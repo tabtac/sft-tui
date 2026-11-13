@@ -132,7 +132,7 @@ func TestStorageWorkflow(t *testing.T) {
 		t.Error("expected WriteChunkAt to fail on completed task")
 	}
 
-	// 4. 不同 RequestID 上传同名文件应冲突；同一 RequestID 的重试由 request_review_test.go 验证。
+	// 4. 不同 RequestID 上传同名文件应冲突；同一 RequestID 的重试由 request_test.go 验证。
 	conflictingReq := req
 	conflictingReq.RequestID = protocol.RequestID{2}
 	_, err = store.CreateUploadTask(ctx, "alice", conflictingReq)
