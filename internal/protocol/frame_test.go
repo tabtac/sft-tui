@@ -43,6 +43,72 @@ func TestValidateFrame_MagicAndVersion(t *testing.T) {
 	if err := ValidateFrame(badFlags, chunk); !errors.As(err, &remErr) || remErr.Code != CodeBadFrame {
 		t.Errorf("expected CodeBadFrame for non-zero flags, got: %v", err)
 	}
+
+	// 非法 Chunk
+	if err := ValidateFrame(h, 1024); err == nil {
+		t.Error("expected error for chunk < MinChunkSize")
+	}
+
+	// 未知消息类型
+	badType := h
+	badType.Type = Type(0xfe)
+	if err := ValidateFrame(badType, chunk); err == nil {
+		t.Error("expected error for unsupported message type")
+	}
+}
+
+func TestValidateFrame_AllMessageTypes(t *testing.T) {
+	chunk := uint32(65536)
+
+	cases := []struct {
+		name     string
+		typ      Type
+		streamID StreamID
+		length   uint32
+		valid    bool
+	}{
+		{"Ping valid", TypePing, 0, 8, true},
+		{"Ping bad len", TypePing, 0, 7, false},
+		{"Hello valid", TypeHello, 0, 10, true},
+		{"Hello bad stream", TypeHello, 1, 10, false},
+		{"HelloAck valid", TypeHelloAck, 0, 12, true},
+		{"PutReq valid", TypePutReq, 1, 60, true},
+		{"PutResp valid", TypePutResp, 1, 25, true},
+		{"GetReq valid", TypeGetReq, 3, 20, true},
+		{"GetResp valid", TypeGetResp, 3, 65, true},
+		{"ListReq valid", TypeListReq, 5, 2, true},
+		{"ListResp valid", TypeListResp, 5, 10, true},
+		{"ListNext valid", TypeListNext, 5, 0, true},
+		{"Data valid", TypeData, 7, 100, true},
+		{"Data empty payload bad", TypeData, 7, 0, false},
+		{"Ack valid", TypeAck, 7, 8, true},
+		{"Commit valid", TypeCommit, 7, 40, true},
+		{"Finish valid", TypeFinish, 7, 56, true},
+		{"ResumeReq valid", TypeResumeReq, 9, 57, true},
+		{"ResumeResp valid", TypeResumeResp, 9, 50, true},
+		{"Cancel valid", TypeCancel, 11, 1, true},
+		{"CancelAck valid", TypeCancelAck, 11, 9, true},
+		{"GoAway valid", TypeGoAway, 0, 8, true},
+		{"Error on conn valid", TypeError, 0, 10, true},
+		{"Error on stream valid", TypeError, 1, 10, true},
+	}
+
+	for _, tc := range cases {
+		h := Header{
+			Magic:    [4]byte{'S', 'F', 'T', '1'},
+			Version:  Version,
+			Type:     tc.typ,
+			Flags:    0,
+			StreamID: tc.streamID,
+			Length:   tc.length,
+		}
+		err := ValidateFrame(h, chunk)
+		if tc.valid && err != nil {
+			t.Errorf("%s: expected valid, got error: %v", tc.name, err)
+		} else if !tc.valid && err == nil {
+			t.Errorf("%s: expected error, got nil", tc.name)
+		}
+	}
 }
 
 func TestValidateFrame_StreamIDConstraints(t *testing.T) {
@@ -125,5 +191,11 @@ func TestReadWriteFrameRoundtrip(t *testing.T) {
 	}
 	if !bytes.Equal(frame.Payload, payload) {
 		t.Errorf("payload mismatch: expected %v, got %v", payload, frame.Payload)
+	}
+
+	// WriteFrame 超过上限测试
+	oversized := make([]byte, MaxDataPayload+1)
+	if err := WriteFrame(&buf, TypeData, 1, oversized, chunk); err == nil {
+		t.Error("expected error for oversized payload")
 	}
 }
