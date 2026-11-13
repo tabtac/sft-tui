@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"sync"
@@ -122,11 +123,109 @@ func objectRelPath(objectID string) string {
 	return fmt.Sprintf("objects/%s", objectID)
 }
 
-// CreateUploadTask 创建上传任务并初始化暂存文件
+const taskColumns = "id, user_id, request_id, direction, file_name, file_size, file_sha256, object_id, offset, status, created_at, updated_at, expires_at"
+
+func scanTask(row interface{ Scan(...any) error }) (Task, error) {
+	var t Task
+	var idHex, reqHex, shaHex string
+	var dir int
+	var status string
+
+	err := row.Scan(&idHex, &t.UserID, &reqHex, &dir, &t.FileName, &t.FileSize, &shaHex, &t.ObjectID, &t.Offset, &status, &t.CreatedAt, &t.UpdatedAt, &t.ExpiresAt)
+	if err != nil {
+		return t, err
+	}
+
+	id, err := HexToID(idHex)
+	if err != nil {
+		return t, fmt.Errorf("corrupt id: %w", err)
+	}
+	reqID, err := HexToID(reqHex)
+	if err != nil {
+		return t, fmt.Errorf("corrupt request_id: %w", err)
+	}
+	if !IsValidHex(t.ObjectID, 32) {
+		return t, fmt.Errorf("corrupt object_id: %q", t.ObjectID)
+	}
+	if dir != int(protocol.DirectionUpload) && dir != int(protocol.DirectionDownload) {
+		return t, fmt.Errorf("corrupt direction: %d", dir)
+	}
+	taskStatus := TaskStatus(status)
+	if !taskStatus.IsValid() {
+		return t, fmt.Errorf("corrupt status: %q", status)
+	}
+	if len(shaHex) != 64 || !IsValidHex(shaHex, 64) {
+		return t, fmt.Errorf("corrupt sha256: %q", shaHex)
+	}
+	b, err := hex.DecodeString(shaHex)
+	if err != nil || len(b) != 32 {
+		return t, fmt.Errorf("corrupt sha256 bytes: %w", err)
+	}
+
+	t.ID = id
+	t.RequestID = reqID
+	t.Direction = protocol.Direction(dir)
+	t.Status = taskStatus
+	copy(t.FileSHA256[:], b)
+
+	return t, nil
+}
+
+// CreateUploadTask 创建上传任务并初始化暂存文件（具备严格的名称校验与幂等性保障）
 func (s *Store) CreateUploadTask(ctx context.Context, userID string, req protocol.PutRequest) (Task, error) {
+	if err := ctx.Err(); err != nil {
+		return Task{}, err
+	}
+	if err := protocol.ValidateName(req.FileName); err != nil {
+		return Task{}, fmt.Errorf("invalid logical filename %q: %w", req.FileName, err)
+	}
+	if req.FileSize > math.MaxInt64 {
+		return Task{}, fmt.Errorf("unsupported file size %d", req.FileSize)
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	if err := ctx.Err(); err != nil {
+		return Task{}, err
+	}
+
+	// 1. 检查幂等性：查询是否已存在相同 (user_id, request_id) 的任务
+	existingRow := s.db.QueryRowContext(ctx, "SELECT "+taskColumns+" FROM tasks WHERE user_id=? AND request_id=?", userID, IDToHex(req.RequestID))
+	existing, err := scanTask(existingRow)
+	if err == nil {
+		if existing.Direction != protocol.DirectionUpload ||
+			existing.FileName != req.FileName ||
+			existing.FileSize != req.FileSize ||
+			existing.FileSHA256 != req.FileSHA256 {
+			return Task{}, ErrTaskConflict
+		}
+		return existing, nil
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return Task{}, err
+	}
+
+	// 2. 检查 published_files 中是否已存在重名文件
+	var existsCount int
+	err = s.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM published_files WHERE user_id=? AND file_name=?", userID, req.FileName).Scan(&existsCount)
+	if err != nil {
+		return Task{}, err
+	}
+	if existsCount > 0 {
+		return Task{}, ErrFileExists
+	}
+
+	// 3. 检查是否有同名的未完成活跃任务
+	var liveCount int
+	err = s.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM tasks WHERE user_id=? AND file_name=? AND direction=1 AND status IN ('ACTIVE', 'PAUSED', 'VERIFYING')", userID, req.FileName).Scan(&liveCount)
+	if err != nil {
+		return Task{}, err
+	}
+	if liveCount > 0 {
+		return Task{}, ErrTaskConflict
+	}
+
+	// 4. 创建新任务
 	now := time.Now().Unix()
 	var transferID protocol.TransferID
 	if _, err := io.ReadFull(rand.Reader, transferID[:]); err != nil {
@@ -155,15 +254,13 @@ func (s *Store) CreateUploadTask(ctx context.Context, userID string, req protoco
 		ExpiresAt:  now + int64(s.retention.Seconds()),
 	}
 
-	// 检查 published_files 中是否已存在重名文件
-	var existsCount int
-	err := s.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM published_files WHERE user_id=? AND file_name=?", userID, req.FileName).Scan(&existsCount)
+	// 通过 root 句柄初始化 .part 文件
+	partRel := stagingRelPath(task.ID)
+	f, err := s.root.OpenFile(partRel, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0600)
 	if err != nil {
 		return Task{}, err
 	}
-	if existsCount > 0 {
-		return Task{}, ErrFileExists
-	}
+	_ = f.Close()
 
 	// 写入数据库
 	_, err = s.db.ExecContext(ctx, `
@@ -174,16 +271,9 @@ func (s *Store) CreateUploadTask(ctx context.Context, userID string, req protoco
 		task.ObjectID, task.Offset, string(task.Status),
 		task.CreatedAt, task.UpdatedAt, task.ExpiresAt)
 	if err != nil {
+		_ = s.root.Remove(partRel)
 		return Task{}, err
 	}
-
-	// 通过 root 句柄初始化 .part 文件
-	partRel := stagingRelPath(task.ID)
-	f, err := s.root.OpenFile(partRel, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
-	if err != nil {
-		return Task{}, err
-	}
-	_ = f.Close()
 
 	return task, nil
 }
@@ -347,8 +437,14 @@ func (s *Store) ListPublishedFiles(ctx context.Context, userID, after string, li
 		if err := rows.Scan(&name, &size, &shaHex); err != nil {
 			return nil, false, err
 		}
+		if len(shaHex) != 64 || !IsValidHex(shaHex, 64) {
+			return nil, false, fmt.Errorf("corrupt published file sha256: %q", shaHex)
+		}
+		b, err := hex.DecodeString(shaHex)
+		if err != nil || len(b) != 32 {
+			return nil, false, fmt.Errorf("corrupt published file sha256 bytes: %w", err)
+		}
 		var d protocol.Digest
-		b, _ := hex.DecodeString(shaHex)
 		copy(d[:], b)
 		entries = append(entries, protocol.FileEntry{
 			FileName: name,
@@ -385,7 +481,13 @@ func (s *Store) OpenPublishedFile(ctx context.Context, userID, fileName string) 
 		return nil, pub, err
 	}
 
-	b, _ := hex.DecodeString(shaHex)
+	if len(shaHex) != 64 || !IsValidHex(shaHex, 64) {
+		return nil, pub, fmt.Errorf("corrupt published file sha256: %q", shaHex)
+	}
+	b, err := hex.DecodeString(shaHex)
+	if err != nil || len(b) != 32 {
+		return nil, pub, fmt.Errorf("corrupt published file sha256 bytes: %w", err)
+	}
 	copy(pub.SHA256[:], b)
 
 	objRel := objectRelPath(pub.ObjectID)
@@ -405,28 +507,10 @@ func (s *Store) GetTask(ctx context.Context, taskID protocol.TransferID) (Task, 
 }
 
 func (s *Store) getTaskLocked(ctx context.Context, taskID protocol.TransferID) (Task, error) {
-	var t Task
-	var idHex, reqHex, shaHex string
-	var dir int
-	var status string
-
-	err := s.db.QueryRowContext(ctx, `
-		SELECT id, user_id, request_id, direction, file_name, file_size, file_sha256, object_id, offset, status, created_at, updated_at, expires_at
-		FROM tasks WHERE id=?
-	`, IDToHex(taskID)).Scan(&idHex, &t.UserID, &reqHex, &dir, &t.FileName, &t.FileSize, &shaHex, &t.ObjectID, &t.Offset, &status, &t.CreatedAt, &t.UpdatedAt, &t.ExpiresAt)
+	row := s.db.QueryRowContext(ctx, "SELECT "+taskColumns+" FROM tasks WHERE id=?", IDToHex(taskID))
+	t, err := scanTask(row)
 	if errors.Is(err, sql.ErrNoRows) {
 		return t, ErrTaskNotFound
 	}
-	if err != nil {
-		return t, err
-	}
-
-	t.ID, _ = HexToID(idHex)
-	t.RequestID, _ = HexToID(reqHex)
-	t.Direction = protocol.Direction(dir)
-	t.Status = TaskStatus(status)
-	b, _ := hex.DecodeString(shaHex)
-	copy(t.FileSHA256[:], b)
-
-	return t, nil
+	return t, err
 }

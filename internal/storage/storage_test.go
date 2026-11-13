@@ -132,16 +132,18 @@ func TestStorageWorkflow(t *testing.T) {
 		t.Error("expected WriteChunkAt to fail on completed task")
 	}
 
-	// 4. 重名上传冲突拦截
-	_, err = store.CreateUploadTask(ctx, "alice", req)
+	// 4. 不同 RequestID 上传同名文件应冲突；同一 RequestID 的重试由 request_review_test.go 验证。
+	conflictingReq := req
+	conflictingReq.RequestID = protocol.RequestID{2}
+	_, err = store.CreateUploadTask(ctx, "alice", conflictingReq)
 	if err != ErrFileExists {
 		t.Fatalf("expected ErrFileExists for duplicate file, got: %v", err)
 	}
 
 	// 5. 列表查询与分页
-	for _, fn := range []string{"file_a.txt", "file_b.txt"} {
+	for i, fn := range []string{"file_a.txt", "file_b.txt"} {
 		fReq := protocol.PutRequest{
-			RequestID:  protocol.RequestID{8, 8, 8},
+			RequestID:  protocol.RequestID{8, byte(i + 1)},
 			FileName:   fn,
 			FileSize:   4,
 			FileSHA256: sha256.Sum256([]byte("data")),
@@ -150,8 +152,12 @@ func TestStorageWorkflow(t *testing.T) {
 		if err != nil {
 			t.Fatalf("CreateUploadTask %s failed: %v", fn, err)
 		}
-		_, _ = store.WriteChunkAt(ctx, tItem.ID, 0, []byte("data"))
-		_ = store.CommitUpload(ctx, tItem.ID, 4, sha256.Sum256([]byte("data")))
+		if _, err := store.WriteChunkAt(ctx, tItem.ID, 0, []byte("data")); err != nil {
+			t.Fatalf("write list fixture %s: %v", fn, err)
+		}
+		if err := store.CommitUpload(ctx, tItem.ID, 4, sha256.Sum256([]byte("data"))); err != nil {
+			t.Fatalf("publish list fixture %s: %v", fn, err)
+		}
 	}
 
 	p1, hasMore, err := store.ListPublishedFiles(ctx, "alice", "", 2)
@@ -267,20 +273,27 @@ func TestCommitHashMismatchAndSizeMismatch(t *testing.T) {
 	}
 
 	// 尚未写完时尝试 commit（大小不一致）
-	_, _ = store.WriteChunkAt(ctx, task.ID, 0, content[:5])
+	if _, err := store.WriteChunkAt(ctx, task.ID, 0, content[:5]); err != nil {
+		t.Fatal(err)
+	}
 	err = store.CommitUpload(ctx, task.ID, uint64(len(content)), declaredHash)
 	if err != ErrOffsetMismatch {
 		t.Fatalf("expected ErrOffsetMismatch, got: %v", err)
 	}
 
 	// 补全写入，但哈希不匹配
-	_, _ = store.WriteChunkAt(ctx, task.ID, 5, content[5:])
+	if _, err := store.WriteChunkAt(ctx, task.ID, 5, content[5:]); err != nil {
+		t.Fatal(err)
+	}
 	err = store.CommitUpload(ctx, task.ID, uint64(len(content)), declaredHash)
 	if err != ErrHashMismatch {
 		t.Fatalf("expected ErrHashMismatch, got: %v", err)
 	}
 
-	tFailed, _ := store.GetTask(ctx, task.ID)
+	tFailed, err := store.GetTask(ctx, task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if tFailed.Status != TaskFailed {
 		t.Errorf("expected status FAILED, got: %s", tFailed.Status)
 	}

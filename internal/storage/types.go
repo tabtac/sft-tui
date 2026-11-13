@@ -13,6 +13,7 @@ type TaskStatus string
 const (
 	TaskActive    TaskStatus = "ACTIVE"
 	TaskPaused    TaskStatus = "PAUSED"
+	TaskVerifying TaskStatus = "VERIFYING"
 	TaskCompleted TaskStatus = "COMPLETED"
 	TaskFailed    TaskStatus = "FAILED"
 	TaskCancelled TaskStatus = "CANCELLED"
@@ -22,6 +23,16 @@ const (
 // IsTerminal 终态检查
 func (s TaskStatus) IsTerminal() bool {
 	return s == TaskCompleted || s == TaskFailed || s == TaskCancelled || s == TaskExpired
+}
+
+// IsValid 校验状态值是否属于有效状态枚举
+func (s TaskStatus) IsValid() bool {
+	switch s {
+	case TaskActive, TaskPaused, TaskVerifying, TaskCompleted, TaskFailed, TaskCancelled, TaskExpired:
+		return true
+	default:
+		return false
+	}
 }
 
 // Task 持久化传输任务结构
@@ -78,4 +89,18 @@ func HexToID(s string) ([16]byte, error) {
 	}
 	copy(out[:], b)
 	return out, nil
+}
+
+// IsValidHex 验证字符串是否为指定长度的合法十六进制字符
+func IsValidHex(s string, expectedLen int) bool {
+	if len(s) != expectedLen {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) {
+			return false
+		}
+	}
+	return true
 }
