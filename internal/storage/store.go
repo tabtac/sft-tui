@@ -696,3 +696,336 @@ func (s *Store) getTaskLocked(ctx context.Context, taskID protocol.TransferID) (
 	}
 	return t, err
 }
+
+// CreateDownloadTask 创建下载任务并返回已发布对象的文件句柄（具备严格幂等性）
+func (s *Store) CreateDownloadTask(ctx context.Context, userID string, req protocol.GetRequest) (Task, *os.File, error) {
+	if err := ctx.Err(); err != nil {
+		return Task{}, nil, err
+	}
+	if err := protocol.ValidateName(req.FileName); err != nil {
+		return Task{}, nil, fmt.Errorf("invalid logical filename %q: %w", req.FileName, err)
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if err := ctx.Err(); err != nil {
+		return Task{}, nil, err
+	}
+
+	// 1. 幂等性检查：查询是否已有相同 (user_id, request_id)
+	existingRow := s.db.QueryRowContext(ctx, "SELECT "+taskColumns+" FROM tasks WHERE user_id=? AND request_id=?", userID, IDToHex(req.RequestID))
+	existing, err := scanTask(existingRow)
+	if err == nil {
+		if existing.Direction != protocol.DirectionDownload || existing.FileName != req.FileName {
+			return Task{}, nil, ErrTaskConflict
+		}
+		f, err := s.root.OpenFile(objectRelPath(existing.ObjectID), os.O_RDONLY, 0)
+		if err != nil {
+			return Task{}, nil, err
+		}
+		return existing, f, nil
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return Task{}, nil, err
+	}
+
+	// 2. 查询已发布文件
+	var pub PublishedFile
+	var shaHex string
+	err = s.db.QueryRowContext(ctx, `
+		SELECT object_id, user_id, file_name, file_size, file_sha256, created_at
+		FROM published_files
+		WHERE user_id=? AND file_name=?
+	`, userID, req.FileName).Scan(&pub.ObjectID, &pub.UserID, &pub.FileName, &pub.FileSize, &shaHex, &pub.CreatedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return Task{}, nil, ErrFileNotFound
+	}
+	if err != nil {
+		return Task{}, nil, err
+	}
+
+	b, _ := hex.DecodeString(shaHex)
+	copy(pub.SHA256[:], b)
+
+	// 3. 校验并打开不可变对象文件
+	objRel := objectRelPath(pub.ObjectID)
+	info, err := s.root.Lstat(objRel)
+	if err != nil {
+		return Task{}, nil, err
+	}
+	if !info.Mode().IsRegular() || uint64(info.Size()) != pub.FileSize {
+		return Task{}, nil, fmt.Errorf("damaged published object %q: irregular or size mismatch", pub.ObjectID)
+	}
+
+	f, err := s.root.OpenFile(objRel, os.O_RDONLY, 0)
+	if err != nil {
+		return Task{}, nil, err
+	}
+
+	// 4. 创建任务记录
+	now := time.Now().Unix()
+	var transferID protocol.TransferID
+	if _, err := io.ReadFull(rand.Reader, transferID[:]); err != nil {
+		f.Close()
+		return Task{}, nil, err
+	}
+
+	task := Task{
+		ID:         transferID,
+		RequestID:  req.RequestID,
+		UserID:     userID,
+		Direction:  protocol.DirectionDownload,
+		FileName:   req.FileName,
+		FileSize:   pub.FileSize,
+		FileSHA256: pub.SHA256,
+		ObjectID:   pub.ObjectID,
+		Offset:     0,
+		Status:     TaskActive,
+		CreatedAt:  now,
+		UpdatedAt:  now,
+		ExpiresAt:  now + int64(s.retention.Seconds()),
+	}
+
+	_, err = s.db.ExecContext(ctx, `
+		INSERT INTO tasks (id, user_id, request_id, direction, file_name, file_size, file_sha256, object_id, offset, status, created_at, updated_at, expires_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, IDToHex(task.ID), task.UserID, IDToHex(task.RequestID), int(task.Direction),
+		task.FileName, task.FileSize, hex.EncodeToString(task.FileSHA256[:]),
+		task.ObjectID, task.Offset, string(task.Status),
+		task.CreatedAt, task.UpdatedAt, task.ExpiresAt)
+	if err != nil {
+		f.Close()
+		return Task{}, nil, err
+	}
+
+	return task, f, nil
+}
+
+// ReadChunkAt 从已发布对象中读取数据块
+func (s *Store) ReadChunkAt(ctx context.Context, taskID protocol.TransferID, offset uint64, length int) ([]byte, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	s.mu.RLock()
+	task, err := s.getTaskLocked(ctx, taskID)
+	s.mu.RUnlock()
+	if err != nil {
+		return nil, err
+	}
+	if task.Status != TaskActive {
+		return nil, ErrTaskNotActive
+	}
+	if task.Direction != protocol.DirectionDownload {
+		return nil, errors.New("task is not a download task")
+	}
+	if offset > task.FileSize {
+		return nil, ErrOffsetMismatch
+	}
+
+	if length <= 0 {
+		return nil, nil
+	}
+	if offset+uint64(length) > task.FileSize {
+		length = int(task.FileSize - offset)
+	}
+
+	objRel := objectRelPath(task.ObjectID)
+	f, err := s.root.OpenFile(objRel, os.O_RDONLY, 0)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	buf := make([]byte, length)
+	if _, err := f.ReadAt(buf, int64(offset)); err != nil && !errors.Is(err, io.EOF) {
+		return nil, err
+	}
+
+	return buf, nil
+}
+
+// CheckpointDownload 更新下载任务检查点进度
+func (s *Store) CheckpointDownload(ctx context.Context, taskID protocol.TransferID, offset uint64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	task, err := s.getTaskLocked(ctx, taskID)
+	if err != nil {
+		return err
+	}
+	if task.Status != TaskActive {
+		return ErrTaskNotActive
+	}
+	if offset > task.FileSize || offset < task.Offset {
+		return ErrOffsetMismatch
+	}
+
+	now := time.Now().Unix()
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE tasks SET offset=?, updated_at=? WHERE id=? AND status=? AND offset<=?
+	`, offset, now, IDToHex(taskID), string(TaskActive), offset)
+	if err != nil {
+		return err
+	}
+	rows, _ := res.RowsAffected()
+	if rows == 0 {
+		return ErrTaskNotActive
+	}
+	return nil
+}
+
+// FinishDownload 将下载任务标记为完成
+func (s *Store) FinishDownload(ctx context.Context, taskID protocol.TransferID) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	now := time.Now().Unix()
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE tasks SET status=?, updated_at=? WHERE id=? AND status=?
+	`, string(TaskCompleted), now, IDToHex(taskID), string(TaskActive))
+	if err != nil {
+		return err
+	}
+	rows, _ := res.RowsAffected()
+	if rows == 0 {
+		return ErrTaskNotActive
+	}
+	return nil
+}
+
+// PauseTask 暂停活动任务
+func (s *Store) PauseTask(ctx context.Context, taskID protocol.TransferID) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	now := time.Now().Unix()
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE tasks SET status=?, updated_at=? WHERE id=? AND status=?
+	`, string(TaskPaused), now, IDToHex(taskID), string(TaskActive))
+	if err != nil {
+		return err
+	}
+	rows, _ := res.RowsAffected()
+	if rows == 0 {
+		return ErrTaskNotActive
+	}
+	return nil
+}
+
+// ResumeTask 恢复已暂停的任务
+func (s *Store) ResumeTask(ctx context.Context, taskID protocol.TransferID) (Task, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	task, err := s.getTaskLocked(ctx, taskID)
+	if err != nil {
+		return task, err
+	}
+	if task.Status != TaskPaused {
+		return task, ErrTaskNotPaused
+	}
+
+	now := time.Now().Unix()
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE tasks SET status=?, updated_at=? WHERE id=? AND status=?
+	`, string(TaskActive), now, IDToHex(taskID), string(TaskPaused))
+	if err != nil {
+		return task, err
+	}
+	rows, _ := res.RowsAffected()
+	if rows == 0 {
+		return task, ErrTaskNotPaused
+	}
+	task.Status = TaskActive
+	task.UpdatedAt = now
+	return task, nil
+}
+
+// CancelTask 取消任务并清理上传暂存文件
+func (s *Store) CancelTask(ctx context.Context, taskID protocol.TransferID) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	task, err := s.getTaskLocked(ctx, taskID)
+	if err != nil {
+		return err
+	}
+	if task.Status.IsTerminal() {
+		return ErrTaskTerminal
+	}
+
+	now := time.Now().Unix()
+	_, err = s.db.ExecContext(ctx, `
+		UPDATE tasks SET status=?, updated_at=? WHERE id=?
+	`, string(TaskCancelled), now, IDToHex(taskID))
+	if err != nil {
+		return err
+	}
+
+	if task.Direction == protocol.DirectionUpload {
+		partRel := stagingRelPath(taskID)
+		_ = s.root.Remove(partRel)
+	}
+
+	return nil
+}
+
+// ExpireTasks 将过期未完成的任务标记为 EXPIRED 并移除对应 staging 临时文件
+func (s *Store) ExpireTasks(ctx context.Context, now time.Time) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, direction FROM tasks 
+		WHERE status IN ('ACTIVE', 'PAUSED', 'VERIFYING') AND expires_at <= ?
+	`, now.Unix())
+	if err != nil {
+		return 0, err
+	}
+	defer rows.Close()
+
+	type expiredTask struct {
+		idHex string
+		dir   int
+	}
+	var expired []expiredTask
+	for rows.Next() {
+		var item expiredTask
+		if err := rows.Scan(&item.idHex, &item.dir); err != nil {
+			return 0, err
+		}
+		expired = append(expired, item)
+	}
+	if err := rows.Err(); err != nil {
+		return 0, err
+	}
+
+	for _, item := range expired {
+		if _, err := s.db.ExecContext(ctx, "UPDATE tasks SET status=?, updated_at=? WHERE id=?", string(TaskExpired), now.Unix(), item.idHex); err != nil {
+			return 0, err
+		}
+		if item.dir == int(protocol.DirectionUpload) {
+			id, _ := HexToID(item.idHex)
+			_ = s.root.Remove(stagingRelPath(id))
+		}
+	}
+
+	return len(expired), nil
+}
+
+// CleanupExpired 清理已超过 retention 保留期的终态任务记录
+func (s *Store) CleanupExpired(ctx context.Context, retention time.Duration) (int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	cutoff := time.Now().Add(-retention).Unix()
+	res, err := s.db.ExecContext(ctx, `
+		DELETE FROM tasks 
+		WHERE status IN ('COMPLETED', 'FAILED', 'CANCELLED', 'EXPIRED') AND updated_at <= ?
+	`, cutoff)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}

@@ -64,15 +64,18 @@ type PublishedFile struct {
 
 // 错误定义
 var (
-	ErrTaskNotFound     = errors.New("task not found")
-	ErrTaskExpired      = errors.New("task expired")
-	ErrTaskConflict     = errors.New("task conflict or already exists")
-	ErrFileNotFound     = errors.New("file not found")
-	ErrFileExists       = errors.New("file already exists")
-	ErrOffsetMismatch   = errors.New("offset mismatch")
-	ErrHashMismatch     = errors.New("file sha256 hash mismatch")
-	ErrQuotaExceeded    = errors.New("storage quota exceeded")
-	ErrStoreLocked      = errors.New("storage root is locked by another instance")
+	ErrTaskNotFound   = errors.New("task not found")
+	ErrTaskExpired    = errors.New("task expired")
+	ErrTaskConflict   = errors.New("task conflict or already exists")
+	ErrTaskNotActive  = errors.New("task is not active")
+	ErrTaskNotPaused  = errors.New("task is not paused")
+	ErrTaskTerminal   = errors.New("task is in terminal state")
+	ErrFileNotFound   = errors.New("file not found")
+	ErrFileExists     = errors.New("file already exists")
+	ErrOffsetMismatch = errors.New("offset mismatch")
+	ErrHashMismatch   = errors.New("file sha256 hash mismatch")
+	ErrQuotaExceeded  = errors.New("storage quota exceeded")
+	ErrStoreLocked    = errors.New("storage root is locked by another instance")
 )
 
 // IDToHex 将 16 字节 ID 转为 Hex 字符串
