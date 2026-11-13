@@ -1,0 +1,27 @@
+# Binaries
+bin/
+dist/
+*.exe
+
+# Databases & local state
+*.db
+*.db-wal
+*.db-shm
+*.log
+var/
+data/
+
+# Certificates & keys
+certs/
+*.pem
+*.key
+
+# Test & coverage artifacts
+coverage.out
+*.test
+
+# OS & Editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
