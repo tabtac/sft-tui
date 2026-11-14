@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"unicode/utf8"
 )
 
 // DigestReaderContext 流式计算输入数据的 SHA-256 与字节数，支持通过 ctx 中断取消。
@@ -123,26 +124,77 @@ func CheckRegularOrAbsent(path string) error {
 	return nil
 }
 
-// StageAndReplace 写入临时数据并原子发布到最终目标
-func StageAndReplace(dst string, data []byte) error {
+// TruncateUTF8 按字节上限截断 UTF-8 字符串，保持字符边界完整，超长时追加省略号。
+func TruncateUTF8(s string, maxBytes int) string {
+	if maxBytes <= 0 {
+		return ""
+	}
+	if len(s) <= maxBytes {
+		return s
+	}
+	cut := maxBytes
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut] + "…"
+}
+
+// StageTempFile 在目标同目录下写入临时文件、设置权限并 Sync 落盘，返回临时文件路径。
+func StageTempFile(dst string, data []byte, perm os.FileMode) (string, error) {
+	if err := CheckRegularOrAbsent(dst); err != nil {
+		return "", err
+	}
 	tmp, err := os.CreateTemp(filepath.Dir(dst), ".stage-*")
+	if err != nil {
+		return "", err
+	}
+	tmpName := tmp.Name()
+	cleanup := true
+	defer func() {
+		if cleanup {
+			_ = os.Remove(tmpName)
+		}
+	}()
+
+	if perm != 0 {
+		if err := tmp.Chmod(perm); err != nil {
+			_ = tmp.Close()
+			return "", err
+		}
+	}
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		return "", err
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return "", err
+	}
+	if err := tmp.Close(); err != nil {
+		return "", err
+	}
+	cleanup = false
+	return tmpName, nil
+}
+
+// StageAndReplaceMode 按指定权限原子写入目标文件；exclusive=true 时若目标已存在则返回错误。
+func StageAndReplaceMode(dst string, data []byte, perm os.FileMode, exclusive bool) error {
+	tmpName, err := StageTempFile(dst, data, perm)
 	if err != nil {
 		return err
 	}
-	tmpName := tmp.Name()
 	defer os.Remove(tmpName)
 
-	if _, err := tmp.Write(data); err != nil {
-		tmp.Close()
-		return err
+	if exclusive {
+		if err := os.Link(tmpName, dst); err != nil {
+			return err
+		}
+		return SyncParentDir(dst)
 	}
-	if err := tmp.Sync(); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-
 	return AtomicReplace(tmpName, dst)
+}
+
+// StageAndReplace 以私有权限（0600）写入临时数据并原子覆盖目标文件。
+func StageAndReplace(dst string, data []byte) error {
+	return StageAndReplaceMode(dst, data, 0600, false)
 }
