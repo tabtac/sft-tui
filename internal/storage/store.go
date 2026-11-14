@@ -26,6 +26,9 @@ type Store struct {
 	lockFile  *os.File
 	mu        sync.RWMutex
 	retention time.Duration
+	limits    Limits
+	leases    map[string]uint64
+	nextLease uint64
 }
 
 // OpenStore 打开并初始化存储引擎，强制执行目录句柄锚定与子目录排他权限收紧。
@@ -115,6 +118,7 @@ func OpenStore(rootDir string) (*Store, error) {
 		db:        db,
 		lockFile:  lFile,
 		retention: 24 * time.Hour,
+		leases:    make(map[string]uint64),
 	}, nil
 }
 
@@ -323,7 +327,11 @@ func (s *Store) CreateUploadTask(ctx context.Context, userID string, req protoco
 	if err := ctx.Err(); err != nil {
 		return Task{}, err
 	}
+	task, _, err := s.createUploadLocked(ctx, userID, req, false)
+	return task, err
+}
 
+func (s *Store) createUploadLocked(ctx context.Context, userID string, req protocol.PutRequest, checkQuota bool) (Task, bool, error) {
 	// 1. 检查幂等性：查询是否已存在相同 (user_id, request_id) 的任务
 	existingRow := s.db.QueryRowContext(ctx, "SELECT "+taskColumns+" FROM tasks WHERE user_id=? AND request_id=?", userID, IDToHex(req.RequestID))
 	existing, err := scanTask(existingRow)
@@ -332,43 +340,49 @@ func (s *Store) CreateUploadTask(ctx context.Context, userID string, req protoco
 			existing.FileName != req.FileName ||
 			existing.FileSize != req.FileSize ||
 			existing.FileSHA256 != req.FileSHA256 {
-			return Task{}, ErrTaskConflict
+			return Task{}, false, ErrTaskConflict
 		}
-		return existing, nil
+		return existing, true, nil
 	} else if !errors.Is(err, sql.ErrNoRows) {
-		return Task{}, err
+		return Task{}, false, err
 	}
 
 	// 2. 检查 published_files 中是否已存在重名文件
 	var existsCount int
 	err = s.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM published_files WHERE user_id=? AND file_name=?", userID, req.FileName).Scan(&existsCount)
 	if err != nil {
-		return Task{}, err
+		return Task{}, false, err
 	}
 	if existsCount > 0 {
-		return Task{}, ErrFileExists
+		return Task{}, false, ErrFileExists
 	}
 
 	// 3. 检查是否有同名的未完成活跃任务
 	var liveCount int
 	err = s.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM tasks WHERE user_id=? AND file_name=? AND direction=1 AND status IN ('ACTIVE', 'PAUSED', 'VERIFYING')", userID, req.FileName).Scan(&liveCount)
 	if err != nil {
-		return Task{}, err
+		return Task{}, false, err
 	}
 	if liveCount > 0 {
-		return Task{}, ErrTaskConflict
+		return Task{}, false, ErrTaskConflict
+	}
+
+	if checkQuota {
+		if err := s.checkQuotaLocked(ctx, userID, req.FileSize, true); err != nil {
+			return Task{}, false, err
+		}
 	}
 
 	// 4. 创建新任务
 	now := time.Now().Unix()
 	var transferID protocol.TransferID
 	if _, err := io.ReadFull(rand.Reader, transferID[:]); err != nil {
-		return Task{}, err
+		return Task{}, false, err
 	}
 
 	var objBytes [16]byte
 	if _, err := io.ReadFull(rand.Reader, objBytes[:]); err != nil {
-		return Task{}, err
+		return Task{}, false, err
 	}
 	objectID := hex.EncodeToString(objBytes[:])
 
@@ -392,7 +406,7 @@ func (s *Store) CreateUploadTask(ctx context.Context, userID string, req protoco
 	partRel := stagingRelPath(task.ID)
 	f, err := s.root.OpenFile(partRel, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0600)
 	if err != nil {
-		return Task{}, err
+		return Task{}, false, err
 	}
 	_ = f.Close()
 
@@ -406,10 +420,10 @@ func (s *Store) CreateUploadTask(ctx context.Context, userID string, req protoco
 		task.CreatedAt, task.UpdatedAt, task.ExpiresAt)
 	if err != nil {
 		_ = s.root.Remove(partRel)
-		return Task{}, err
+		return Task{}, false, err
 	}
 
-	return task, nil
+	return task, false, nil
 }
 
 // WriteChunkAt 严格写入数据块，并在落盘后推进 SQLite 检查点
@@ -424,6 +438,10 @@ func (s *Store) WriteChunkAt(ctx context.Context, taskID protocol.TransferID, of
 	if err := ctx.Err(); err != nil {
 		return 0, err
 	}
+	return s.writeChunkLocked(ctx, taskID, offset, data)
+}
+
+func (s *Store) writeChunkLocked(ctx context.Context, taskID protocol.TransferID, offset uint64, data []byte) (uint64, error) {
 
 	task, err := s.getTaskLocked(ctx, taskID)
 	if err != nil {
@@ -500,6 +518,10 @@ func (s *Store) WriteChunkAt(ctx context.Context, taskID protocol.TransferID, of
 func (s *Store) CommitUpload(ctx context.Context, taskID protocol.TransferID, fileSize uint64, declaredSHA protocol.Digest) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.commitUploadLocked(ctx, taskID, fileSize, declaredSHA)
+}
+
+func (s *Store) commitUploadLocked(ctx context.Context, taskID protocol.TransferID, fileSize uint64, declaredSHA protocol.Digest) error {
 
 	task, err := s.getTaskLocked(ctx, taskID)
 	if err != nil {
@@ -745,41 +767,51 @@ func (s *Store) CreateDownloadTask(ctx context.Context, userID string, req proto
 	if err := ctx.Err(); err != nil {
 		return Task{}, nil, err
 	}
+	task, f, _, err := s.createDownloadLocked(ctx, userID, req, false)
+	return task, f, err
+}
 
+func (s *Store) createDownloadLocked(ctx context.Context, userID string, req protocol.GetRequest, checkQuota bool) (Task, *os.File, bool, error) {
 	// 1. 幂等性检查：查询是否已有相同 (user_id, request_id)
 	existingRow := s.db.QueryRowContext(ctx, "SELECT "+taskColumns+" FROM tasks WHERE user_id=? AND request_id=?", userID, IDToHex(req.RequestID))
 	existing, err := scanTask(existingRow)
 	if err == nil {
 		if existing.Direction != protocol.DirectionDownload || existing.FileName != req.FileName {
-			return Task{}, nil, ErrTaskConflict
+			return Task{}, nil, false, ErrTaskConflict
 		}
 		if existing.Status == TaskExpired {
-			return Task{}, nil, ErrTaskExpired
+			return Task{}, nil, false, ErrTaskExpired
 		}
 		if existing.Status == TaskCancelled || existing.Status == TaskFailed {
-			return Task{}, nil, ErrTaskConflict
+			return Task{}, nil, false, ErrTaskConflict
 		}
 		objRel := objectRelPath(existing.ObjectID)
 		info, err := s.root.Lstat(objRel)
 		if err != nil {
-			return Task{}, nil, err
+			return Task{}, nil, false, err
 		}
 		if !info.Mode().IsRegular() || uint64(info.Size()) != existing.FileSize {
-			return Task{}, nil, fmt.Errorf("damaged published object %q: irregular or size mismatch", existing.ObjectID)
+			return Task{}, nil, false, fmt.Errorf("damaged published object %q: irregular or size mismatch", existing.ObjectID)
 		}
 		f, err := s.root.OpenFile(objRel, os.O_RDONLY, 0)
 		if err != nil {
-			return Task{}, nil, err
+			return Task{}, nil, false, err
 		}
-		return existing, f, nil
+		return existing, f, true, nil
 	} else if !errors.Is(err, sql.ErrNoRows) {
-		return Task{}, nil, err
+		return Task{}, nil, false, err
+	}
+
+	if checkQuota {
+		if err := s.checkQuotaLocked(ctx, userID, 0, false); err != nil {
+			return Task{}, nil, false, err
+		}
 	}
 
 	// 2. 查询并打开已发布不可变对象文件
 	f, pub, err := s.openPublishedLocked(ctx, userID, req.FileName)
 	if err != nil {
-		return Task{}, nil, err
+		return Task{}, nil, false, err
 	}
 
 	// 4. 创建任务记录
@@ -787,7 +819,7 @@ func (s *Store) CreateDownloadTask(ctx context.Context, userID string, req proto
 	var transferID protocol.TransferID
 	if _, err := io.ReadFull(rand.Reader, transferID[:]); err != nil {
 		f.Close()
-		return Task{}, nil, err
+		return Task{}, nil, false, err
 	}
 
 	task := Task{
@@ -815,10 +847,10 @@ func (s *Store) CreateDownloadTask(ctx context.Context, userID string, req proto
 		task.CreatedAt, task.UpdatedAt, task.ExpiresAt)
 	if err != nil {
 		f.Close()
-		return Task{}, nil, err
+		return Task{}, nil, false, err
 	}
 
-	return task, f, nil
+	return task, f, false, nil
 }
 
 // ReadChunkAt 从已发布对象中读取数据块
@@ -1015,7 +1047,9 @@ func (s *Store) ExpireTasks(ctx context.Context, now time.Time) (int, error) {
 		if err := rows.Scan(&item.idHex, &item.dir); err != nil {
 			return 0, err
 		}
-		expired = append(expired, item)
+		if s.leases[item.idHex] == 0 {
+			expired = append(expired, item)
+		}
 	}
 	if err := rows.Err(); err != nil {
 		return 0, err

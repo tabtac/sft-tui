@@ -3,9 +3,19 @@ package storage
 import (
 	"encoding/hex"
 	"errors"
+	"time"
 
 	"sft-tui/internal/protocol"
 )
+
+// Limits 存储与用户资源限额配置
+type Limits struct {
+	MaxFileBytes               uint64
+	UserStorageBytes           uint64
+	MaxPendingTransfersPerUser uint32
+	MaxFilesPerUser            uint32
+	TransferRetention          time.Duration
+}
 
 // TaskStatus 任务状态枚举
 type TaskStatus string
@@ -76,6 +86,8 @@ var (
 	ErrHashMismatch   = errors.New("file sha256 hash mismatch")
 	ErrQuotaExceeded  = errors.New("storage quota exceeded")
 	ErrStoreLocked    = errors.New("storage root is locked by another instance")
+	ErrTaskBusy       = errors.New("task is already active on another stream")
+	ErrTaskCancelled  = errors.New("task is cancelled")
 )
 
 // IDToHex 将 16 字节 ID 转为 Hex 字符串
