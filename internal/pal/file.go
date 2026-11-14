@@ -1,11 +1,65 @@
 package pal
 
 import (
+	"context"
+	"crypto/sha256"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 )
+
+// DigestReaderContext 流式计算输入数据的 SHA-256 与字节数，支持通过 ctx 中断取消。
+func DigestReaderContext(ctx context.Context, r io.Reader) ([32]byte, uint64, error) {
+	hasher := sha256.New()
+	buf := make([]byte, 64*1024)
+	var total uint64
+	for {
+		if err := ctx.Err(); err != nil {
+			return [32]byte{}, total, err
+		}
+		n, err := r.Read(buf)
+		if n > 0 {
+			_, _ = hasher.Write(buf[:n])
+			total += uint64(n)
+		}
+		if err == io.EOF {
+			var sum [32]byte
+			copy(sum[:], hasher.Sum(nil))
+			return sum, total, nil
+		}
+		if err != nil {
+			return [32]byte{}, total, err
+		}
+	}
+}
+
+// ReadSmall 安全读取有大小上限的普通文件（不跟随目录外的异常大文件/设备）。
+func ReadSmall(path string, maxBytes int64) ([]byte, error) {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return nil, err
+	}
+	if !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("file must be regular: %s", path)
+	}
+	if info.Size() > maxBytes {
+		return nil, fmt.Errorf("file exceeds max allowed size (%d > %d): %s", info.Size(), maxBytes, path)
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	data, err := io.ReadAll(io.LimitReader(f, maxBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > maxBytes {
+		return nil, fmt.Errorf("file exceeds max allowed size: %s", path)
+	}
+	return data, nil
+}
 
 // CopyFile 安全复制文件内容并落盘同步
 func CopyFile(src, dst string) error {

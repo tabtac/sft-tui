@@ -74,6 +74,19 @@ func OpenLockFile(path string) (*os.File, error) {
 	return os.OpenFile(path, os.O_CREATE|os.O_RDWR|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0600)
 }
 
+// FileIdentity 返回文件底层设备号、inode 与硬链接数
+func FileIdentity(f *os.File) (dev uint64, ino uint64, nlink uint64, err error) {
+	info, err := f.Stat()
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	st, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return 0, 0, 0, fmt.Errorf("unexpected stat type %T", info.Sys())
+	}
+	return uint64(st.Dev), uint64(st.Ino), uint64(st.Nlink), nil
+}
+
 // SyncParentDir 刷新父目录元数据
 func SyncParentDir(path string) error {
 	dir, err := os.Open(filepath.Dir(path))

@@ -89,6 +89,16 @@ func OpenLockFile(path string) (*os.File, error) {
 	return os.NewFile(uintptr(h), path), nil
 }
 
+// FileIdentity 返回 Windows 卷序列号、文件索引与硬链接数
+func FileIdentity(f *os.File) (dev uint64, ino uint64, nlink uint64, err error) {
+	var info windows.ByHandleFileInformation
+	if err := windows.GetFileInformationByHandle(windows.Handle(f.Fd()), &info); err != nil {
+		return 0, 0, 0, err
+	}
+	ino = (uint64(info.FileIndexHigh) << 32) | uint64(info.FileIndexLow)
+	return uint64(info.VolumeSerialNumber), ino, uint64(info.NumberOfLinks), nil
+}
+
 // SyncParentDir Windows 目录句柄不支持 fsync，依赖 NTFS 日志保证一致性
 func SyncParentDir(path string) error {
 	return nil
