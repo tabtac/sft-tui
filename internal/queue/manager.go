@@ -94,6 +94,7 @@ type Manager struct {
 	historyDirty bool
 	activeCount  atomic.Int64
 	nextPrune    time.Time
+	runner       TaskRunner
 }
 
 func randomID() (string, error) {
@@ -168,15 +169,45 @@ func Open(cfg Config) (*Manager, error) {
 			cancel()
 			return fail(fmt.Errorf("active task record does not match identity or path is invalid"))
 		}
+		key, err := StateKeyForIdentity(cfg.Identity, t.Direction, t.Remote, t.Path)
+		if err != nil || key != t.StateKey || (t.Direction != protocol.DirectionUpload && t.Direction != protocol.DirectionDownload) {
+			cancel()
+			return fail(fmt.Errorf("队列检查点索引不符"))
+		}
+		if t.State.Active() {
+			t.State = Paused
+			t.Error = "上次退出时任务未完成，请选择继续"
+		}
+		if t.WantCancel {
+			t.State = Pending
+			t.Error = "上次取消尚未完成，请重试取消"
+		}
 		taskCopy := t
 		m.tasks[t.ID] = &taskCopy
+	}
+
+	var restored []Task
+	for _, t := range m.tasks {
+		restored = append(restored, *t)
+	}
+	if err := s.Write(restored, false); err != nil {
+		cancel()
+		return fail(err)
 	}
 
 	m.currentDirty = true
 	m.historyDirty = true
 	m.pruneRecords(time.Now())
 
+	go m.loop()
 	return m, nil
+}
+
+// SetRunner 设置传输执行器
+func (m *Manager) SetRunner(r TaskRunner) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.runner = r
 }
 
 // Enqueue 批次加入传输任务
@@ -358,10 +389,8 @@ func (m *Manager) close() error {
 	m.mu.Unlock()
 
 	m.cancel()
-	select {
-	case <-m.loopDone:
-	default:
-	}
+	m.signal()
+	<-m.loopDone
 	m.wg.Wait()
 	return m.store.Close()
 }
