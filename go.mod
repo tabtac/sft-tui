@@ -6,6 +6,7 @@ require (
 	github.com/Microsoft/go-winio v0.6.1
 	golang.org/x/sys v0.49.0
 	golang.org/x/text v0.21.0
+	golang.org/x/time v0.12.0
 	modernc.org/sqlite v1.62.0
 )
 
