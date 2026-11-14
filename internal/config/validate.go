@@ -80,6 +80,11 @@ func (c Server) validate(requireAuthorization bool) error {
 	if err := validateBandwidth(c.Bandwidth, c.Limits.ChunkSize); err != nil {
 		return err
 	}
+	if c.GlobalBandwidth != nil {
+		if err := validateBandwidth(*c.GlobalBandwidth, c.Limits.ChunkSize); err != nil {
+			return fmt.Errorf("全局带宽配置非法：%w", err)
+		}
+	}
 	if c.Listen == "" || c.StorageRoot == "" || r.MaxConnections == 0 || r.MaxHandshakes == 0 ||
 		r.MaxHandshakes > r.MaxConnections || r.MaxUnauthenticatedPerIP == 0 || r.MaxConnectionsPerUser == 0 ||
 		r.MaxFileBytes == 0 || r.MaxFileBytes > math.MaxInt64 || r.UserStorageBytes < r.MaxFileBytes || r.UserStorageBytes > math.MaxInt64 {

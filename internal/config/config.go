@@ -83,6 +83,7 @@ type Server struct {
 	Timeouts          Timeouts           `json:"timeouts"`
 	Resources         Resources          `json:"resources"`
 	Bandwidth         Bandwidth          `json:"bandwidth"`
+	GlobalBandwidth   *Bandwidth         `json:"global_bandwidth,omitempty"`
 	Logging           Logging            `json:"logging"`
 	AuthorizedClients []AuthorizedClient `json:"authorized_clients"`
 }
@@ -241,10 +242,11 @@ func ClientAddressFromListen(listen string) (string, error) {
 	return net.JoinHostPort(host, port), nil
 }
 
-// RestartConfig 排除支持热重载的字段（TLS 与 AuthorizedClients）。
+// RestartConfig 排除支持热重载的字段（TLS、AuthorizedClients 与 GlobalBandwidth）。
 func RestartConfig(c Server) Server {
 	c.TLS = TLSFiles{}
 	c.AuthorizedClients = nil
+	c.GlobalBandwidth = nil
 	return c
 }
 
@@ -254,7 +256,9 @@ func RestartRequired(a, b Server) bool {
 
 // MergeHot 保留运行中需重启生效的字段，仅合并热更新字段。
 func MergeHot(base, updated Server) Server {
-	base.TLS, base.AuthorizedClients = updated.TLS, updated.AuthorizedClients
+	base.TLS = updated.TLS
+	base.AuthorizedClients = updated.AuthorizedClients
+	base.GlobalBandwidth = updated.GlobalBandwidth
 	return base
 }
 
