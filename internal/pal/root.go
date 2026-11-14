@@ -59,8 +59,8 @@ func (r *Root) EnsureSecureSubdir(sub string) error {
 		if !info.IsDir() {
 			return fmt.Errorf("security violation: sub-path %q is not a directory", sub)
 		}
-		// 收紧已有目录权限为 0700
-		return r.root.Chmod(sub, 0700)
+		// 收紧已有目录权限为私有访问
+		return r.secureSubdir(sub)
 	}
 
 	if !os.IsNotExist(err) {
@@ -81,7 +81,7 @@ func (r *Root) EnsureSecureSubdir(sub string) error {
 		_ = r.root.Remove(sub)
 		return fmt.Errorf("security violation: created sub-path %q is not a regular directory", sub)
 	}
-	return nil
+	return r.secureSubdir(sub)
 }
 
 // OpenFile 锚定在根目录内安全打开文件

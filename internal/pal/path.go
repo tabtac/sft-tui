@@ -3,7 +3,7 @@ package pal
 import (
 	"errors"
 	"fmt"
-	"os"
+	"path"
 	"path/filepath"
 	"strings"
 )
@@ -14,6 +14,9 @@ var ErrPathTraversal = errors.New("path traversal detected")
 // SecureJoin 严格校验并拼接基准目录与相对路径，确保结果严格位于 baseDir 之内。
 // 防御 "../" 穿越、绝对路径注入、Windows 盘符注入以及特殊相对路径。
 func SecureJoin(baseDir, relPath string) (string, error) {
+	if strings.ContainsRune(relPath, 0) {
+		return "", fmt.Errorf("%w: path %q contains null byte", ErrPathTraversal, relPath)
+	}
 	cleanBase, err := filepath.Abs(baseDir)
 	if err != nil {
 		return "", fmt.Errorf("invalid base directory: %w", err)
@@ -22,7 +25,7 @@ func SecureJoin(baseDir, relPath string) (string, error) {
 	// 统一将反斜杠替换为正斜杠，使 Linux 与 Windows 都能统一识别
 	normalized := strings.ReplaceAll(relPath, "\\", "/")
 
-	// 拦截 Windows 盘符（如 "C:/Windows"）
+	// 拦截 Windows 盘符（如 "C:/Windows"、"C:relative"）
 	if len(normalized) >= 2 && normalized[1] == ':' {
 		c := normalized[0]
 		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') {
@@ -30,13 +33,13 @@ func SecureJoin(baseDir, relPath string) (string, error) {
 		}
 	}
 
-	// 拦截以 "/" 开头的绝对路径
+	// 拦截以 "/" 开头的绝对路径或 UNC 路径
 	if strings.HasPrefix(normalized, "/") {
 		return "", fmt.Errorf("%w: absolute path %q is prohibited", ErrPathTraversal, relPath)
 	}
 
-	cleanRel := filepath.Clean(normalized)
-	if cleanRel == ".." || strings.HasPrefix(cleanRel, "../") || strings.HasPrefix(cleanRel, `..\`) {
+	cleanRel := path.Clean(normalized)
+	if cleanRel == ".." || strings.HasPrefix(cleanRel, "../") {
 		return "", fmt.Errorf("%w: path %q attempts to escape base %q", ErrPathTraversal, relPath, baseDir)
 	}
 
@@ -47,12 +50,4 @@ func SecureJoin(baseDir, relPath string) (string, error) {
 	}
 
 	return fullPath, nil
-}
-
-// EnsureSecureDir 确保创建私有目录（权限 0700）
-func EnsureSecureDir(dir string) error {
-	if err := os.MkdirAll(dir, 0700); err != nil {
-		return err
-	}
-	return os.Chmod(dir, 0700)
 }

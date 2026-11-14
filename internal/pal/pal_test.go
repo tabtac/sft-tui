@@ -38,12 +38,12 @@ func TestSecureJoin(t *testing.T) {
 	}
 }
 
-func TestEnsureSecureDir(t *testing.T) {
+func TestEnsurePrivateDir(t *testing.T) {
 	tempDir := t.TempDir()
 	target := filepath.Join(tempDir, "secure_dir")
 
-	if err := EnsureSecureDir(target); err != nil {
-		t.Fatalf("EnsureSecureDir failed: %v", err)
+	if err := EnsurePrivateDir(target); err != nil {
+		t.Fatalf("EnsurePrivateDir failed: %v", err)
 	}
 
 	info, err := os.Stat(target)

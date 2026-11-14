@@ -4,13 +4,14 @@ package pal
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"syscall"
 )
 
 // AtomicReplace 在 Linux 下使用系统调用原子重命名。
-// 若跨设备 (EXDEV)，则复制后落盘再删除源文件。
+// 若跨设备 (EXDEV)，先复制到目标同目录临时文件并落盘，再原子重命名覆盖目标。
 func AtomicReplace(src, dst string) error {
 	err := os.Rename(src, dst)
 	if err == nil {
@@ -20,8 +21,7 @@ func AtomicReplace(src, dst string) error {
 
 	var linkErr *os.LinkError
 	if errors.As(err, &linkErr) && errors.Is(linkErr.Err, syscall.EXDEV) {
-		// 跨文件系统备选路径
-		if err := CopyFile(src, dst); err != nil {
+		if err := replaceCrossDevice(src, dst); err != nil {
 			return err
 		}
 		_ = os.Remove(src)
@@ -29,6 +29,34 @@ func AtomicReplace(src, dst string) error {
 		return nil
 	}
 	return err
+}
+
+func replaceCrossDevice(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+
+	inInfo, err := in.Stat()
+	if err != nil {
+		return err
+	}
+	if !inInfo.Mode().IsRegular() {
+		return fmt.Errorf("source must be a regular file: %s", src)
+	}
+
+	tmp, err := os.CreateTemp(filepath.Dir(dst), ".replace-*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
+
+	if err := syncAndCloseCopy(tmp, in); err != nil {
+		return err
+	}
+	return os.Rename(tmpName, dst)
 }
 
 // LockFile 非阻塞独占锁

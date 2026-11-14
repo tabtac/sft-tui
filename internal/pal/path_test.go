@@ -44,11 +44,19 @@ func TestReviewSecureJoinAcceptsContainedPaths(t *testing.T) {
 }
 
 func TestReviewStageParentUsesNativePathRules(t *testing.T) {
-	for _, path := range []string{"a", "a/b", filepath.Join(string(filepath.Separator), "a"), filepath.Join("a", "b", "c")} {
-		t.Run(path, func(t *testing.T) {
-			// BUG: 手写 filepathDir 对 /a 返回空串，StageAndReplace 会在系统临时目录创建临时文件。
-			if got, want := filepathDir(path), filepath.Dir(path); got != want {
-				t.Errorf("BUG: temporary file parent=%q want=%q", got, want)
+	dir := t.TempDir()
+	for _, rel := range []string{"a", filepath.Join("sub", "b")} {
+		t.Run(rel, func(t *testing.T) {
+			target := filepath.Join(dir, rel)
+			if err := os.MkdirAll(filepath.Dir(target), 0700); err != nil {
+				t.Fatal(err)
+			}
+			if err := StageAndReplace(target, []byte("data")); err != nil {
+				t.Fatalf("StageAndReplace failed: %v", err)
+			}
+			got, err := os.ReadFile(target)
+			if err != nil || string(got) != "data" {
+				t.Errorf("staged content=%q err=%v", got, err)
 			}
 		})
 	}

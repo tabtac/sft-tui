@@ -50,6 +50,28 @@ func TestDownloadTaskLifecycle(t *testing.T) {
 		t.Fatalf("ReadChunkAt offset 0: got %q, err %v", chunk1, err)
 	}
 
+	// 4.5 模拟进度落盘后服务端重启，下载任务不得被错误标记为 FAILED
+	if err := s.CheckpointDownload(ctx, dlTask.ID, 5); err != nil {
+		t.Fatalf("CheckpointDownload before reopen: %v", err)
+	}
+	_ = f.Close()
+	_ = fAgain.Close()
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close before reopen: %v", err)
+	}
+	reopened, err := OpenStore(root)
+	if err != nil {
+		t.Fatalf("OpenStore reopen: %v", err)
+	}
+	s = reopened
+	recoveredDL, err := s.GetTask(ctx, dlTask.ID)
+	if err != nil {
+		t.Fatalf("GetTask after reopen: %v", err)
+	}
+	if recoveredDL.Status != TaskActive || recoveredDL.Offset != 5 {
+		t.Fatalf("reopen corrupted active download task: %+v", recoveredDL)
+	}
+
 	chunk2, err := s.ReadChunkAt(ctx, dlTask.ID, 5, 200)
 	if err != nil || !bytes.Equal(chunk2, []byte(" secure file transfer")) {
 		t.Fatalf("ReadChunkAt offset 5: got %q, err %v", chunk2, err)

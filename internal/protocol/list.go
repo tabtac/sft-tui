@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"io"
+	"math"
 )
 
 type ListRequest struct {
@@ -62,7 +63,7 @@ func marshalListResponse(x ListResponse) ([]byte, error) {
 
 	previous := ""
 	for _, f := range x.Files {
-		if ValidateName(f.FileName) != nil || f.FileName <= previous || f.Size > 1<<63-1 {
+		if ValidateName(f.FileName) != nil || f.FileName <= previous || f.Size > math.MaxInt64 {
 			return nil, badListError()
 		}
 		_ = binary.Write(&b, binary.BigEndian, uint16(len(f.FileName)))
@@ -98,7 +99,7 @@ func unmarshalListResponse(p []byte, x *ListResponse) error {
 		if ValidateName(entry.FileName) != nil || entry.FileName <= previous {
 			return badListError()
 		}
-		if binary.Read(r, binary.BigEndian, &entry.Size) != nil || entry.Size > 1<<63-1 {
+		if binary.Read(r, binary.BigEndian, &entry.Size) != nil || entry.Size > math.MaxInt64 {
 			return badListError()
 		}
 		if _, err := io.ReadFull(r, entry.SHA256[:]); err != nil {

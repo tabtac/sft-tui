@@ -206,8 +206,9 @@ func Open(cfg Config) (*Manager, error) {
 // SetRunner 设置传输执行器
 func (m *Manager) SetRunner(r TaskRunner) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	m.runner = r
+	m.mu.Unlock()
+	m.signal()
 }
 
 // Enqueue 批次加入传输任务
@@ -413,6 +414,12 @@ func (m *Manager) pruneRecords(now time.Time) {
 	if idx < len(m.history) {
 		m.history = m.history[:idx]
 		m.historyDirty = true
+	}
+	for id, t := range m.tasks {
+		if t.Terminal() && t.Updated.Before(cutoff) {
+			delete(m.tasks, id)
+			m.currentDirty = true
+		}
 	}
 	m.nextPrune = now.Add(time.Hour)
 }

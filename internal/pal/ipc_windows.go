@@ -26,11 +26,17 @@ func GetIPCPath(baseDir string) string {
 	return fmt.Sprintf(`\\.\pipe\sftd-%s`, hex.EncodeToString(h[:8]))
 }
 
-// ListenIPC 监听 Windows Named Pipe
+// ListenIPC 监听 Windows Named Pipe，配置仅当前用户与 SYSTEM 可访问的私有 DACL
 func ListenIPC(endpoint string) (net.Listener, error) {
+	sid, err := CurrentUserSID()
+	if err != nil {
+		return nil, err
+	}
+	sddl := "D:P(A;;GA;;;SY)(A;;GA;;;" + sid + ")"
 	cfg := &winio.PipeConfig{
-		InputBufferSize:  4096,
-		OutputBufferSize: 4096,
+		SecurityDescriptor: sddl,
+		InputBufferSize:    4096,
+		OutputBufferSize:   4096,
 	}
 	return winio.ListenPipe(endpoint, cfg)
 }

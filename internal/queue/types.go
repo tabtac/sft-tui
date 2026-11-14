@@ -87,6 +87,17 @@ type Task struct {
 	Speed          float64            `json:"-"`
 	ETA            time.Duration      `json:"-"`
 	SHA256         string             `json:"sha256,omitempty"`
+	RequestID      string             `json:"request_id,omitempty"`
+	TransferID     string             `json:"transfer_id,omitempty"`
+	TempName       string             `json:"temp_name,omitempty"`
+	TempDevice     uint64             `json:"temp_device,omitempty"`
+	TempInode      uint64             `json:"temp_inode,omitempty"`
+	Published      bool               `json:"published,omitempty"`
+}
+
+// HasCheckpoint 判断任务是否已绑定服务端传输或本地临时下载状态
+func (t Task) HasCheckpoint() bool {
+	return t.TransferID != "" || t.TempName != "" || t.TempInode != 0 || t.Published
 }
 
 // Terminal 终态判断

@@ -19,6 +19,9 @@ func CopyFile(src, dst string) error {
 	if err != nil {
 		return err
 	}
+	if !inInfo.Mode().IsRegular() {
+		return fmt.Errorf("source must be a regular file: %s", src)
+	}
 
 	if dstInfo, err := os.Stat(dst); err == nil {
 		if os.SameFile(inInfo, dstInfo) {
@@ -30,7 +33,16 @@ func CopyFile(src, dst string) error {
 	if err != nil {
 		return err
 	}
-	defer out.Close()
+	return syncAndCloseCopy(out, in)
+}
+
+func syncAndCloseCopy(out *os.File, in *os.File) error {
+	closed := false
+	defer func() {
+		if !closed {
+			_ = out.Close()
+		}
+	}()
 
 	if _, err := io.Copy(out, in); err != nil {
 		return err
@@ -38,12 +50,28 @@ func CopyFile(src, dst string) error {
 	if err := out.Sync(); err != nil {
 		return err
 	}
+	closed = true
 	return out.Close()
+}
+
+// CheckRegularOrAbsent 校验路径若存在则必须是普通文件（严禁符号链接或目录等非常规文件）
+func CheckRegularOrAbsent(path string) error {
+	info, err := os.Lstat(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+		return fmt.Errorf("security violation: %q must be a regular file", path)
+	}
+	return nil
 }
 
 // StageAndReplace 写入临时数据并原子发布到最终目标
 func StageAndReplace(dst string, data []byte) error {
-	tmp, err := os.CreateTemp(filepathDir(dst), ".stage-*")
+	tmp, err := os.CreateTemp(filepath.Dir(dst), ".stage-*")
 	if err != nil {
 		return err
 	}
@@ -63,8 +91,4 @@ func StageAndReplace(dst string, data []byte) error {
 	}
 
 	return AtomicReplace(tmpName, dst)
-}
-
-func filepathDir(p string) string {
-	return filepath.Dir(p)
 }

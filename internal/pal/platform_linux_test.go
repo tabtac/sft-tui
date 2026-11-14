@@ -9,32 +9,22 @@ import (
 )
 
 func TestReviewPrivateDirectoryPermissions(t *testing.T) {
-	for _, ensure := range []struct {
-		name string
-		run  func(string) error
-	}{
-		{"private", EnsurePrivateDir}, {"secure", EnsureSecureDir},
-	} {
-		t.Run(ensure.name, func(t *testing.T) {
-			path := filepath.Join(t.TempDir(), "private")
-			if err := os.Mkdir(path, 0777); err != nil {
-				t.Fatal(err)
-			}
-			if err := os.Chmod(path, 0777); err != nil {
-				t.Fatal(err)
-			}
-			if err := ensure.run(path); err != nil {
-				t.Fatal(err)
-			}
-			info, err := os.Stat(path)
-			if err != nil {
-				t.Fatal(err)
-			}
-			// BUG: EnsureSecureDir 对已有宽松目录仅 MkdirAll，不会收紧权限。
-			if info.Mode().Perm() != 0700 {
-				t.Errorf("BUG: private directory permissions=%o want=700", info.Mode().Perm())
-			}
-		})
+	path := filepath.Join(t.TempDir(), "private")
+	if err := os.Mkdir(path, 0777); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(path, 0777); err != nil {
+		t.Fatal(err)
+	}
+	if err := EnsurePrivateDir(path); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0700 {
+		t.Errorf("private directory permissions=%o want=700", info.Mode().Perm())
 	}
 }
 
@@ -125,9 +115,14 @@ func TestReviewSecureSubdirTightensExistingPermissions(t *testing.T) {
 }
 
 func TestReviewNativeParentDirectoryForBackslashFilename(t *testing.T) {
-	// Linux 的反斜杠是文件名字符，临时文件必须留在真正的父目录。
-	path := filepath.Join(t.TempDir(), `config\name`)
-	if got, want := filepathDir(path), filepath.Dir(path); got != want {
-		t.Errorf("BUG: Linux backslash filename uses wrong staging directory: %q want=%q", got, want)
+	// Linux 的反斜杠是文件名字符，StageAndReplace 必须在真正的父目录中落盘替换。
+	dir := t.TempDir()
+	path := filepath.Join(dir, `config\name`)
+	if err := StageAndReplace(path, []byte("ok")); err != nil {
+		t.Fatalf("StageAndReplace failed: %v", err)
+	}
+	got, err := os.ReadFile(path)
+	if err != nil || string(got) != "ok" {
+		t.Errorf("staged backslash filename content=%q err=%v", got, err)
 	}
 }

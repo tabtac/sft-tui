@@ -36,6 +36,24 @@ func PrivateSecurityDescriptor() (*windows.SECURITY_DESCRIPTOR, error) {
 	return windows.SecurityDescriptorFromString(sddl)
 }
 
+// applyPrivateDACL 为目录句柄应用仅当前用户与 SYSTEM 可访问的受保护 DACL
+func applyPrivateDACL(h windows.Handle) error {
+	sd, err := PrivateSecurityDescriptor()
+	if err != nil {
+		return err
+	}
+	dacl, _, err := sd.DACL()
+	if err != nil {
+		return err
+	}
+	return windows.SetSecurityInfo(
+		h,
+		windows.SE_FILE_OBJECT,
+		windows.DACL_SECURITY_INFORMATION|windows.PROTECTED_DACL_SECURITY_INFORMATION,
+		nil, nil, dacl, nil,
+	)
+}
+
 // EnsurePrivateDir 在 Windows 下确保私有目录安全：
 // 1. 若已存在，强制校验不是重解析点/符号链接，并应用私有安全描述符。
 // 2. 若不存在，在创建时即应用私有安全描述符（ACL）。
@@ -45,7 +63,6 @@ func EnsurePrivateDir(path string) error {
 		return err
 	}
 
-	// 探测是否存在
 	h, err := windows.CreateFile(
 		p,
 		windows.GENERIC_READ|windows.WRITE_DAC,
@@ -67,22 +84,7 @@ func EnsurePrivateDir(path string) error {
 		if info.FileAttributes&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 {
 			return fmt.Errorf("security violation: %q is a reparse point/symlink", path)
 		}
-
-		// 重新应用私有 ACL
-		sd, err := PrivateSecurityDescriptor()
-		if err != nil {
-			return err
-		}
-		dacl, _, err := sd.DACL()
-		if err != nil {
-			return err
-		}
-		return windows.SetSecurityInfo(
-			h,
-			windows.SE_FILE_OBJECT,
-			windows.DACL_SECURITY_INFORMATION|windows.PROTECTED_DACL_SECURITY_INFORMATION,
-			nil, nil, dacl, nil,
-		)
+		return applyPrivateDACL(h)
 	}
 
 	// 不存在，创建父目录并设置 ACL
@@ -101,11 +103,64 @@ func EnsurePrivateDir(path string) error {
 	}
 
 	if err := windows.CreateDirectory(p, secAttr); err != nil {
-		if !os.IsExist(err) {
-			return &os.PathError{Op: "CreateDirectory", Path: path, Err: err}
+		if os.IsExist(err) {
+			return EnsurePrivateDir(path)
 		}
+		return &os.PathError{Op: "CreateDirectory", Path: path, Err: err}
 	}
 	return nil
+}
+
+// secureSubdir 对根目录句柄内的已有子目录收紧私有 DACL（同时验证句柄指向同目录、非重解析点）
+func (r *Root) secureSubdir(sub string) error {
+	pinned, err := r.root.Open(sub)
+	if err != nil {
+		return err
+	}
+	defer pinned.Close()
+
+	var pinnedInfo windows.ByHandleFileInformation
+	if err := windows.GetFileInformationByHandle(windows.Handle(pinned.Fd()), &pinnedInfo); err != nil {
+		return err
+	}
+
+	targetPath, err := SecureJoin(r.path, sub)
+	if err != nil {
+		return err
+	}
+	p, err := windows.UTF16PtrFromString(targetPath)
+	if err != nil {
+		return err
+	}
+
+	h, err := windows.CreateFile(
+		p,
+		windows.GENERIC_READ|windows.WRITE_DAC,
+		windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE,
+		nil,
+		windows.OPEN_EXISTING,
+		windows.FILE_FLAG_BACKUP_SEMANTICS|windows.FILE_FLAG_OPEN_REPARSE_POINT,
+		0,
+	)
+	if err != nil {
+		return &os.PathError{Op: "open subdir", Path: targetPath, Err: err}
+	}
+	defer windows.CloseHandle(h)
+
+	var info windows.ByHandleFileInformation
+	if err := windows.GetFileInformationByHandle(h, &info); err != nil {
+		return err
+	}
+	if info.FileAttributes&windows.FILE_ATTRIBUTE_DIRECTORY == 0 ||
+		info.FileAttributes&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+		return fmt.Errorf("security violation: sub-path %q is a reparse point or non-directory", sub)
+	}
+	if info.VolumeSerialNumber != pinnedInfo.VolumeSerialNumber ||
+		info.FileIndexHigh != pinnedInfo.FileIndexHigh ||
+		info.FileIndexLow != pinnedInfo.FileIndexLow {
+		return fmt.Errorf("security violation: sub-path %q changed during hardening", sub)
+	}
+	return applyPrivateDACL(h)
 }
 
 // SyncRootSubdir Windows 目录不支持 fsync，由 NTFS 日志保障元数据一致性

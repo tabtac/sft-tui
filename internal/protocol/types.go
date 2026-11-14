@@ -45,6 +45,11 @@ const (
 	DirectionDownload Direction = 0x02
 )
 
+// Valid 校验传输方向是否合法
+func (d Direction) Valid() bool {
+	return d == DirectionUpload || d == DirectionDownload
+}
+
 // ResponseState 服务端对任务的响应状态
 type ResponseState uint8
 
@@ -53,6 +58,11 @@ const (
 	ResponseCompleted ResponseState = 0x02
 )
 
+// Valid 校验响应状态是否合法
+func (s ResponseState) Valid() bool {
+	return s == ResponseActive || s == ResponseCompleted
+}
+
 // CancelMode 取消模式
 type CancelMode uint8
 
@@ -60,6 +70,11 @@ const (
 	CancelPause CancelMode = 0x01
 	CancelAbort CancelMode = 0x02
 )
+
+// Valid 校验取消模式是否合法
+func (m CancelMode) Valid() bool {
+	return m == CancelPause || m == CancelAbort
+}
 
 // RemoteError SFT/1 协议层错误
 type RemoteError struct {

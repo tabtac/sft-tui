@@ -184,16 +184,16 @@ func Marshal(v any) ([]byte, error) {
 		}
 		buf.Write(msg.Bytes)
 	case RemoteError:
-		if len(msg.Message) > MaxErrorMessageBytes || !utf8.ValidString(msg.Message) {
-			return nil, fmt.Errorf("错误文本过长或编码非法")
-		}
-		if err := write(msg.Code); err != nil {
+		if err := writeRemoteError(&buf, write, msg); err != nil {
 			return nil, err
 		}
-		if err := write(uint16(len(msg.Message))); err != nil {
+	case *RemoteError:
+		if msg == nil {
+			return nil, &RemoteError{Code: CodeBadFrame, Message: "空错误指针"}
+		}
+		if err := writeRemoteError(&buf, write, *msg); err != nil {
 			return nil, err
 		}
-		buf.WriteString(msg.Message)
 	default:
 		// 定长结构体直接通过 binary.Write 序列化
 		if err := write(v); err != nil {
@@ -250,8 +250,8 @@ func Unmarshal(payload []byte, out any) error {
 	case *Data:
 		if err = read(&target.FileOffset); err == nil {
 			rem := r.Len()
-			if rem < 1 {
-				return &RemoteError{Code: CodeBadFrame, Message: "DATA 负载不能为空"}
+			if rem < 1 || rem > MaxChunkSize {
+				return &RemoteError{Code: CodeBadFrame, Message: "DATA 负载长度越界"}
 			}
 			target.Bytes = make([]byte, rem)
 			_, err = io.ReadFull(r, target.Bytes)
@@ -289,5 +289,19 @@ func Unmarshal(payload []byte, out any) error {
 		return &RemoteError{Code: CodeBadFrame, Message: "消息包含多余未解析字节"}
 	}
 
+	return nil
+}
+
+func writeRemoteError(buf *bytes.Buffer, write func(any) error, msg RemoteError) error {
+	if len(msg.Message) > MaxErrorMessageBytes || !utf8.ValidString(msg.Message) {
+		return fmt.Errorf("错误文本过长或编码非法")
+	}
+	if err := write(msg.Code); err != nil {
+		return err
+	}
+	if err := write(uint16(len(msg.Message))); err != nil {
+		return err
+	}
+	buf.WriteString(msg.Message)
 	return nil
 }

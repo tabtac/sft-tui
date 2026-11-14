@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -47,12 +48,10 @@ func OpenStore(dir, identity string) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
-	if info, err := os.Lstat(dbPath); err == nil {
-		if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
-			return nil, fmt.Errorf("queue database must be a regular file: %q", dbPath)
+	for _, fName := range []string{dbPath, dbPath + "-wal", dbPath + "-shm"} {
+		if err := pal.CheckRegularOrAbsent(fName); err != nil {
+			return nil, err
 		}
-	} else if !os.IsNotExist(err) {
-		return nil, err
 	}
 
 	uri := url.URL{
@@ -80,12 +79,31 @@ func OpenStore(dir, identity string) (*Store, error) {
 	}
 
 	schema := `
+		PRAGMA journal_mode=WAL;
+		PRAGMA synchronous=FULL;
+		PRAGMA foreign_keys=ON;
+		PRAGMA busy_timeout=3000;
 		CREATE TABLE IF NOT EXISTS tasks(id TEXT PRIMARY KEY, record BLOB NOT NULL);
 		CREATE TABLE IF NOT EXISTS history(seq INTEGER PRIMARY KEY AUTOINCREMENT, record BLOB NOT NULL, updated INTEGER NOT NULL);
 		PRAGMA user_version=1;
 	`
 	if _, err := db.Exec(schema); err != nil {
 		return closeFailure(err)
+	}
+
+	var syncMode int
+	if err := db.QueryRow("PRAGMA synchronous;").Scan(&syncMode); err != nil {
+		return closeFailure(err)
+	}
+	if syncMode != 2 && syncMode != 3 {
+		return closeFailure(fmt.Errorf("queue sqlite synchronous pragma failed: expected FULL (2), got %d", syncMode))
+	}
+	var journalMode string
+	if err := db.QueryRow("PRAGMA journal_mode;").Scan(&journalMode); err != nil {
+		return closeFailure(err)
+	}
+	if strings.ToUpper(journalMode) != "WAL" {
+		return closeFailure(fmt.Errorf("queue sqlite journal_mode pragma failed: expected WAL, got %s", journalMode))
 	}
 
 	failed = false

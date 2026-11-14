@@ -118,9 +118,9 @@ func OpenStore(rootDir string) (*Store, error) {
 	}, nil
 }
 
-// reconcileStaging 检查并修复掉电或非正常退出留下的未确认尾部与数据缺失
+// reconcileStaging 检查并修复掉电或非正常退出留下的未确认尾部、未提交发布残留与数据缺失
 func reconcileStaging(root *pal.Root, db *sql.DB) error {
-	rows, err := db.Query("SELECT id, offset, file_size FROM tasks WHERE status NOT IN ('COMPLETED', 'FAILED', 'CANCELLED', 'EXPIRED')")
+	rows, err := db.Query("SELECT id, direction, offset, file_size, object_id FROM tasks WHERE status NOT IN ('COMPLETED', 'FAILED', 'CANCELLED', 'EXPIRED')")
 	if err != nil {
 		return err
 	}
@@ -128,13 +128,15 @@ func reconcileStaging(root *pal.Root, db *sql.DB) error {
 
 	type taskInfo struct {
 		idHex    string
+		dir      int
 		offset   uint64
 		fileSize uint64
+		objectID string
 	}
 	var list []taskInfo
 	for rows.Next() {
 		var item taskInfo
-		if err := rows.Scan(&item.idHex, &item.offset, &item.fileSize); err != nil {
+		if err := rows.Scan(&item.idHex, &item.dir, &item.offset, &item.fileSize, &item.objectID); err != nil {
 			return err
 		}
 		list = append(list, item)
@@ -144,7 +146,30 @@ func reconcileStaging(root *pal.Root, db *sql.DB) error {
 	}
 
 	for _, item := range list {
+		// 仅上传任务拥有 staging/.part 暂存文件；下载任务从不可变 objects/ 读取
+		if item.dir != int(protocol.DirectionUpload) {
+			continue
+		}
 		partRel := "staging/" + item.idHex + ".part"
+		objRel := objectRelPath(item.objectID)
+
+		// 修复 CommitUpload 阶段 Link/Rename 成功但 SQLite 事务未提交前的崩溃残留
+		if item.offset == item.fileSize {
+			var pubCount int
+			if err := db.QueryRow("SELECT COUNT(*) FROM published_files WHERE object_id=?", item.objectID).Scan(&pubCount); err != nil {
+				return err
+			}
+			if pubCount == 0 {
+				if _, objErr := root.Lstat(objRel); objErr == nil {
+					if _, partErr := root.Lstat(partRel); partErr == nil {
+						_ = root.Remove(objRel)
+					} else if os.IsNotExist(partErr) {
+						_ = root.Rename(objRel, partRel)
+					}
+				}
+			}
+		}
+
 		info, err := root.Lstat(partRel)
 		if err != nil {
 			if os.IsNotExist(err) {
@@ -224,6 +249,19 @@ func objectRelPath(objectID string) string {
 
 const taskColumns = "id, user_id, request_id, direction, file_name, file_size, file_sha256, object_id, offset, status, created_at, updated_at, expires_at"
 
+func parseDigestHex(shaHex string) (protocol.Digest, error) {
+	var d protocol.Digest
+	if len(shaHex) != 64 || !IsValidHex(shaHex, 64) {
+		return d, fmt.Errorf("corrupt sha256: %q", shaHex)
+	}
+	b, err := hex.DecodeString(shaHex)
+	if err != nil || len(b) != 32 {
+		return d, fmt.Errorf("corrupt sha256 bytes: %w", err)
+	}
+	copy(d[:], b)
+	return d, nil
+}
+
 func scanTask(row interface{ Scan(...any) error }) (Task, error) {
 	var t Task
 	var idHex, reqHex, shaHex string
@@ -253,19 +291,16 @@ func scanTask(row interface{ Scan(...any) error }) (Task, error) {
 	if !taskStatus.IsValid() {
 		return t, fmt.Errorf("corrupt status: %q", status)
 	}
-	if len(shaHex) != 64 || !IsValidHex(shaHex, 64) {
-		return t, fmt.Errorf("corrupt sha256: %q", shaHex)
-	}
-	b, err := hex.DecodeString(shaHex)
-	if err != nil || len(b) != 32 {
-		return t, fmt.Errorf("corrupt sha256 bytes: %w", err)
+	digest, err := parseDigestHex(shaHex)
+	if err != nil {
+		return t, err
 	}
 
 	t.ID = id
 	t.RequestID = reqID
 	t.Direction = protocol.Direction(dir)
 	t.Status = taskStatus
-	copy(t.FileSHA256[:], b)
+	t.FileSHA256 = digest
 
 	return t, nil
 }
@@ -393,6 +428,9 @@ func (s *Store) WriteChunkAt(ctx context.Context, taskID protocol.TransferID, of
 	task, err := s.getTaskLocked(ctx, taskID)
 	if err != nil {
 		return 0, err
+	}
+	if task.Direction != protocol.DirectionUpload {
+		return 0, errors.New("task is not an upload task")
 	}
 	if task.Status != TaskActive {
 		return 0, fmt.Errorf("task cannot be written: status is %s", task.Status)
@@ -531,12 +569,18 @@ func (s *Store) CommitUpload(ctx context.Context, taskID protocol.TransferID, fi
 	// 刷新 objects 目录落盘
 	_ = s.root.SyncRootSubdir("objects")
 
+	rollbackPublish := func() {
+		if linkErr == nil {
+			_ = s.root.Remove(objRel)
+		} else {
+			_ = s.root.Rename(objRel, partRel)
+		}
+	}
+
 	// 开启事务将元数据入库并标记任务完成
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		if linkErr == nil {
-			_ = s.root.Remove(objRel)
-		}
+		rollbackPublish()
 		return err
 	}
 	defer tx.Rollback()
@@ -547,9 +591,7 @@ func (s *Store) CommitUpload(ctx context.Context, taskID protocol.TransferID, fi
 		VALUES (?, ?, ?, ?, ?, ?)
 	`, task.ObjectID, task.UserID, task.FileName, task.FileSize, hex.EncodeToString(task.FileSHA256[:]), now)
 	if err != nil {
-		if linkErr == nil {
-			_ = s.root.Remove(objRel)
-		}
+		rollbackPublish()
 		return fmt.Errorf("publish metadata insertion failed: %w", err)
 	}
 
@@ -557,16 +599,12 @@ func (s *Store) CommitUpload(ctx context.Context, taskID protocol.TransferID, fi
 		UPDATE tasks SET status=?, updated_at=? WHERE id=?
 	`, string(TaskCompleted), now, IDToHex(taskID))
 	if err != nil {
-		if linkErr == nil {
-			_ = s.root.Remove(objRel)
-		}
+		rollbackPublish()
 		return err
 	}
 
 	if err := tx.Commit(); err != nil {
-		if linkErr == nil {
-			_ = s.root.Remove(objRel)
-		}
+		rollbackPublish()
 		return err
 	}
 
@@ -608,15 +646,10 @@ func (s *Store) ListPublishedFiles(ctx context.Context, userID, after string, li
 		if err := rows.Scan(&name, &size, &shaHex); err != nil {
 			return nil, false, err
 		}
-		if len(shaHex) != 64 || !IsValidHex(shaHex, 64) {
-			return nil, false, fmt.Errorf("corrupt published file sha256: %q", shaHex)
+		d, err := parseDigestHex(shaHex)
+		if err != nil {
+			return nil, false, err
 		}
-		b, err := hex.DecodeString(shaHex)
-		if err != nil || len(b) != 32 {
-			return nil, false, fmt.Errorf("corrupt published file sha256 bytes: %w", err)
-		}
-		var d protocol.Digest
-		copy(d[:], b)
 		entries = append(entries, protocol.FileEntry{
 			FileName: name,
 			Size:     size,
@@ -633,11 +666,7 @@ func (s *Store) ListPublishedFiles(ctx context.Context, userID, after string, li
 	return entries, hasMore, rows.Err()
 }
 
-// OpenPublishedFile 打开已发布的文件以供下载读取
-func (s *Store) OpenPublishedFile(ctx context.Context, userID, fileName string) (*os.File, PublishedFile, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
+func (s *Store) openPublishedLocked(ctx context.Context, userID, fileName string) (*os.File, PublishedFile, error) {
 	var pub PublishedFile
 	var shaHex string
 	err := s.db.QueryRowContext(ctx, `
@@ -652,14 +681,11 @@ func (s *Store) OpenPublishedFile(ctx context.Context, userID, fileName string) 
 		return nil, pub, err
 	}
 
-	if len(shaHex) != 64 || !IsValidHex(shaHex, 64) {
-		return nil, pub, fmt.Errorf("corrupt published file sha256: %q", shaHex)
+	digest, err := parseDigestHex(shaHex)
+	if err != nil {
+		return nil, pub, err
 	}
-	b, err := hex.DecodeString(shaHex)
-	if err != nil || len(b) != 32 {
-		return nil, pub, fmt.Errorf("corrupt published file sha256 bytes: %w", err)
-	}
-	copy(pub.SHA256[:], b)
+	pub.SHA256 = digest
 
 	objRel := objectRelPath(pub.ObjectID)
 	info, err := s.root.Lstat(objRel)
@@ -679,6 +705,13 @@ func (s *Store) OpenPublishedFile(ctx context.Context, userID, fileName string) 
 	}
 
 	return f, pub, nil
+}
+
+// OpenPublishedFile 打开已发布的文件以供下载读取
+func (s *Store) OpenPublishedFile(ctx context.Context, userID, fileName string) (*os.File, PublishedFile, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.openPublishedLocked(ctx, userID, fileName)
 }
 
 // GetTask 获取任务
@@ -720,7 +753,21 @@ func (s *Store) CreateDownloadTask(ctx context.Context, userID string, req proto
 		if existing.Direction != protocol.DirectionDownload || existing.FileName != req.FileName {
 			return Task{}, nil, ErrTaskConflict
 		}
-		f, err := s.root.OpenFile(objectRelPath(existing.ObjectID), os.O_RDONLY, 0)
+		if existing.Status == TaskExpired {
+			return Task{}, nil, ErrTaskExpired
+		}
+		if existing.Status == TaskCancelled || existing.Status == TaskFailed {
+			return Task{}, nil, ErrTaskConflict
+		}
+		objRel := objectRelPath(existing.ObjectID)
+		info, err := s.root.Lstat(objRel)
+		if err != nil {
+			return Task{}, nil, err
+		}
+		if !info.Mode().IsRegular() || uint64(info.Size()) != existing.FileSize {
+			return Task{}, nil, fmt.Errorf("damaged published object %q: irregular or size mismatch", existing.ObjectID)
+		}
+		f, err := s.root.OpenFile(objRel, os.O_RDONLY, 0)
 		if err != nil {
 			return Task{}, nil, err
 		}
@@ -729,35 +776,8 @@ func (s *Store) CreateDownloadTask(ctx context.Context, userID string, req proto
 		return Task{}, nil, err
 	}
 
-	// 2. 查询已发布文件
-	var pub PublishedFile
-	var shaHex string
-	err = s.db.QueryRowContext(ctx, `
-		SELECT object_id, user_id, file_name, file_size, file_sha256, created_at
-		FROM published_files
-		WHERE user_id=? AND file_name=?
-	`, userID, req.FileName).Scan(&pub.ObjectID, &pub.UserID, &pub.FileName, &pub.FileSize, &shaHex, &pub.CreatedAt)
-	if errors.Is(err, sql.ErrNoRows) {
-		return Task{}, nil, ErrFileNotFound
-	}
-	if err != nil {
-		return Task{}, nil, err
-	}
-
-	b, _ := hex.DecodeString(shaHex)
-	copy(pub.SHA256[:], b)
-
-	// 3. 校验并打开不可变对象文件
-	objRel := objectRelPath(pub.ObjectID)
-	info, err := s.root.Lstat(objRel)
-	if err != nil {
-		return Task{}, nil, err
-	}
-	if !info.Mode().IsRegular() || uint64(info.Size()) != pub.FileSize {
-		return Task{}, nil, fmt.Errorf("damaged published object %q: irregular or size mismatch", pub.ObjectID)
-	}
-
-	f, err := s.root.OpenFile(objRel, os.O_RDONLY, 0)
+	// 2. 查询并打开已发布不可变对象文件
+	f, pub, err := s.openPublishedLocked(ctx, userID, req.FileName)
 	if err != nil {
 		return Task{}, nil, err
 	}
@@ -1001,10 +1021,27 @@ func (s *Store) ExpireTasks(ctx context.Context, now time.Time) (int, error) {
 		return 0, err
 	}
 
+	if len(expired) == 0 {
+		return 0, nil
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+
+	nowUnix := now.Unix()
 	for _, item := range expired {
-		if _, err := s.db.ExecContext(ctx, "UPDATE tasks SET status=?, updated_at=? WHERE id=?", string(TaskExpired), now.Unix(), item.idHex); err != nil {
+		if _, err := tx.ExecContext(ctx, "UPDATE tasks SET status=?, updated_at=? WHERE id=?", string(TaskExpired), nowUnix, item.idHex); err != nil {
 			return 0, err
 		}
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+
+	for _, item := range expired {
 		if item.dir == int(protocol.DirectionUpload) {
 			id, _ := HexToID(item.idHex)
 			_ = s.root.Remove(stagingRelPath(id))

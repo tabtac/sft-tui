@@ -4,8 +4,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"os"
-	"path/filepath"
 	"time"
 
 	"sft-tui/internal/protocol"
@@ -119,15 +117,12 @@ func (m *Manager) Cancel(id string) error {
 	}
 
 	if r == nil {
-		checkpoint := filepath.Join(m.cfg.StateDir, t.StateKey+".json")
-		if _, e := os.Stat(checkpoint); os.IsNotExist(e) {
+		if !t.HasCheckpoint() {
 			old := *t
 			t.State = Cancelled
 			t.WantCancel = false
 			t.Error = ""
 			return m.persistIdle(t, old, true)
-		} else if e != nil {
-			return e
 		}
 	}
 
@@ -143,7 +138,7 @@ func (m *Manager) Cancel(id string) error {
 	}
 	if r != nil {
 		_ = r.op.Request(protocol.CancelAbort)
-	} else {
+	} else if !m.closed && m.storageErr == nil {
 		m.hold = false
 	}
 	m.signal()
@@ -153,6 +148,10 @@ func (m *Manager) Cancel(id string) error {
 // PauseAll 批量暂停所有任务，支持排空等待
 func (m *Manager) PauseAll(ctx context.Context) error {
 	m.mu.Lock()
+	if m.closed {
+		m.mu.Unlock()
+		return io.ErrClosedPipe
+	}
 	m.hold = true
 	var ids []string
 	var records []Task

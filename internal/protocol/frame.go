@@ -142,28 +142,26 @@ func WriteFrame(w io.Writer, typ Type, stream StreamID, payload []byte, negotiat
 		return err
 	}
 
-	var raw [HeaderSize]byte
-	copy(raw[:4], Magic)
-	raw[4] = Version
-	raw[5] = byte(typ)
-	binary.BigEndian.PutUint16(raw[6:8], 0)
-	binary.BigEndian.PutUint32(raw[8:12], uint32(stream))
-	binary.BigEndian.PutUint32(raw[12:16], uint32(len(payload)))
+	buf := make([]byte, HeaderSize+len(payload))
+	copy(buf[:4], Magic)
+	buf[4] = Version
+	buf[5] = byte(typ)
+	binary.BigEndian.PutUint16(buf[6:8], 0)
+	binary.BigEndian.PutUint32(buf[8:12], uint32(stream))
+	binary.BigEndian.PutUint32(buf[12:16], uint32(len(payload)))
+	copy(buf[HeaderSize:], payload)
 
-	// 依次写入帧头和负载
-	for _, chunk := range [][]byte{raw[:], payload} {
-		for len(chunk) > 0 {
-			n, err := w.Write(chunk)
-			if n < 0 || n > len(chunk) {
-				return io.ErrShortWrite
-			}
-			chunk = chunk[n:]
-			if err != nil {
-				return err
-			}
-			if n == 0 {
-				return io.ErrShortWrite
-			}
+	for len(buf) > 0 {
+		n, err := w.Write(buf)
+		if n < 0 || n > len(buf) {
+			return io.ErrShortWrite
+		}
+		buf = buf[n:]
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return io.ErrShortWrite
 		}
 	}
 

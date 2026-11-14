@@ -33,6 +33,11 @@ func EnsurePrivateDir(path string) error {
 	return os.Chmod(path, 0700)
 }
 
+// secureSubdir 收紧根内子目录权限为 0700
+func (r *Root) secureSubdir(sub string) error {
+	return r.root.Chmod(sub, 0700)
+}
+
 // SyncRootSubdir 刷新子目录元数据落盘
 func (r *Root) SyncRootSubdir(sub string) error {
 	f, err := r.root.Open(sub)

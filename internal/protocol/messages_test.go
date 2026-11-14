@@ -237,7 +237,7 @@ func TestMarshalUnmarshalAllTypes(t *testing.T) {
 		t.Errorf("GoAway mismatch")
 	}
 
-	// 7. RemoteError
+	// 7. RemoteError (值与指针序列化)
 	rErr := RemoteError{
 		Code:    CodeUnauthorized,
 		Message: "证书未通过认证",
@@ -246,9 +246,19 @@ func TestMarshalUnmarshalAllTypes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Marshal RemoteError failed: %v", err)
 	}
+	pPtr, err := Marshal(&rErr)
+	if err != nil || !bytes.Equal(p, pPtr) {
+		t.Fatalf("Marshal *RemoteError failed or mismatched: err=%v", err)
+	}
 	var outErr RemoteError
 	if err := Unmarshal(p, &outErr); err != nil || outErr.Code != rErr.Code || outErr.Message != rErr.Message {
 		t.Fatalf("RemoteError mismatch: %+v vs %+v, err=%v", rErr, outErr, err)
+	}
+
+	// 8. DATA 超过 MaxChunkSize 应拒绝反序列化
+	oversizedData := make([]byte, DataOffsetSize+MaxChunkSize+1)
+	if err := Unmarshal(oversizedData, &outData); err == nil {
+		t.Error("expected error for oversized DATA payload in Unmarshal")
 	}
 
 	// 8. 反序列化时末尾包含多余字节应报错

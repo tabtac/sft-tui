@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"path/filepath"
 	"sort"
 	"time"
 
@@ -40,7 +39,7 @@ func (m *Manager) dispatch() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	if m.closed || m.hold || m.storageErr != nil {
+	if m.closed || m.hold || m.storageErr != nil || m.runner == nil {
 		return
 	}
 
@@ -140,12 +139,7 @@ func (m *Manager) run(task Task, r *running) {
 					m.Progress(task.ID, transferred, total, phase)
 				})
 			} else {
-				// 默认状态流转（测试与未挂载传输层时自驱）
-				started = true
-				m.Progress(task.ID, 0, task.Size, Preparing)
-				m.Progress(task.ID, 0, task.Size, Hashing)
-				m.Progress(task.ID, task.Size, task.Size, Transferring)
-				m.Progress(task.ID, task.Size, task.Size, Verifying)
+				err = fmt.Errorf("未配置传输执行器")
 			}
 		}
 	}
@@ -185,8 +179,7 @@ func (m *Manager) run(task Task, r *running) {
 		t.State = Paused
 		t.Error = ""
 	case !started && mode == protocol.CancelAbort:
-		checkpoint := filepath.Join(m.cfg.StateDir, t.StateKey+".json")
-		if _, e := os.Stat(checkpoint); os.IsNotExist(e) {
+		if !t.HasCheckpoint() {
 			t.State = Cancelled
 			t.WantCancel = false
 			t.Error = ""
@@ -212,11 +205,14 @@ func (m *Manager) run(task Task, r *running) {
 }
 
 func (m *Manager) cleanCheckpoint(ctx context.Context, t Task) error {
-	checkpoint := filepath.Join(m.cfg.StateDir, t.StateKey+".json")
-	if _, err := os.Stat(checkpoint); os.IsNotExist(err) {
+	if !t.HasCheckpoint() {
 		return nil
-	} else if err != nil {
-		return err
 	}
-	return os.Remove(checkpoint)
+	m.mu.Lock()
+	runner := m.runner
+	m.mu.Unlock()
+	if runner == nil {
+		return fmt.Errorf("未配置传输执行器")
+	}
+	return runner(ctx, t, NewOperation(ctx), nil)
 }
