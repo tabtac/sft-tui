@@ -36,13 +36,13 @@ func SecureJoin(baseDir, relPath string) (string, error) {
 	}
 
 	cleanRel := filepath.Clean(normalized)
-	if strings.HasPrefix(cleanRel, "..") || cleanRel == ".." {
+	if cleanRel == ".." || strings.HasPrefix(cleanRel, "../") || strings.HasPrefix(cleanRel, `..\`) {
 		return "", fmt.Errorf("%w: path %q attempts to escape base %q", ErrPathTraversal, relPath, baseDir)
 	}
 
 	fullPath := filepath.Join(cleanBase, filepath.FromSlash(cleanRel))
 	rel, err := filepath.Rel(cleanBase, fullPath)
-	if err != nil || strings.HasPrefix(rel, "..") || rel == ".." {
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
 		return "", fmt.Errorf("%w: resolved path %q is outside base %q", ErrPathTraversal, fullPath, cleanBase)
 	}
 
@@ -51,5 +51,8 @@ func SecureJoin(baseDir, relPath string) (string, error) {
 
 // EnsureSecureDir 确保创建私有目录（权限 0700）
 func EnsureSecureDir(dir string) error {
-	return os.MkdirAll(dir, 0700)
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return err
+	}
+	return os.Chmod(dir, 0700)
 }

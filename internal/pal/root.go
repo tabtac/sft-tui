@@ -3,6 +3,7 @@ package pal
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 )
 
 // Root 封装标准库 os.Root，提供锚定根目录的文件系统操作，从内核与系统调用层面阻止符号链接与路径穿越。
@@ -13,18 +14,22 @@ type Root struct {
 
 // OpenRoot 打开并锁定指定的根目录，在打开前强制执行私有安全权限校验与符号链接排查。
 func OpenRoot(path string) (*Root, error) {
-	if err := EnsurePrivateDir(path); err != nil {
-		return nil, fmt.Errorf("failed to secure root directory %q: %w", path, err)
+	absPath, err := filepath.Abs(path)
+	if err != nil {
+		return nil, fmt.Errorf("invalid path %q: %w", path, err)
+	}
+	if err := EnsurePrivateDir(absPath); err != nil {
+		return nil, fmt.Errorf("failed to secure root directory %q: %w", absPath, err)
 	}
 
-	r, err := os.OpenRoot(path)
+	r, err := os.OpenRoot(absPath)
 	if err != nil {
 		return nil, fmt.Errorf("open root failed: %w", err)
 	}
 
 	return &Root{
 		root: r,
-		path: path,
+		path: absPath,
 	}, nil
 }
 

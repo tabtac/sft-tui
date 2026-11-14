@@ -1,8 +1,10 @@
 package pal
 
 import (
+	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 )
 
 // CopyFile 安全复制文件内容并落盘同步
@@ -12,6 +14,17 @@ func CopyFile(src, dst string) error {
 		return err
 	}
 	defer in.Close()
+
+	inInfo, err := in.Stat()
+	if err != nil {
+		return err
+	}
+
+	if dstInfo, err := os.Stat(dst); err == nil {
+		if os.SameFile(inInfo, dstInfo) {
+			return fmt.Errorf("source and destination point to the same file: %s", src)
+		}
+	}
 
 	out, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
 	if err != nil {
@@ -53,15 +66,5 @@ func StageAndReplace(dst string, data []byte) error {
 }
 
 func filepathDir(p string) string {
-	d := p
-	for i := len(p) - 1; i >= 0; i-- {
-		if p[i] == '/' || p[i] == '\\' {
-			d = p[:i]
-			break
-		}
-	}
-	if d == p {
-		return "."
-	}
-	return d
+	return filepath.Dir(p)
 }
