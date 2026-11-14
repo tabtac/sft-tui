@@ -117,7 +117,8 @@ func (m *Manager) run(task Task, r *running) {
 
 	if task.WantCancel {
 		// 取消已落盘检查点
-		err = m.cleanCheckpoint(r.op.Context(), task)
+		started = task.HasCheckpoint()
+		err = m.cleanCheckpoint(r.op.Context(), task, r.op)
 	} else {
 		if task.Direction == protocol.DirectionUpload && task.SourceModified != 0 {
 			info, e := os.Stat(task.Path)
@@ -168,10 +169,10 @@ func (m *Manager) run(task Task, r *running) {
 			t.Done = t.Size
 		}
 		t.Error = ""
-	case errors.Is(err, ErrPaused) || mode == protocol.CancelPause:
+	case errors.Is(err, ErrPaused):
 		t.State = Paused
 		t.Error = ""
-	case errors.Is(err, ErrCancelled) || mode == protocol.CancelAbort:
+	case errors.Is(err, ErrCancelled):
 		t.State = Cancelled
 		t.WantCancel = false
 		t.Error = ""
@@ -193,6 +194,9 @@ func (m *Manager) run(task Task, r *running) {
 		t.Error = err.Error()
 		if mode == protocol.CancelAbort || task.WantCancel {
 			t.WantCancel = true
+			t.Error = "取消尚未完成：" + t.Error
+		} else if mode == protocol.CancelPause {
+			t.Error = "暂停未确认：" + t.Error
 		}
 	}
 
@@ -204,7 +208,7 @@ func (m *Manager) run(task Task, r *running) {
 	m.signal()
 }
 
-func (m *Manager) cleanCheckpoint(ctx context.Context, t Task) error {
+func (m *Manager) cleanCheckpoint(ctx context.Context, t Task, op *Operation) error {
 	if !t.HasCheckpoint() {
 		return nil
 	}
@@ -214,5 +218,5 @@ func (m *Manager) cleanCheckpoint(ctx context.Context, t Task) error {
 	if runner == nil {
 		return fmt.Errorf("未配置传输执行器")
 	}
-	return runner(ctx, t, NewOperation(ctx), nil)
+	return runner(ctx, t, op, nil)
 }

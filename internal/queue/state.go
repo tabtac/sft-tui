@@ -232,6 +232,27 @@ func (m *Manager) ClearHistory() error {
 	return nil
 }
 
+// UpdateTask 原子修改并持久化运行中任务的检查点元数据（如 TransferID / RequestID / 临时文件信息）
+func (m *Manager) UpdateTask(id string, fn func(*Task)) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.closed {
+		return io.ErrClosedPipe
+	}
+	t := m.tasks[id]
+	if t == nil {
+		return fmt.Errorf("任务不存在")
+	}
+	old := *t
+	fn(t)
+	if err := m.persist(t, false); err != nil {
+		*t = old
+		return err
+	}
+	return nil
+}
+
 // Quiesce 安全静默当前队列，切换身份前排空所有进行中任务
 func (m *Manager) Quiesce(ctx context.Context) error {
 	err := m.PauseAll(ctx)
