@@ -207,6 +207,50 @@ func (m *Manager) PauseAll(ctx context.Context) error {
 	return nil
 }
 
+// ResumeAll 批量恢复所有处于暂停或可重试待处理状态的任务
+func (m *Manager) ResumeAll() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.closed {
+		return io.ErrClosedPipe
+	}
+	if m.storageErr != nil {
+		return m.storageErr
+	}
+
+	var records []Task
+	var restored []struct {
+		ptr *Task
+		old Task
+	}
+	now := time.Now()
+	for id, t := range m.tasks {
+		if m.active[id] != nil || t.WantCancel || (t.State != Paused && t.State != Pending) {
+			continue
+		}
+		restored = append(restored, struct {
+			ptr *Task
+			old Task
+		}{t, *t})
+		t.State = Waiting
+		t.Error = ""
+		t.Updated = now
+		records = append(records, *t)
+	}
+	if len(records) > 0 {
+		if err := m.saveRecords(records, false); err != nil {
+			for _, r := range restored {
+				*r.ptr = r.old
+			}
+			return err
+		}
+	}
+	m.hold = false
+	m.signal()
+	return nil
+}
+
 // ClearHistory 清空历史记录
 func (m *Manager) ClearHistory() error {
 	m.mu.Lock()

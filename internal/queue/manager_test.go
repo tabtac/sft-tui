@@ -235,3 +235,35 @@ func TestManagerConflictInSameBatch(t *testing.T) {
 		t.Fatal("expected duplicate destination in same batch to fail")
 	}
 }
+
+func TestManagerPauseAllAndResumeAll(t *testing.T) {
+	m, dir := newTestManager(t)
+	f1 := filepath.Join(dir, "r1.bin")
+	f2 := filepath.Join(dir, "r2.bin")
+	_ = os.WriteFile(f1, []byte("one"), 0600)
+	_ = os.WriteFile(f2, []byte("two"), 0600)
+
+	tasks, err := m.Enqueue([]Spec{
+		{Direction: protocol.DirectionUpload, Remote: "r1.bin", Path: f1},
+		{Direction: protocol.DirectionUpload, Remote: "r2.bin", Path: f2},
+	})
+	if err != nil || len(tasks) != 2 {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	if err := m.PauseAll(context.Background()); err != nil {
+		t.Fatalf("PauseAll: %v", err)
+	}
+	for _, tk := range m.Snapshot(false) {
+		if tk.State != Paused {
+			t.Fatalf("expected Paused after PauseAll, got %s", tk.State)
+		}
+	}
+	if err := m.ResumeAll(); err != nil {
+		t.Fatalf("ResumeAll: %v", err)
+	}
+	for _, tk := range m.Snapshot(false) {
+		if tk.State != Waiting {
+			t.Fatalf("expected Waiting after ResumeAll, got %s", tk.State)
+		}
+	}
+}
