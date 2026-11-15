@@ -83,9 +83,28 @@ func (s *Server) UpdateTLS(tlsCfg *tls.Config) {
 	}
 }
 
+type connGate struct {
+	acquireHandshake func() (release func(), accepted bool)
+	onAuthenticate   func(raw net.Conn, user string) (connID uint64, ok bool)
+	onDisconnect     func(raw net.Conn, connID uint64)
+}
+
 // HandleConn 对单条已接受的 TCP 连接执行 mTLS 1.3 握手、身份绑定与多路复用流调度。
 func (s *Server) HandleConn(ctx context.Context, raw net.Conn) {
+	s.handleConn(ctx, raw, nil)
+}
+
+func (s *Server) handleConn(ctx context.Context, raw net.Conn, gate *connGate) {
 	defer raw.Close()
+
+	var relHS func()
+	if gate != nil && gate.acquireHandshake != nil {
+		var ok bool
+		relHS, ok = gate.acquireHandshake()
+		if !ok {
+			return
+		}
+	}
 
 	conn := tls.Server(raw, s.tlsBase)
 	timeout := time.Duration(s.cfg.Timeouts.HandshakeSeconds) * time.Second
@@ -93,6 +112,9 @@ func (s *Server) HandleConn(ctx context.Context, raw net.Conn) {
 	handshakeCtx, cancel := context.WithTimeout(ctx, timeout)
 	err := conn.HandshakeContext(handshakeCtx)
 	cancel()
+	if relHS != nil {
+		relHS()
+	}
 	if err != nil {
 		s.logger.Debug("TLS 握手失败", "remote", raw.RemoteAddr(), "error", err)
 		return
@@ -112,9 +134,22 @@ func (s *Server) HandleConn(ctx context.Context, raw net.Conn) {
 
 	user := principal.UserID
 	var connID uint64
-	if s.hooks.OnConnect != nil {
+	if gate != nil && gate.onAuthenticate != nil {
 		var ok bool
-		connID, ok = s.hooks.OnConnect(user, raw.RemoteAddr().String())
+		connID, ok = gate.onAuthenticate(raw, user)
+		if !ok {
+			return
+		}
+		if gate.onDisconnect != nil {
+			defer gate.onDisconnect(raw, connID)
+		}
+	} else if s.hooks.OnConnect != nil {
+		remote := ""
+		if addr := raw.RemoteAddr(); addr != nil {
+			remote = addr.String()
+		}
+		var ok bool
+		connID, ok = s.hooks.OnConnect(user, remote)
 		if !ok {
 			return
 		}
