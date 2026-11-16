@@ -22,6 +22,9 @@ type Started struct {
 }
 
 func Start(ctx context.Context, executable, configPath string) (Started, error) {
+	if err := ctx.Err(); err != nil {
+		return Started{}, err
+	}
 	absConfig, err := filepath.Abs(configPath)
 	if err != nil {
 		return Started{}, err

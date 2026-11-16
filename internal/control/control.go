@@ -4,6 +4,7 @@ package control
 
 import (
 	"bufio"
+	"bytes"
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
@@ -141,9 +142,28 @@ func StartManaged(configPath, storageRoot string, handlers Handlers) (*Service, 
 				}()
 				_ = c.SetDeadline(time.Now().Add(5 * time.Second))
 				var req request
-				dec := json.NewDecoder(io.LimitReader(c, 4096))
-				dec.DisallowUnknownFields()
-				err := dec.Decode(&req)
+				line, err := bufio.NewReader(io.LimitReader(c, 4097)).ReadBytes('\n')
+				if err == io.EOF && len(line) > 0 {
+					err = nil
+				}
+				if err == nil && len(line) > 4096 {
+					err = fmt.Errorf("控制请求过大")
+				}
+				if err == nil {
+					trimmed := bytes.TrimSpace(line)
+					if !bytes.HasPrefix(trimmed, []byte("{")) {
+						err = fmt.Errorf("控制请求必须为 JSON 对象")
+					} else {
+						dec := json.NewDecoder(bytes.NewReader(trimmed))
+						dec.DisallowUnknownFields()
+						if err = dec.Decode(&req); err == nil {
+							var extra any
+							if extraErr := dec.Decode(&extra); extraErr != io.EOF {
+								err = fmt.Errorf("控制请求只能包含单个 JSON 对象")
+							}
+						}
+					}
+				}
 				if err == nil && !sameConfigPath(req.Config, absConfig) {
 					err = fmt.Errorf("运行中的服务端使用另一配置文件：%s", absConfig)
 				}

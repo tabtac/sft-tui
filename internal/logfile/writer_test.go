@@ -2,9 +2,14 @@ package logfile
 
 import (
 	"bytes"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync"
 	"testing"
+	"unicode/utf8"
 )
 
 func TestWriterBoundLockAndTruncation(t *testing.T) {
@@ -43,5 +48,106 @@ func TestWriterBoundLockAndTruncation(t *testing.T) {
 	}
 	if info.Size() > MinMaxBytes {
 		t.Fatalf("log size exceeded bound: %d > %d", info.Size(), MinMaxBytes)
+	}
+}
+
+func TestWriterUTF8TruncationAndClosedLifecycle(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "service.log")
+	writer, err := Open(path, MinMaxBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := bytes.Repeat([]byte("中文🙂"), MinMaxBytes)
+	written, err := writer.Write(payload)
+	if err != nil || written != len(payload) {
+		t.Fatalf("bounded writer returned wrong accepted length: %d %v", written, err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Errorf("repeated Close=%v", err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil || !utf8.Valid(data) || int64(len(data)) > MinMaxBytes {
+		t.Errorf("truncated log has invalid UTF-8/size: %d %v", len(data), err)
+	}
+	if n, err := writer.Write([]byte("late")); n != 0 || !errors.Is(err, os.ErrClosed) {
+		t.Errorf("closed writer accepted data: %d %v", n, err)
+	}
+	reopened, err := Open(path, MinMaxBytes)
+	if err != nil {
+		t.Fatalf("Close leaked log lock: %v", err)
+	}
+	defer reopened.Close()
+}
+
+func TestConcurrentLogWritesRemainWholeRecords(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "service.log")
+	writer, err := Open(path, MinMaxBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer writer.Close()
+	const workers, records = 8, 40
+	var wg sync.WaitGroup
+	for worker := 0; worker < workers; worker++ {
+		wg.Add(1)
+		go func(worker int) {
+			defer wg.Done()
+			for record := 0; record < records; record++ {
+				line := fmt.Sprintf("worker-%d-record-%02d\n", worker, record)
+				if _, err := writer.Write([]byte(line)); err != nil {
+					t.Errorf("concurrent log Write: %v", err)
+					return
+				}
+			}
+		}(worker)
+	}
+	wg.Wait()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(strings.TrimSuffix(string(data), "\n"), "\n")
+	seen := make(map[string]bool)
+	for _, line := range lines {
+		if seen[line] {
+			t.Errorf("duplicated log record: %q", line)
+		}
+		seen[line] = true
+	}
+	if len(seen) != workers*records {
+		t.Errorf("lost/interleaved log records: got=%d want=%d", len(seen), workers*records)
+	}
+	for worker := 0; worker < workers; worker++ {
+		for record := 0; record < records; record++ {
+			if !seen[fmt.Sprintf("worker-%d-record-%02d", worker, record)] {
+				t.Errorf("missing complete record: worker=%d record=%d", worker, record)
+			}
+		}
+	}
+}
+
+func TestLogOpenRejectsSymbolicLinkWithoutTouchingTarget(t *testing.T) {
+	root := t.TempDir()
+	target := filepath.Join(root, "target")
+	if err := os.WriteFile(target, []byte("preserve"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(root, "service.log")
+	if err := os.Symlink(target, link); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+	writer, err := Open(link, MinMaxBytes)
+	if writer != nil {
+		writer.Close()
+	}
+	if err == nil {
+		t.Error("symlink service log accepted")
+	}
+	data, err := os.ReadFile(target)
+	if err != nil || string(data) != "preserve" {
+		t.Errorf("log symlink target changed: %q %v", data, err)
 	}
 }

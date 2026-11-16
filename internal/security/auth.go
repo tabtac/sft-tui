@@ -30,6 +30,19 @@ type Principal struct {
 	IPAddresses       []string
 }
 
+func (p Principal) clone() Principal {
+	if p.Permissions != nil {
+		p.Permissions = append([]string(nil), p.Permissions...)
+	}
+	if p.DNSNames != nil {
+		p.DNSNames = append([]string(nil), p.DNSNames...)
+	}
+	if p.IPAddresses != nil {
+		p.IPAddresses = append([]string(nil), p.IPAddresses...)
+	}
+	return p
+}
+
 func (p Principal) validAt(now time.Time) bool {
 	return !p.Disabled && now.Before(p.NotAfter)
 }
@@ -242,9 +255,9 @@ func (a *Authorizer) Certificate(cert *x509.Certificate) (Principal, error) {
 	p, ok := a.certs[CertFingerprint(cert)]
 	a.mu.RUnlock()
 	if !ok || !p.validAt(time.Now()) || p.PubKeyFingerprint != PubKeyFingerprint(cert) {
-		return p, &protocol.RemoteError{Code: protocol.CodeUnauthorized, Message: "客户端证书未授权或用户已禁用"}
+		return p.clone(), &protocol.RemoteError{Code: protocol.CodeUnauthorized, Message: "客户端证书未授权或用户已禁用"}
 	}
-	return p, nil
+	return p.clone(), nil
 }
 
 // Check 检查指定用户是否具备操作权限。
@@ -253,9 +266,9 @@ func (a *Authorizer) Check(user, operation string) (Principal, error) {
 	p, ok := a.users[user]
 	a.mu.RUnlock()
 	if !ok || !p.Allows(operation) {
-		return p, &protocol.RemoteError{Code: protocol.CodeUnauthorized, Message: "用户没有此操作权限"}
+		return p.clone(), &protocol.RemoteError{Code: protocol.CodeUnauthorized, Message: "用户没有此操作权限"}
 	}
-	return p, nil
+	return p.clone(), nil
 }
 
 // Register 注册已建立 mTLS 连接的到期定时器，并在证书过期时主动断连。
@@ -265,7 +278,7 @@ func (a *Authorizer) Register(cert *x509.Certificate, conn net.Conn) (Principal,
 
 	p, ok := a.certs[CertFingerprint(cert)]
 	if !ok || !p.validAt(time.Now()) || p.PubKeyFingerprint != PubKeyFingerprint(cert) {
-		return p, fmt.Errorf("用户已撤销或证书不匹配")
+		return p.clone(), fmt.Errorf("用户已撤销或证书不匹配")
 	}
 	if old := a.connections[conn]; old != nil {
 		old.timer.Stop()
@@ -283,7 +296,7 @@ func (a *Authorizer) Register(cert *x509.Certificate, conn net.Conn) (Principal,
 			_ = conn.Close()
 		}
 	})
-	return p, nil
+	return p.clone(), nil
 }
 
 func (a *Authorizer) Unregister(conn net.Conn) {

@@ -14,6 +14,31 @@ import (
 	"sft-tui/internal/security"
 )
 
+func prepareExportDir(outDir string, trackCertsSubdir bool) (func(bool), error) {
+	_, outStatErr := os.Lstat(outDir)
+	outExisted := !os.IsNotExist(outStatErr)
+	var certsDir string
+	var certsExisted bool
+	if trackCertsSubdir {
+		certsDir = filepath.Join(outDir, "certs")
+		_, certDirStatErr := os.Lstat(certsDir)
+		certsExisted = !os.IsNotExist(certDirStatErr)
+	}
+	if err := pal.EnsurePrivateDir(outDir); err != nil {
+		return nil, err
+	}
+	return func(ok bool) {
+		if ok {
+			return
+		}
+		if !outExisted {
+			_ = os.RemoveAll(outDir)
+		} else if trackCertsSubdir && !certsExisted {
+			_ = os.Remove(certsDir)
+		}
+	}, nil
+}
+
 func exportAction(o Options, server config.Server, index int) (Result, error) {
 	result := Result{Server: server}
 	if index < 0 || o.Out == "" {
@@ -69,15 +94,12 @@ func exportAction(o Options, server config.Server, index int) (Result, error) {
 	if err != nil {
 		return result, err
 	}
-	if err = pal.EnsurePrivateDir(o.Out); err != nil {
+	cleanupDir, err := prepareExportDir(o.Out, true)
+	if err != nil {
 		return result, err
 	}
 	ok := false
-	defer func() {
-		if !ok {
-			_ = os.RemoveAll(o.Out)
-		}
-	}()
+	defer func() { cleanupDir(ok) }()
 	err = applyChanges([]fileChange{
 		{path: filepath.Join(o.Out, c.TLS.CACertificate), data: ca, mode: 0644, exclusive: true},
 		{path: filepath.Join(o.Out, c.TLS.Certificate), data: cert, mode: 0644, exclusive: true},
@@ -102,15 +124,12 @@ func exportPublicCertificates(o Options, server config.Server, user config.Autho
 	if err != nil {
 		return result, err
 	}
-	if err = pal.EnsurePrivateDir(o.Out); err != nil {
+	cleanupDir, err := prepareExportDir(o.Out, false)
+	if err != nil {
 		return result, err
 	}
 	ok := false
-	defer func() {
-		if !ok {
-			_ = os.RemoveAll(o.Out)
-		}
-	}()
+	defer func() { cleanupDir(ok) }()
 	note := "此目录仅含 CA 和用户公开证书，不含任何私钥。\n将 " + user.UserID + ".pem 与客户端本地保留的原私钥配套使用。\n"
 	err = applyChanges([]fileChange{
 		{path: filepath.Join(o.Out, "ca.pem"), data: ca, mode: 0644, exclusive: true},

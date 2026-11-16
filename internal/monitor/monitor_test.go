@@ -78,3 +78,62 @@ func TestRuntimeLifecycleRatesAndDrain(t *testing.T) {
 		t.Fatalf("unexpected final snapshot: %+v", snap)
 	}
 }
+
+func TestLogQueriesAreIsolatedAndWriteErrorsDeduplicated(t *testing.T) {
+	logs := &Logs{}
+	fail := slog.New(logs.Handler(slog.NewTextHandler(failingWriter{}, nil)))
+	fail.Error("first")
+	fail.Error("second")
+	page := logs.Query(LogQuery{Text: "文件日志写入失败"})
+	if len(page.Events) != 1 {
+		t.Fatalf("duplicate disk failure events: %d", len(page.Events))
+	}
+	var sink bytes.Buffer
+	working := slog.New(logs.Handler(slog.NewTextHandler(&sink, nil)))
+	working.Info("recovered", "user", "alice", "file", "Report.PDF")
+	fail.Error("failed again")
+	page = logs.Query(LogQuery{Text: "文件日志写入失败"})
+	if len(page.Events) != 2 {
+		t.Errorf("new failure after recovery was suppressed: %d", len(page.Events))
+	}
+	page = logs.Query(LogQuery{User: "alice", File: "report", Text: "RECOVERED"})
+	if len(page.Events) != 1 {
+		t.Fatalf("case-insensitive text/file query failed: %+v", page)
+	}
+	page.Events[0].Message = "mutated"
+	again := logs.Query(LogQuery{User: "alice"})
+	if len(again.Events) != 1 || again.Events[0].Message != "recovered" {
+		t.Error("caller mutated stored log ring through query result")
+	}
+}
+
+func TestRuntimeSnapshotsAreIndependentAndHistoryIsBounded(t *testing.T) {
+	runtime := New()
+	connection, ok := runtime.Connect("alice", "127.0.0.1:1")
+	if !ok {
+		t.Fatal("connect failed")
+	}
+	task, ok := runtime.Begin(connection, 1, "alice", "upload")
+	if !ok {
+		t.Fatal("begin failed")
+	}
+	runtime.Describe(task, "file", 10, 0)
+	snapshot := runtime.Snapshot()
+	snapshot.Peers[0].User = "intruder"
+	snapshot.Tasks[0].File = "changed"
+	again := runtime.Snapshot()
+	if again.Peers[0].User != "alice" || again.Tasks[0].File != "file" {
+		t.Error("runtime snapshot aliases mutable state")
+	}
+	runtime.End(task, "completed", nil)
+	for i := 0; i < 300; i++ {
+		id, ok := runtime.Begin(connection, uint32(3+i*2), "alice", "upload")
+		if !ok {
+			t.Fatal("begin failed")
+		}
+		runtime.End(id, "completed", nil)
+	}
+	if len(runtime.Snapshot().History) > 100 {
+		t.Error("runtime history grew beyond its bound")
+	}
+}
