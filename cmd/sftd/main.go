@@ -10,9 +10,12 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"runtime"
 	"syscall"
 	"time"
+
+	"github.com/mattn/go-isatty"
 
 	"sft-tui/internal/buildinfo"
 	"sft-tui/internal/certmanage"
@@ -22,6 +25,7 @@ import (
 	"sft-tui/internal/monitor"
 	"sft-tui/internal/service"
 	"sft-tui/internal/transfer"
+	"sft-tui/internal/tui"
 )
 
 func main() {
@@ -31,6 +35,10 @@ func main() {
 func runCommand(args []string, out, errOut io.Writer) int {
 	if len(args) > 0 {
 		switch args[0] {
+		case "ui":
+			return runUI(args[1:], 0, out, errOut)
+		case "users":
+			return runUI(args[1:], 1, out, errOut)
 		case "init":
 			return runInit(args[1:], out, errOut)
 		case "cert":
@@ -52,6 +60,41 @@ func runCommand(args []string, out, errOut io.Writer) int {
 	return runServe(args, out, errOut)
 }
 
+func runUI(args []string, initialPage int, out, errOut io.Writer) int {
+	flags := flag.NewFlagSet("sftd ui", flag.ContinueOnError)
+	flags.SetOutput(errOut)
+	cfgPath := flags.String("config", "configs/server.local.json", "服务端配置文件")
+	logPath := flags.String("log", "", "可选查看指定日志文件尾部（省略时查询运行服务结构化日志）")
+	if err := flags.Parse(args); err != nil {
+		if err == flag.ErrHelp {
+			return 0
+		}
+		return 2
+	}
+	if flags.NArg() != 0 {
+		flags.Usage()
+		return 2
+	}
+	if f, ok := out.(*os.File); !ok || (!isatty.IsTerminal(f.Fd()) && !isatty.IsCygwinTerminal(f.Fd())) {
+		fmt.Fprintln(errOut, "sftd ui：需要在交互式终端中运行")
+		return 1
+	}
+	exeDir := "."
+	if exe, err := os.Executable(); err == nil {
+		exeDir = filepath.Dir(exe)
+	}
+	if err := tui.RunServer(tui.ServerOptions{
+		ExecutableDir: exeDir,
+		ConfigPath:    *cfgPath,
+		LogPath:       *logPath,
+		Page:          initialPage,
+	}); err != nil {
+		fmt.Fprintln(errOut, "sftd ui：", err)
+		return 1
+	}
+	return 0
+}
+
 func runServe(args []string, out, errOut io.Writer) int {
 	flags := flag.NewFlagSet("sftd", flag.ContinueOnError)
 	flags.SetOutput(errOut)
@@ -60,7 +103,9 @@ func runServe(args []string, out, errOut io.Writer) int {
 	logLevel := flags.String("log-level", "info", "日志等级：debug、info、warn、error")
 	logPath := flags.String("log-file", "", "可选有界服务日志文件路径（省略时输出标准错误）")
 	flags.Usage = func() {
-		fmt.Fprintln(flags.Output(), `用法：sftd [serve] [-config FILE] [-log-level LEVEL] [-log-file FILE]
+		fmt.Fprintln(flags.Output(), `用法：sftd ui [-config FILE] [-log FILE]
+      sftd users [-config FILE]
+      sftd [serve] [-config FILE] [-log-level LEVEL] [-log-file FILE]
       sftd init [-config FILE] [-dir DIR] [-name USER]
       sftd cert <init|ca|server|user|revoke|status|sync|export> [选项]
       sftd start|status|logs|reload|stop [-config FILE]`)

@@ -104,3 +104,20 @@ func TestInitCertAndServeLifecycle(t *testing.T) {
 		t.Fatal("sftd serve did not exit after stop")
 	}
 }
+
+func TestSFTDUISubcommandNonTTYAndHelp(t *testing.T) {
+	var out, errOut bytes.Buffer
+	if code := runCommand([]string{"ui", "-h"}, &out, &errOut); code != 0 {
+		t.Fatalf("sftd ui -h failed (%d): %s", code, errOut.String())
+	}
+	out.Reset()
+	errOut.Reset()
+	if code := runCommand([]string{"users", "-h"}, &out, &errOut); code != 0 {
+		t.Fatalf("sftd users -h failed (%d): %s", code, errOut.String())
+	}
+	out.Reset()
+	errOut.Reset()
+	if code := runCommand([]string{"ui"}, &out, &errOut); code != 1 || !strings.Contains(errOut.String(), "交互式终端") {
+		t.Fatalf("expected non-TTY error for sftd ui, got code=%d stderr=%q", code, errOut.String())
+	}
+}
