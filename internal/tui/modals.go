@@ -24,23 +24,27 @@ const (
 	modalClearHistory
 )
 
-func renderModalOverlay(base string, title string, lines []string, footer string, m *model) string {
-	boxW := min(max(48, m.width-10), 84)
+func renderModalBox(width, height int, th theme, title string, lines []string, footer string) string {
+	boxW := min(max(48, width-10), 86)
 	innerW := boxW - 6 // 2 border + 4 horizontal padding
 	var body []string
-	body = append(body, m.th.modalTitle.Render(truncCell(title, innerW)))
-	body = append(body, lipgloss.NewStyle().Foreground(m.th.border).Render(strings.Repeat("─", innerW)))
+	body = append(body, th.modalTitle.Render(truncCell(title, innerW)))
+	body = append(body, lipgloss.NewStyle().Foreground(th.border).Render(strings.Repeat("─", innerW)))
 	for _, ln := range lines {
 		body = append(body, ln)
 	}
 	if footer != "" {
-		body = append(body, lipgloss.NewStyle().Foreground(m.th.border).Render(strings.Repeat("─", innerW)))
-		body = append(body, m.th.badgeMuted.Render(footer))
+		body = append(body, lipgloss.NewStyle().Foreground(th.border).Render(strings.Repeat("─", innerW)))
+		body = append(body, th.badgeMuted.Render(footer))
 	}
-	box := m.th.modalBox.Width(boxW - 2).Render(strings.Join(body, "\n"))
-	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, box,
+	box := th.modalBox.Width(boxW - 2).Render(strings.Join(body, "\n"))
+	return lipgloss.Place(width, height, lipgloss.Center, lipgloss.Center, box,
 		lipgloss.WithWhitespaceChars(" "),
 	)
+}
+
+func renderModalOverlay(_ string, title string, lines []string, footer string, m *model) string {
+	return renderModalBox(m.width, m.height, m.th, title, lines, footer)
 }
 
 func (m *model) viewModal(base string) string {

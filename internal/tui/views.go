@@ -168,18 +168,22 @@ func (m *model) renderNarrowBody(bodyH int) string {
 	return lipgloss.JoinVertical(lipgloss.Left, bar, pane)
 }
 
-func (m *model) renderBox(title string, lines []string, active bool, outerW, outerH int) string {
+func renderPanelBox(th theme, title string, lines []string, active bool, outerW, outerH int) string {
 	contentH := max(1, outerH-2)
 	trimmed := make([]string, 0, contentH)
 	trimmed = append(trimmed, title)
 	for i := 0; i < contentH-1 && i < len(lines); i++ {
 		trimmed = append(trimmed, lines[i])
 	}
-	st := m.th.panel
+	st := th.panel
 	if active {
-		st = m.th.panelActive
+		st = th.panelActive
 	}
 	return st.Width(max(4, outerW-2)).Height(max(1, outerH-2)).Render(strings.Join(trimmed, "\n"))
+}
+
+func (m *model) renderBox(title string, lines []string, active bool, outerW, outerH int) string {
+	return renderPanelBox(m.th, title, lines, active, outerW, outerH)
 }
 
 func (m *model) renderLocalPanel(outerW, outerH int) string {
