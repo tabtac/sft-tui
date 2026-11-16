@@ -278,6 +278,9 @@ func (s *Store) CommitUploadSession(ctx context.Context, taskID protocol.Transfe
 		return err
 	}
 	if err := s.commitUploadLocked(ctx, taskID, fileSize, declaredSHA); err != nil {
+		if errors.Is(err, ErrHashMismatch) {
+			delete(s.leases, idHex)
+		}
 		return err
 	}
 	delete(s.leases, idHex)

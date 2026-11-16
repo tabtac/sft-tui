@@ -573,6 +573,7 @@ func (s *Store) commitUploadLocked(ctx context.Context, taskID protocol.Transfer
 	if hex.EncodeToString(actualDigest) != hex.EncodeToString(declaredSHA[:]) ||
 		hex.EncodeToString(actualDigest) != hex.EncodeToString(task.FileSHA256[:]) {
 		_, _ = s.db.ExecContext(ctx, "UPDATE tasks SET status=?, updated_at=? WHERE id=?", string(TaskFailed), time.Now().Unix(), IDToHex(taskID))
+		_ = s.root.Remove(partRel)
 		return ErrHashMismatch
 	}
 

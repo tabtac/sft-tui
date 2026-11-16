@@ -10,6 +10,7 @@ import (
 
 	"sft-tui/internal/protocol"
 	"sft-tui/internal/queue"
+	"sft-tui/internal/storage"
 )
 
 var (
@@ -66,8 +67,11 @@ func isFatalTransfer(err error) bool {
 }
 
 func isHardServerFailure(err error) bool {
-	var remote *protocol.RemoteError
-	if !errors.As(err, &remote) {
+	if err == nil {
+		return false
+	}
+	remote := storage.AsRemote(err)
+	if remote == nil {
 		return false
 	}
 	switch remote.Code {
