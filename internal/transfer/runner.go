@@ -182,6 +182,18 @@ func (r *QueueRunner) List(ctx context.Context) ([]protocol.FileEntry, error) {
 	return entries, err
 }
 
+func preDialControlErr(err error, task queue.Task, op *queue.Operation) error {
+	if op != nil && op.Mode() != 0 && errors.Is(err, context.Canceled) {
+		if op.Mode() == protocol.CancelPause {
+			return ErrPaused
+		}
+		if op.Mode() == protocol.CancelAbort && !task.HasCheckpoint() {
+			return ErrCancelled
+		}
+	}
+	return err
+}
+
 // Run 满足 queue.TaskRunner 签名，支持瞬态断连重连、断点提示以及统一 SQLite 持久化。
 func (r *QueueRunner) Run(ctx context.Context, task queue.Task, op *queue.Operation, progress func(transferred, total uint64, phase queue.State)) error {
 	r.ResetDialError()
@@ -194,20 +206,17 @@ func (r *QueueRunner) Run(ctx context.Context, task queue.Task, op *queue.Operat
 	}
 
 	for attempt := 0; attempt < 4; attempt++ {
-		if ctx.Err() != nil {
-			return ctx.Err()
+		if op != nil && op.Mode() != 0 {
+			if mapped := preDialControlErr(context.Canceled, task, op); mapped != context.Canceled {
+				return mapped
+			}
+		}
+		if err := ctx.Err(); err != nil {
+			return preDialControlErr(err, task, op)
 		}
 		c, err := r.GetClient(ctx)
 		if err != nil {
-			if op != nil && op.Mode() != 0 && errors.Is(err, context.Canceled) {
-				if op.Mode() == protocol.CancelPause {
-					return ErrPaused
-				}
-				if op.Mode() == protocol.CancelAbort && !task.HasCheckpoint() {
-					return ErrCancelled
-				}
-			}
-			return err
+			return preDialControlErr(err, task, op)
 		}
 
 		// 从 manager 重新读取最新检查点字段以防止重试覆盖

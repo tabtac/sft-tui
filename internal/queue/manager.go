@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -420,6 +421,24 @@ func (m *Manager) pruneRecords(now time.Time) {
 			delete(m.tasks, id)
 			m.currentDirty = true
 		}
+	}
+	var terminal []*Task
+	for _, t := range m.tasks {
+		if t.Terminal() {
+			terminal = append(terminal, t)
+		}
+	}
+	if len(terminal) > HistoryLimit {
+		sort.Slice(terminal, func(i, j int) bool {
+			if !terminal[i].Updated.Equal(terminal[j].Updated) {
+				return terminal[i].Updated.After(terminal[j].Updated)
+			}
+			return terminal[i].ID < terminal[j].ID
+		})
+		for _, old := range terminal[HistoryLimit:] {
+			delete(m.tasks, old.ID)
+		}
+		m.currentDirty = true
 	}
 	m.nextPrune = now.Add(time.Hour)
 }

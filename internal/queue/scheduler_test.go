@@ -110,6 +110,7 @@ func TestSchedulerConcurrencyLimit(t *testing.T) {
 	var runningCount atomic.Int32
 	var maxConcurrent atomic.Int32
 	done := make(chan struct{})
+	started := make(chan struct{}, 4)
 
 	m.SetRunner(func(ctx context.Context, task Task, op *Operation, progress func(transferred, total uint64, phase State)) error {
 		cur := runningCount.Add(1)
@@ -120,6 +121,7 @@ func TestSchedulerConcurrencyLimit(t *testing.T) {
 			}
 		}
 		defer runningCount.Add(-1)
+		started <- struct{}{}
 
 		progress(1, task.Size, Transferring)
 		select {
@@ -142,17 +144,29 @@ func TestSchedulerConcurrencyLimit(t *testing.T) {
 		})
 	}
 
-	if _, err := m.Enqueue(specs); err != nil {
+	tasks, err := m.Enqueue(specs)
+	if err != nil {
 		t.Fatal(err)
 	}
 
-	// 等待并发派发稳定
-	time.Sleep(300 * time.Millisecond)
+	// 使用执行器握手确认两个槽位确实被使用，避免“完全未派发也通过上限测试”。
+	for i := 0; i < 2; i++ {
+		select {
+		case <-started:
+		case <-time.After(3 * time.Second):
+			t.Fatal("scheduler failed to fill both available slots")
+		}
+	}
 
-	if mc := maxConcurrent.Load(); mc > 2 {
-		t.Errorf("concurrency exceeded limit: %d > 2", mc)
+	if mc := maxConcurrent.Load(); mc != 2 {
+		t.Errorf("concurrency did not use exactly two slots: %d", mc)
 	}
 
 	close(done)
-	time.Sleep(200 * time.Millisecond)
+	for _, task := range tasks {
+		awaitQueueState(t, m, task.ID, Completed)
+	}
+	if mc := maxConcurrent.Load(); mc > 2 {
+		t.Errorf("concurrency exceeded limit while draining remaining tasks: %d > 2", mc)
+	}
 }

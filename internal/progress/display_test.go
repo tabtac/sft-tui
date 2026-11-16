@@ -2,6 +2,7 @@ package progress
 
 import (
 	"bytes"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -41,5 +42,51 @@ func TestDisplayAlwaysAndNever(t *testing.T) {
 	quiet.Close()
 	if status.Len() != 0 {
 		t.Fatalf("never mode unexpectedly wrote status: %q", status.String())
+	}
+}
+
+func TestProgressCompletionSanitizesUntrustedResultText(t *testing.T) {
+	for _, failed := range []bool{false, true} {
+		t.Run(fmt.Sprint(failed), func(t *testing.T) {
+			var status, results bytes.Buffer
+			display, err := New("never", &status, &results)
+			if err != nil {
+				t.Fatal(err)
+			}
+			display.Finish(0, "file\x1b[2J\x1b]0;changed-title\x07", failed)
+			display.Close()
+			// BUG: Start 会清理控制字符，Finish 的结果/错误消息却原样输出，能注入终端控制序列。
+			if strings.ContainsAny(status.String()+results.String(), "\x1b\x07") {
+				t.Error("BUG: result text injected terminal control sequences")
+			}
+		})
+	}
+}
+
+func TestProgressZeroByteAndOverflowRemainBounded(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		done, total uint64
+		phase       queue.State
+		percent     string
+	}{
+		{"zero_completed", 0, 0, queue.Completed, "100%"},
+		{"overflow_clamped", 200, 100, queue.Transferring, "100%"},
+		{"unknown_total", 17, 0, queue.Transferring, "0%"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var status, results bytes.Buffer
+			display, err := New("always", &status, &results)
+			if err != nil {
+				t.Fatal(err)
+			}
+			display.Start(0, "file")
+			display.Update(0, tc.done, tc.total, tc.phase)
+			display.Finish(0, "done", false)
+			display.Close()
+			if !strings.Contains(status.String(), tc.percent) {
+				t.Errorf("progress missing expected percentage %s: %q", tc.percent, status.String())
+			}
+		})
 	}
 }

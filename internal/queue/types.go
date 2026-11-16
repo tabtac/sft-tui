@@ -97,7 +97,7 @@ type Task struct {
 
 // HasCheckpoint 判断任务是否已绑定服务端传输或本地临时下载状态
 func (t Task) HasCheckpoint() bool {
-	return t.TransferID != "" || t.TempName != "" || t.TempInode != 0 || t.Published
+	return t.RequestID != "" || t.TransferID != "" || t.TempName != "" || t.TempInode != 0 || t.Published
 }
 
 // Terminal 终态判断

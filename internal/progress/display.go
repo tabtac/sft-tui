@@ -111,6 +111,7 @@ func (d *Display) Update(id int, done, total uint64, phase queue.State) {
 }
 
 func (d *Display) Finish(id int, message string, failed bool) {
+	message = safeLabel(message)
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	d.clear()

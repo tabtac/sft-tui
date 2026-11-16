@@ -9,12 +9,15 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"reflect"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"sft-tui/internal/config"
+	"sft-tui/internal/pal"
 	"sft-tui/internal/protocol"
 	"sft-tui/internal/queue"
 	"sft-tui/internal/security"
@@ -465,4 +468,209 @@ func TestServerBandwidthHookAndAuthCheck(t *testing.T) {
 	}
 	_ = io.EOF
 	_ = errors.New("")
+}
+
+func TestCancelAcknowledgementValidationPreservesCheckpoint(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		mode      protocol.CancelMode
+		offset    uint64
+		direction protocol.Direction
+	}{
+		{"wrong_mode", protocol.CancelPause, 2, protocol.DirectionUpload},
+		{"past_size", protocol.CancelAbort, 11, protocol.DirectionUpload},
+		{"download_ahead_of_durable_data", protocol.CancelAbort, 6, protocol.DirectionDownload},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			task := queue.Task{Direction: tc.direction, Size: 10, Done: 5, TransferID: strings.Repeat("1", 32), RequestID: strings.Repeat("2", 32)}
+			before := task
+			payload, err := protocol.Marshal(protocol.CancelAck{Mode: tc.mode, AcceptedOffset: tc.offset})
+			if err != nil {
+				t.Fatal(err)
+			}
+			updates := 0
+			err = applyCancelAck(payload, protocol.CancelAbort, &task, nil, func(fn func(*queue.Task)) error { updates++; fn(&task); return nil })
+			if err == nil || errors.Is(err, ErrCancelled) || updates != 0 || task != before {
+				t.Errorf("invalid cancellation confirmation changed checkpoint: updates=%d err=%v", updates, err)
+			}
+		})
+	}
+}
+
+func TestCancelAcknowledgementDoesNotHideLocalCleanupFailure(t *testing.T) {
+	dir := t.TempDir()
+	root, err := pal.OpenRoot(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+	part := filepath.Join(dir, "part.bin")
+	if err := os.WriteFile(part, []byte("replacement file"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	f, err := root.Open("part.bin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dev, ino, _, identityErr := pal.FileIdentity(f)
+	closeErr := f.Close()
+	if identityErr != nil || closeErr != nil {
+		t.Fatalf("file identity: %v %v", identityErr, closeErr)
+	}
+	task := queue.Task{Direction: protocol.DirectionDownload, Size: 16, Done: 4, TransferID: strings.Repeat("1", 32), TempName: "part.bin", TempDevice: dev, TempInode: ino + 1}
+	before := task
+	payload, err := protocol.Marshal(protocol.CancelAck{Mode: protocol.CancelAbort, AcceptedOffset: 4})
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = applyCancelAck(payload, protocol.CancelAbort, &task, root, func(fn func(*queue.Task)) error { fn(&task); return nil })
+	// BUG: applyCancelAck 忽略 removeDownloadPart 的 inode 不匹配错误，随后清空检查点并报告已取消。
+	if err == nil || errors.Is(err, ErrCancelled) || task != before {
+		t.Errorf("BUG: local cleanup failure lost checkpoint and reported cancellation success: %v", err)
+	}
+	data, err := os.ReadFile(part)
+	if err != nil || string(data) != "replacement file" {
+		t.Errorf("replacement file was touched: %q %v", data, err)
+	}
+}
+
+func TestCancelAckPersistenceFailureIsReturned(t *testing.T) {
+	task := queue.Task{Direction: protocol.DirectionUpload, Size: 10, TransferID: strings.Repeat("1", 32)}
+	payload, err := protocol.Marshal(protocol.CancelAck{Mode: protocol.CancelAbort})
+	if err != nil {
+		t.Fatal(err)
+	}
+	failure := errors.New("queue checkpoint commit failed")
+	err = applyCancelAck(payload, protocol.CancelAbort, &task, nil, func(func(*queue.Task)) error { return failure })
+	if !errors.Is(err, failure) || task.TransferID == "" {
+		t.Errorf("checkpoint persistence error hidden: %v", err)
+	}
+}
+
+func TestEndToEndListCallbackFailureDoesNotBreakOtherStreams(t *testing.T) {
+	h := startTestServer(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	client, err := Dial(ctx, h.cliCfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	source := filepath.Join(t.TempDir(), "source")
+	if err := os.WriteFile(source, []byte("data"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.UploadFile(ctx, source, "a.bin", nil); err != nil {
+		t.Fatal(err)
+	}
+	stop := errors.New("stop iterating")
+	if err := client.ListFiles(ctx, func(protocol.FileEntry) error { return stop }); !errors.Is(err, stop) {
+		t.Fatalf("callback failure=%v", err)
+	}
+	if _, err := client.UploadFile(ctx, source, "b.bin", nil); err != nil {
+		t.Fatalf("callback failure poisoned shared connection: %v", err)
+	}
+	var names []string
+	if err := client.ListFiles(ctx, func(file protocol.FileEntry) error { names = append(names, file.FileName); return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(names, []string{"a.bin", "b.bin"}) {
+		t.Errorf("subsequent list=%q", names)
+	}
+}
+
+func TestEndToEndPublishedFilesAreIsolatedPerUser(t *testing.T) {
+	h := startTestServer(t)
+	certDir := filepath.Join(h.dir, "certs")
+	if err := testcert.IssueClient(certDir, "bob"); err != nil {
+		t.Fatal(err)
+	}
+	entries := append([]config.AuthorizedClient(nil), h.srvCfg.AuthorizedClients...)
+	entries = append(entries, config.AuthorizedClient{UserID: "bob", Certificate: filepath.Join(certDir, "bob.pem"), Permissions: []string{"upload", "download"}})
+	if err := h.auth.Reload(entries); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	alice, err := Dial(ctx, h.cliCfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer alice.Close()
+	bobCfg := h.cliCfg
+	bobCfg.TLS.Certificate = filepath.Join(certDir, "bob.pem")
+	bobCfg.TLS.PrivateKey = filepath.Join(certDir, "bob-key.pem")
+	bobCfg.StateDir = filepath.Join(h.dir, "bob-state")
+	bob, err := Dial(ctx, bobCfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer bob.Close()
+	source := filepath.Join(t.TempDir(), "source")
+	if err := os.WriteFile(source, []byte("alice private data"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := alice.UploadFile(ctx, source, "private.bin", nil); err != nil {
+		t.Fatal(err)
+	}
+	var leaked []protocol.FileEntry
+	if err := bob.ListFiles(ctx, func(file protocol.FileEntry) error { leaked = append(leaked, file); return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if len(leaked) != 0 {
+		t.Errorf("other user's index leaked: %+v", leaked)
+	}
+	target := filepath.Join(t.TempDir(), "private.bin")
+	if _, err := bob.DownloadFile(ctx, "private.bin", target, nil); err == nil {
+		t.Error("other user's object was downloadable")
+	}
+	if _, err := os.Stat(target); !os.IsNotExist(err) {
+		t.Errorf("failed foreign download published local target: %v", err)
+	}
+	if err := os.WriteFile(source, []byte("bob data"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := bob.UploadFile(ctx, source, "private.bin", nil); err != nil {
+		t.Fatalf("same logical name should be independent per user: %v", err)
+	}
+}
+
+func TestQueueRunnerHonorsControlBeforeOpeningConnection(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		mode protocol.CancelMode
+		want error
+	}{
+		{"pause", protocol.CancelPause, ErrPaused}, {"abort", protocol.CancelAbort, ErrCancelled},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := config.DefaultClient()
+			runner := NewQueueRunner(cfg, nil)
+			defer runner.Close()
+			op := queue.NewOperation(context.Background())
+			defer op.Close()
+			if err := op.Request(tc.mode); err != nil {
+				t.Fatal(err)
+			}
+			err := runner.Run(op.Context(), queue.Task{Direction: protocol.DirectionUpload}, op, nil)
+			// BUG: Run 顶部直接返回 ctx.Err，尚未拨号时已请求的暂停/取消无法转换成控制结果。
+			if !errors.Is(err, tc.want) {
+				t.Errorf("BUG: pre-start control returned %v want=%v", err, tc.want)
+			}
+		})
+	}
+}
+
+func TestPersistedRequestIDCannotBeSilentlyRegenerated(t *testing.T) {
+	for _, id := range []string{"not-hex", strings.Repeat("a", 31), strings.Repeat("z", 32)} {
+		t.Run(id, func(t *testing.T) {
+			task := queue.Task{RequestID: id}
+			updates := 0
+			_, err := ensureRequestID(&task, func(fn func(*queue.Task)) error { updates++; fn(&task); return nil })
+			// BUG: 损坏的持久化 RequestID 被静默换成新 ID，会丢失服务端原请求的幂等身份。
+			if err == nil || updates != 0 || task.RequestID != id {
+				t.Errorf("BUG: invalid persisted request ID regenerated: updates=%d err=%v", updates, err)
+			}
+		})
+	}
 }

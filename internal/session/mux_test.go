@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"io"
+	"math"
 	"net"
 	"sync"
 	"testing"
@@ -176,5 +177,118 @@ func TestMuxCancelSignalsPayloadContext(t *testing.T) {
 	}
 	if ack.Mode != protocol.CancelPause {
 		t.Fatalf("expected CancelPause, got %v", ack.Mode)
+	}
+}
+
+func newIdleTestMux(t *testing.T, limit uint16) (*Mux, net.Conn) {
+	t.Helper()
+	local, peer := net.Pipe()
+	mux := NewMux(&Conn{Net: local, Chunk: 4096, Timeouts: testTimeouts()}, limit, protocol.MinWindowSize, nil)
+	t.Cleanup(func() { mux.Close(io.EOF); peer.Close(); mux.Wait() })
+	return mux, peer
+}
+
+func TestMuxCapacityReleaseAndStreamIDExhaustion(t *testing.T) {
+	mux, _ := newIdleTestMux(t, 2)
+	first, err := mux.Open(protocol.DirectionUpload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := mux.Open(protocol.DirectionDownload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := mux.Open(protocol.DirectionUpload); err == nil {
+		t.Error("stream capacity exceeded")
+	}
+	first.Release()
+	third, err := mux.Open(protocol.DirectionUpload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if third.ID != 5 {
+		t.Errorf("released StreamID was reused: %d", third.ID)
+	}
+	second.Release()
+	third.Release()
+	mux.mu.Lock()
+	mux.last = protocol.StreamID(math.MaxUint32 - 2)
+	mux.mu.Unlock()
+	last, err := mux.Open(protocol.DirectionUpload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if uint32(last.ID) != math.MaxUint32 {
+		t.Errorf("last stream ID=%d", last.ID)
+	}
+	last.Release()
+	if _, err := mux.Open(protocol.DirectionUpload); err == nil {
+		t.Error("exhausted stream IDs wrapped around")
+	}
+}
+
+func TestStreamReceiveCancellationAndMuxFailure(t *testing.T) {
+	mux, _ := newIdleTestMux(t, 1)
+	stream, err := mux.Open(protocol.DirectionDownload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stream.Release()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := stream.ReceiveContext(ctx); !errors.Is(err, context.Canceled) {
+		t.Errorf("cancelled receive=%v", err)
+	}
+	failure := errors.New("connection failed")
+	mux.Close(failure)
+	if _, err := stream.Receive(); !errors.Is(err, failure) {
+		t.Errorf("mux failure not returned to stream: %v", err)
+	}
+	if _, err := mux.Open(protocol.DirectionUpload); !errors.Is(err, failure) {
+		t.Errorf("closed mux accepted stream or lost cause: %v", err)
+	}
+}
+
+func TestStreamInboxCoalescesDataAndBoundsControls(t *testing.T) {
+	mux, _ := newIdleTestMux(t, 1)
+	stream, err := mux.Open(protocol.DirectionDownload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stream.Release()
+	for _, part := range []struct {
+		offset uint64
+		data   string
+	}{{0, "ab"}, {2, "cd"}} {
+		payload, err := protocol.Marshal(protocol.Data{FileOffset: part.offset, Bytes: []byte(part.data)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := stream.enqueue(protocol.Frame{Header: protocol.Header{Type: protocol.TypeData, Length: uint32(len(payload))}, Payload: payload}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	frame, ok := stream.dequeue()
+	if !ok {
+		t.Fatal("missing DATA")
+	}
+	var data protocol.Data
+	if err := protocol.Unmarshal(frame.Payload, &data); err != nil || data.FileOffset != 0 || string(data.Bytes) != "abcd" {
+		t.Errorf("DATA coalescing corrupted payload: %+v %v", data, err)
+	}
+	if _, ok := stream.dequeue(); ok {
+		t.Error("coalesced DATA left duplicate frame")
+	}
+	ack, err := protocol.Marshal(protocol.Ack{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 16; i++ {
+		if err := stream.enqueue(protocol.Frame{Header: protocol.Header{Type: protocol.TypeAck}, Payload: ack}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := stream.enqueue(protocol.Frame{Header: protocol.Header{Type: protocol.TypeAck}, Payload: ack}); err == nil {
+		t.Error("control inbox exceeded bound")
 	}
 }

@@ -302,8 +302,14 @@ func (m *Manager) Quiesce(ctx context.Context) error {
 	err := m.PauseAll(ctx)
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if len(m.active) == 0 && m.storageErr == nil {
-		return nil
+	if err != nil {
+		return err
 	}
-	return err
+	if m.storageErr != nil {
+		return m.storageErr
+	}
+	if len(m.active) > 0 {
+		return fmt.Errorf("仍有 %d 个任务正在收尾", len(m.active))
+	}
+	return nil
 }

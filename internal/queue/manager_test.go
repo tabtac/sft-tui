@@ -2,8 +2,11 @@ package queue
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -265,5 +268,170 @@ func TestManagerPauseAllAndResumeAll(t *testing.T) {
 		if tk.State != Waiting {
 			t.Fatalf("expected Waiting after ResumeAll, got %s", tk.State)
 		}
+	}
+}
+
+func enqueueControlFixture(t *testing.T, m *Manager, dir string) Task {
+	t.Helper()
+	path := filepath.Join(dir, "controlled.bin")
+	if err := os.WriteFile(path, []byte("data"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	tasks, err := m.Enqueue([]Spec{{Direction: protocol.DirectionUpload, Remote: "controlled.bin", Path: path}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return tasks[0]
+}
+
+func awaitQueueState(t *testing.T, m *Manager, id string, state State) Task {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		task := m.Task(id)
+		if task != nil && task.State == state && !m.HasRunning() {
+			return *task
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	t.Fatalf("task did not settle in %s: %+v", state, m.Task(id))
+	return Task{}
+}
+
+func TestQueueWithoutRunnerKeepsTaskWaiting(t *testing.T) {
+	m, dir := newTestManager(t)
+	task := enqueueControlFixture(t, m, dir)
+	m.dispatch()
+	if got := m.Task(task.ID); got.State != Waiting || got.Done != 0 || m.HasRunning() {
+		t.Errorf("unconfigured executor completed/dispatched task: %+v", got)
+	}
+}
+
+func TestControlFailureRequiresExplicitAcknowledgement(t *testing.T) {
+	for _, mode := range []protocol.CancelMode{protocol.CancelPause, protocol.CancelAbort} {
+		t.Run(fmt.Sprint(mode), func(t *testing.T) {
+			m, dir := newTestManager(t)
+			task := enqueueControlFixture(t, m, dir)
+			if err := m.UpdateTask(task.ID, func(cur *Task) { cur.TransferID = strings.Repeat("1", 32) }); err != nil {
+				t.Fatal(err)
+			}
+			started := make(chan struct{})
+			failure := errors.New("peer control acknowledgement lost")
+			m.SetRunner(func(ctx context.Context, task Task, op *Operation, progress func(uint64, uint64, State)) error {
+				close(started)
+				<-ctx.Done()
+				return failure
+			})
+			select {
+			case <-started:
+			case <-time.After(3 * time.Second):
+				t.Fatal("runner was not dispatched")
+			}
+			var err error
+			if mode == protocol.CancelPause {
+				err = m.Pause(task.ID)
+			} else {
+				err = m.Cancel(task.ID)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			got := awaitQueueState(t, m, task.ID, Pending)
+			if !strings.Contains(got.Error, failure.Error()) || got.TransferID == "" {
+				t.Errorf("control failure lost error/checkpoint: %+v", got)
+			}
+			if mode == protocol.CancelAbort && !got.WantCancel {
+				t.Error("failed cancel lost persistent intent")
+			}
+		})
+	}
+}
+
+func TestHasCheckpointIncludesUnansweredRequest(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		task Task
+		want bool
+	}{
+		{"empty", Task{}, false},
+		{"request_only", Task{RequestID: strings.Repeat("1", 32)}, true},
+		{"transfer", Task{TransferID: strings.Repeat("2", 32)}, true},
+		{"temp_name", Task{TempName: "part"}, true},
+		{"temp_inode", Task{TempInode: 1}, true},
+		{"published", Task{Published: true}, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// BUG: PUT/GET 已发送但响应丢失时仅有 RequestID，仍需幂等查询并取消服务端任务。
+			if got := tc.task.HasCheckpoint(); got != tc.want {
+				t.Errorf("BUG: HasCheckpoint=%v want=%v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestCancelUnansweredRequestKeepsRemoteCleanupIntent(t *testing.T) {
+	m, dir := newTestManager(t)
+	task := enqueueControlFixture(t, m, dir)
+	if err := m.UpdateTask(task.ID, func(cur *Task) { cur.State = Paused; cur.RequestID = strings.Repeat("1", 32) }); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Cancel(task.ID); err != nil {
+		t.Fatal(err)
+	}
+	got := m.Task(task.ID)
+	// BUG: RequestID-only 任务被当作从未发送，直接写入 Cancelled 并跳过远端清理。
+	if got.Terminal() || !got.WantCancel || got.RequestID == "" {
+		t.Errorf("BUG: unacknowledged request cancelled locally: state=%s wantCancel=%v", got.State, got.WantCancel)
+	}
+}
+
+func TestQuiescePropagatesUnconfirmedCancellation(t *testing.T) {
+	m, dir := newTestManager(t)
+	task := enqueueControlFixture(t, m, dir)
+	if err := m.UpdateTask(task.ID, func(cur *Task) { cur.State = Pending; cur.WantCancel = true; cur.TransferID = strings.Repeat("1", 32) }); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	// BUG: Quiesce 在 active 为空时吞掉 PauseAll 对未完成取消的错误。
+	if err := m.Quiesce(ctx); err == nil {
+		t.Error("BUG: quiesce reported success with unresolved cancellation")
+	}
+}
+
+func TestHistoryCountLimitAlsoBoundsTerminalCurrentTasks(t *testing.T) {
+	m, _ := newTestManager(t)
+	m.mu.Lock()
+	now := time.Now()
+	for i := 0; i < HistoryLimit+5; i++ {
+		id := fmt.Sprintf("terminal-%d", i)
+		task := &Task{ID: id, State: Completed, Updated: now.Add(time.Duration(i) * time.Nanosecond)}
+		m.tasks[id] = task
+		m.history = append(m.history, *task)
+	}
+	m.pruneRecords(now)
+	current, history := len(m.tasks), len(m.history)
+	m.mu.Unlock()
+	// BUG: 当前仅按时间删除终态，数量上限只作用于 history，长期运行会积累当前任务映射。
+	if current > HistoryLimit || history > HistoryLimit {
+		t.Errorf("BUG: terminal retention current=%d history=%d limit=%d", current, history, HistoryLimit)
+	}
+}
+
+func TestUpdateCheckpointRollbackOnDatabaseFailure(t *testing.T) {
+	m, dir := newTestManager(t)
+	task := enqueueControlFixture(t, m, dir)
+	if _, err := m.store.db.Exec(`CREATE TRIGGER reject_checkpoint BEFORE INSERT ON tasks BEGIN SELECT RAISE(FAIL,'checkpoint write rejected'); END`); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.UpdateTask(task.ID, func(cur *Task) { cur.RequestID = strings.Repeat("1", 32); cur.Done = 2 }); err == nil {
+		t.Error("injected persistence failure not returned")
+	}
+	got := m.Task(task.ID)
+	if got.RequestID != task.RequestID || got.Done != task.Done {
+		t.Errorf("failed checkpoint update leaked into memory: %+v", got)
+	}
+	if _, err := m.store.db.Exec("DROP TRIGGER reject_checkpoint"); err != nil {
+		t.Fatal(err)
 	}
 }

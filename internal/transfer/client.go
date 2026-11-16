@@ -374,9 +374,10 @@ func decodeDigestHex(s string) (protocol.Digest, error) {
 func ensureRequestID(t *queue.Task, update CheckpointUpdater) (protocol.RequestID, error) {
 	if t.RequestID != "" {
 		id, err := decodeHex16(t.RequestID)
-		if err == nil {
-			return protocol.RequestID(id), nil
+		if err != nil {
+			return protocol.RequestID{}, fmt.Errorf("持久化请求 ID 无效：%w", err)
 		}
+		return protocol.RequestID(id), nil
 	}
 	var reqID protocol.RequestID
 	if _, err := io.ReadFull(rand.Reader, reqID[:]); err != nil {
@@ -1041,7 +1042,9 @@ func applyCancelAck(payload []byte, mode protocol.CancelMode, task *queue.Task, 
 	}
 	if mode == protocol.CancelAbort {
 		if dlRoot != nil {
-			_ = removeDownloadPart(dlRoot, *task)
+			if err := removeDownloadPart(dlRoot, *task); err != nil {
+				return err
+			}
 		}
 		if err := update(clearTaskCheckpoint); err != nil {
 			return err
