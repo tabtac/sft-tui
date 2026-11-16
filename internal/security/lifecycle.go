@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"math/big"
 	"net"
+	"strconv"
 	"strings"
 	"time"
 
@@ -154,6 +155,25 @@ func ParseServerNames(names string) ([]string, []net.IP, error) {
 		dns = append(dns, name)
 	}
 	return dns, ips, nil
+}
+
+// ValidateConnectAddress 校验客户端连接地址（host:port，禁止通配地址并校验域名/IP 格式）。
+func ValidateConnectAddress(address string) (string, string, error) {
+	host, port, err := net.SplitHostPort(strings.TrimSpace(address))
+	if err != nil {
+		return "", "", fmt.Errorf("请输入主机:端口，IPv6 使用 [地址]:端口：%w", err)
+	}
+	n, err := strconv.Atoi(port)
+	if err != nil || n < 1 || n > 65535 {
+		return "", "", fmt.Errorf("端口须为 1–65535")
+	}
+	if host == "" || host == "0.0.0.0" || host == "::" {
+		return "", "", fmt.Errorf("客户端连接地址必须为实际 IP 或 DNS，不能使用通配监听地址")
+	}
+	if _, _, err = ParseServerNames(host); err != nil {
+		return "", "", err
+	}
+	return host, port, nil
 }
 
 // NewLeaf 使用磁盘上的 CA 证书和私钥签发带新 Ed25519 密钥对的叶证书（user 为空表示服务端证书）。

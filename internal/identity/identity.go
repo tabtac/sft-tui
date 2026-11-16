@@ -20,6 +20,7 @@ import (
 
 	"sft-tui/internal/config"
 	"sft-tui/internal/pal"
+	"sft-tui/internal/prompt"
 	"sft-tui/internal/security"
 )
 
@@ -41,6 +42,11 @@ type material struct {
 
 // Resolve 解析并载入当前客户端配置；指定 explicitConfig（非 init）时直接读取该文件。
 func Resolve(executableDir, workingDir, sourceDir, explicitConfig string, initialize bool, out io.Writer) (config.Client, error) {
+	return ResolveInteractive(executableDir, workingDir, sourceDir, explicitConfig, initialize, nil, out)
+}
+
+// ResolveInteractive 与 Resolve 相同，但在发现多个候选身份且提供交互输入 in 时允许用户编号选择。
+func ResolveInteractive(executableDir, workingDir, sourceDir, explicitConfig string, initialize bool, in io.Reader, out io.Writer) (config.Client, error) {
 	if explicitConfig != "" && sourceDir != "" {
 		return config.Client{}, fmt.Errorf("-config 与 -dir 不能同时使用")
 	}
@@ -78,9 +84,26 @@ func Resolve(executableDir, workingDir, sourceDir, explicitConfig string, initia
 			return config.Client{}, fmt.Errorf("未找到客户端配置；请将导出包放到 sft 同目录，或通过 -dir / -config 指定")
 		}
 		if len(candidates) > 1 {
-			return config.Client{}, fmt.Errorf("发现多个可用身份配置（%d 个），请通过 -config / -dir 指定，或在 TUI 界面按 i 选择", len(candidates))
+			if in != nil && out != nil {
+				labels := make([]string, len(candidates))
+				for i, p := range candidates {
+					if prof, e := Preview(p, workingDir); e == nil {
+						labels[i] = prof.Label + "  (" + p + ")"
+					} else {
+						labels[i] = p
+					}
+				}
+				idx, err := prompt.New(in, out).Choose("发现多个客户端身份，请选择要激活的配置", labels)
+				if err != nil {
+					return config.Client{}, err
+				}
+				target = candidates[idx]
+			} else {
+				return config.Client{}, fmt.Errorf("发现多个可用身份配置（%d 个），请通过 -config / -dir 指定，或在 TUI 界面按 i 选择", len(candidates))
+			}
+		} else {
+			target = candidates[0]
 		}
-		target = candidates[0]
 	}
 
 	c, err := importSnapshot(home, target, workingDir, true)
@@ -299,6 +322,13 @@ func selectExpected(executableDir, id, label string, expected *config.Client) (c
 	}
 	var out config.Client
 	err = withIdentityLock(home, func() error {
+		c, err := loadProfile(pPath)
+		if err != nil {
+			return err
+		}
+		if _, err := readMaterial(pPath, filepath.Dir(pPath)); err != nil {
+			return err
+		}
 		if expected != nil && c != *expected {
 			return fmt.Errorf("身份配置在预览后发生变化，请重新选择")
 		}
@@ -358,6 +388,9 @@ func readLabels(home string) (map[string]string, error) {
 	m := map[string]string{}
 	if err := json.Unmarshal(data, &m); err != nil {
 		return nil, err
+	}
+	if m == nil {
+		m = map[string]string{}
 	}
 	return m, nil
 }
