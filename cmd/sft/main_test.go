@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 
+	"sft-tui/internal/certmanage"
 	"sft-tui/internal/config"
 	"sft-tui/internal/testcert"
 	"sft-tui/internal/transfer"
@@ -126,5 +127,67 @@ func TestHeadlessCLIUploadListDownloadAndStatus(t *testing.T) {
 	errOut.Reset()
 	if code := runCommand([]string{"-config", cfgPath, "status"}, &out, &errOut); code != 0 || !strings.Contains(out.String(), "没有待恢复") {
 		t.Fatalf("unexpected status output (%d): %s %s", code, out.String(), errOut.String())
+	}
+}
+
+func TestCLIRejectsInvalidArgumentsBeforeOpeningIdentity(t *testing.T) {
+	for _, args := range [][]string{
+		{"unknown"}, {"status", "extra"}, {"pause"}, {"abort", "a", "b"}, {"upload"}, {"download"},
+		{"-parallel", "0", "upload", "a"}, {"-parallel", "65", "upload", "a"}, {"-progress", "invalid", "upload", "a"},
+		{"ui", "extra"}, {"-unknown"},
+	} {
+		t.Run(strings.Join(args, "_"), func(t *testing.T) {
+			var out, stderr bytes.Buffer
+			if code := runCommand(args, &out, &stderr); code != 2 {
+				t.Errorf("invalid CLI arguments exit=%d stderr=%q", code, stderr.String())
+			}
+			if stderr.Len() == 0 {
+				t.Error("invalid CLI arguments omitted usage/error")
+			}
+		})
+	}
+}
+
+func TestClientHelpAndVersionNeedNoIdentity(t *testing.T) {
+	for _, args := range [][]string{{"-h"}, {"-version"}, {"ui", "-h"}, {"init", "-h"}} {
+		t.Run(strings.Join(args, "_"), func(t *testing.T) {
+			var out, stderr bytes.Buffer
+			if code := runCommand(args, &out, &stderr); code != 0 {
+				t.Errorf("help/version exit=%d stderr=%q", code, stderr.String())
+			}
+			if out.Len()+stderr.Len() == 0 {
+				t.Error("help/version produced no output")
+			}
+		})
+	}
+}
+
+func TestInteractiveInitSelectsAmongMultipleBundles(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "configs", "server.local.json")
+	if _, err := certmanage.Execute("init", certmanage.Options{
+		Dir:             filepath.Join(dir, "certs"),
+		ServerConfig:    cfgPath,
+		ClientConfigDir: filepath.Join(dir, "bundles"),
+		Name:            "alice",
+		Hosts:           "localhost,127.0.0.1",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := certmanage.Execute("user", certmanage.Options{
+		Dir:             filepath.Join(dir, "certs"),
+		ServerConfig:    cfgPath,
+		ClientConfigDir: filepath.Join(dir, "bundles"),
+		Name:            "bob",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var out, errOut bytes.Buffer
+	code := runCommandWithInput([]string{"init", "-dir", filepath.Join(dir, "bundles")}, strings.NewReader("2\n"), &out, &errOut)
+	if code != 0 {
+		t.Fatalf("interactive init failed (%d): out=%q err=%q", code, out.String(), errOut.String())
+	}
+	if !strings.Contains(out.String(), "发现多个客户端身份") || !strings.Contains(out.String(), "bob") {
+		t.Fatalf("unexpected interactive output: %q", out.String())
 	}
 }

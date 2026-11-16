@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"flag"
@@ -20,19 +21,30 @@ import (
 	"sft-tui/internal/buildinfo"
 	"sft-tui/internal/certmanage"
 	"sft-tui/internal/config"
+	"sft-tui/internal/console"
 	"sft-tui/internal/control"
 	"sft-tui/internal/logfile"
 	"sft-tui/internal/monitor"
 	"sft-tui/internal/service"
+	"sft-tui/internal/setup"
 	"sft-tui/internal/transfer"
 	"sft-tui/internal/tui"
 )
 
 func main() {
-	os.Exit(runCommand(os.Args[1:], os.Stdout, os.Stderr))
+	if console.Auto() {
+		os.Exit(console.Run(func(s *console.Session) int {
+			return runUI(nil, 0, s.Out, s.Out)
+		}))
+	}
+	os.Exit(runCommandWithInput(os.Args[1:], os.Stdin, os.Stdout, os.Stderr))
 }
 
 func runCommand(args []string, out, errOut io.Writer) int {
+	return runCommandWithInput(args, nil, out, errOut)
+}
+
+func runCommandWithInput(args []string, in io.Reader, out, errOut io.Writer) int {
 	if len(args) > 0 {
 		switch args[0] {
 		case "ui":
@@ -40,9 +52,9 @@ func runCommand(args []string, out, errOut io.Writer) int {
 		case "users":
 			return runUI(args[1:], 1, out, errOut)
 		case "init":
-			return runInit(args[1:], out, errOut)
+			return runInitWithInput(args[1:], in, out, errOut)
 		case "cert":
-			return runCert(args[1:], out, errOut)
+			return runCertWithInput(args[1:], in, out, errOut)
 		case "start":
 			return runStart(args[1:], out, errOut)
 		case "reload":
@@ -250,18 +262,19 @@ func runServe(args []string, out, errOut io.Writer) int {
 	return 0
 }
 
-func runInit(args []string, out, errOut io.Writer) int {
+func runInitWithInput(args []string, in io.Reader, out, errOut io.Writer) int {
 	flags := flag.NewFlagSet("sftd init", flag.ContinueOnError)
 	flags.SetOutput(errOut)
 	var o certmanage.Options
-	flags.StringVar(&o.ServerConfig, "config", "configs/server.local.json", "生成的服务端配置路径")
-	flags.StringVar(&o.Dir, "dir", "certs", "证书输出目录")
+	flags.StringVar(&o.ServerConfig, "config", "configs/server.local.json", "生成或调整的服务端配置路径")
+	flags.StringVar(&o.Dir, "dir", "certs", "证书输出或扫描目录")
 	flags.StringVar(&o.ClientConfigDir, "client-config-dir", "", "客户端配置输出目录（默认为服务端配置同目录）")
 	flags.StringVar(&o.Name, "name", "alice", "初始授权用户名")
 	flags.StringVar(&o.Hosts, "hosts", "localhost,127.0.0.1,::1", "服务端证书 SAN 列表")
 	flags.StringVar(&o.Address, "server-address", "", "写入客户端配置的服务端地址")
 	flags.IntVar(&o.CADays, "ca-days", 365, "CA 有效天数")
 	flags.IntVar(&o.Days, "days", 30, "服务端及用户证书有效天数")
+	yes := flags.Bool("y", false, "非交互式直接按参数或默认值初始化")
 	if err := flags.Parse(args); err != nil {
 		if err == flag.ErrHelp {
 			return 0
@@ -272,6 +285,59 @@ func runInit(args []string, out, errOut io.Writer) int {
 		flags.Usage()
 		return 2
 	}
+	visited := make(map[string]bool)
+	flags.Visit(func(f *flag.Flag) { visited[f.Name] = true })
+
+	interactive := in != nil && !*yes && !visited["name"] && !visited["hosts"] && !visited["server-address"] && !visited["ca-days"] && !visited["days"]
+	if interactive {
+		reader, ok := in.(*bufio.Reader)
+		if !ok {
+			reader = bufio.NewReader(in)
+		}
+		scanDir := "."
+		if visited["dir"] {
+			scanDir = o.Dir
+		}
+		if _, err := os.Stat(o.ServerConfig); os.IsNotExist(err) {
+			var matches []config.TLSFiles
+			if _, statErr := os.Stat(scanDir); statErr == nil {
+				matches, err = setup.ScanServerTLS(scanDir)
+				if err != nil {
+					fmt.Fprintln(errOut, "sftd init：", err)
+					return 1
+				}
+			} else if !os.IsNotExist(statErr) {
+				fmt.Fprintln(errOut, "sftd init：", statErr)
+				return 1
+			}
+			if len(matches) == 0 {
+				if o.ClientConfigDir == "" {
+					o.ClientConfigDir = filepath.Dir(o.ServerConfig)
+				}
+				o, err = certmanage.InitializeDefaultDialog(reader, out, o)
+				if err != nil {
+					fmt.Fprintln(errOut, "sftd init：", err)
+					return 1
+				}
+				res, err := certmanage.Execute("init", o)
+				if err != nil {
+					fmt.Fprintln(errOut, "sftd init：", err)
+					return 1
+				}
+				for _, msg := range res.Messages {
+					fmt.Fprintln(out, msg)
+				}
+				fmt.Fprintln(out, "初始化完成；可运行 sftd ui 或 sftd start 启动管理与服务，sftd cert export 导出用户包。")
+				return 0
+			}
+		}
+		if err := setup.Server(reader, out, o.ServerConfig, scanDir); err != nil {
+			fmt.Fprintln(errOut, "sftd init：", err)
+			return 1
+		}
+		return 0
+	}
+
 	res, err := certmanage.Execute("init", o)
 	if err != nil {
 		fmt.Fprintln(errOut, "sftd init：", err)

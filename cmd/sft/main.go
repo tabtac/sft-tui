@@ -17,8 +17,10 @@ import (
 
 	"sft-tui/internal/buildinfo"
 	"sft-tui/internal/config"
+	"sft-tui/internal/console"
 	"sft-tui/internal/identity"
 	"sft-tui/internal/progress"
+	"sft-tui/internal/prompt"
 	"sft-tui/internal/protocol"
 	"sft-tui/internal/queue"
 	"sft-tui/internal/security"
@@ -32,10 +34,19 @@ type cliJob struct {
 }
 
 func main() {
-	os.Exit(runCommand(os.Args[1:], os.Stdout, os.Stderr))
+	if console.Auto() {
+		os.Exit(console.Run(func(s *console.Session) int {
+			return runUI(nil, s.Out)
+		}))
+	}
+	os.Exit(runCommandWithInput(os.Args[1:], os.Stdin, os.Stdout, os.Stderr))
 }
 
 func runCommand(args []string, out, errOut io.Writer) int {
+	return runCommandWithInput(args, nil, out, errOut)
+}
+
+func runCommandWithInput(args []string, in io.Reader, out, errOut io.Writer) int {
 	// 无参数且当前标准输入/输出为交互式终端时直接进入 TUI 界面
 	if len(args) == 0 {
 		if f, ok := out.(*os.File); ok && (isatty.IsTerminal(f.Fd()) || isatty.IsCygwinTerminal(f.Fd())) {
@@ -48,7 +59,7 @@ func runCommand(args []string, out, errOut io.Writer) int {
 	case "ui":
 		return runUI(args[1:], errOut)
 	case "init":
-		return runInit(args[1:], out, errOut)
+		return runInitWithInput(args[1:], in, out, errOut)
 	}
 
 	flags := flag.NewFlagSet("sft", flag.ContinueOnError)
@@ -104,7 +115,7 @@ func runCommand(args []string, out, errOut io.Writer) int {
 		return 2
 	}
 
-	cfg, err := resolveIdentity(*cfgPath, *dirPath, false, out)
+	cfg, err := resolveIdentity(*cfgPath, *dirPath, false, in, out)
 	if err != nil {
 		fmt.Fprintln(errOut, "sft：", err)
 		return 1
@@ -212,7 +223,7 @@ func runUI(args []string, errOut io.Writer) int {
 	return 0
 }
 
-func runInit(args []string, out, errOut io.Writer) int {
+func runInitWithInput(args []string, in io.Reader, out, errOut io.Writer) int {
 	flags := flag.NewFlagSet("sft init", flag.ContinueOnError)
 	flags.SetOutput(errOut)
 	dir := flags.String("dir", "", "用户导出包目录（省略时自动扫描当前目录及程序目录）")
@@ -227,14 +238,31 @@ func runInit(args []string, out, errOut io.Writer) int {
 		flags.Usage()
 		return 2
 	}
-	if _, err := resolveIdentity(*cfgPath, *dir, true, out); err != nil {
-		fmt.Fprintln(errOut, "sft init：", err)
-		return 1
+	if _, err := resolveIdentity(*cfgPath, *dir, true, in, out); err != nil {
+		if in != nil && *cfgPath == "" && *dir == "" {
+			target, pErr := prompt.New(in, out).Text("未自动找到可用包；请输入 client*.json 或导出目录路径", "", prompt.Nonempty)
+			if pErr == nil {
+				info, stErr := os.Stat(target)
+				if stErr == nil && info.IsDir() {
+					_, err = resolveIdentity("", target, true, in, out)
+				} else if stErr == nil {
+					_, err = resolveIdentity(target, "", true, in, out)
+				} else {
+					err = stErr
+				}
+			} else {
+				err = pErr
+			}
+		}
+		if err != nil {
+			fmt.Fprintln(errOut, "sft init：", err)
+			return 1
+		}
 	}
 	return 0
 }
 
-func resolveIdentity(cfgPath, dirPath string, initMode bool, out io.Writer) (config.Client, error) {
+func resolveIdentity(cfgPath, dirPath string, initMode bool, in io.Reader, out io.Writer) (config.Client, error) {
 	exeDir := "."
 	if exe, err := os.Executable(); err == nil {
 		exeDir = filepath.Dir(exe)
@@ -243,7 +271,7 @@ func resolveIdentity(cfgPath, dirPath string, initMode bool, out io.Writer) (con
 	if err != nil {
 		return config.Client{}, err
 	}
-	return identity.Resolve(exeDir, wd, dirPath, cfgPath, initMode, out)
+	return identity.ResolveInteractive(exeDir, wd, dirPath, cfgPath, initMode, in, out)
 }
 
 func runList(cfg config.Client, out, errOut io.Writer) int {

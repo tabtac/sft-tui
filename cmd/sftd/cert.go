@@ -9,13 +9,14 @@ import (
 	"sft-tui/internal/control"
 )
 
-func runCert(args []string, out, errOut io.Writer) int {
+func runCertWithInput(args []string, in io.Reader, out, errOut io.Writer) int {
 	usage := func() {
 		fmt.Fprintln(errOut, `用法：sftd cert 操作 [选项]
   init                          生成 CA、服务端证书与初始用户授权配置
+  users / manage [-name USER]   交互式新建、编辑权限/带宽、导出、续期或查看用户
   ca                            创建或续期（-renew）CA
   server                        签发或刷新服务端证书及私钥
-  user -name USER               签发或续期（-renew）用户证书（支持 -csr FILE）
+  user [-name USER]             签发或续期（-renew）用户证书（支持 -csr FILE）
   revoke -name USER             吊销用户访问权限并断开已有连接
   status [-name USER]           查看 CA/服务端/用户证书状态与 SHA-256 指纹
   sync [-name USER]             同步客户端配置文件并通知服务端热加载
@@ -27,7 +28,7 @@ func runCert(args []string, out, errOut io.Writer) int {
 	}
 	action := args[0]
 	switch action {
-	case "init", "ca", "server", "user", "revoke", "status", "sync", "export":
+	case "init", "users", "manage", "ca", "server", "user", "revoke", "status", "sync", "export":
 	default:
 		usage()
 		return 2
@@ -79,6 +80,27 @@ func runCert(args []string, out, errOut io.Writer) int {
 		o.Renew && action != "ca" && action != "user" && action != "server" {
 		fmt.Fprintln(errOut, "sftd cert：参数与操作不匹配")
 		return 2
+	}
+
+	visited := make(map[string]bool)
+	flags.Visit(func(f *flag.Flag) { visited[f.Name] = true })
+
+	var err error
+	switch {
+	case action == "init" && in != nil && !visited["name"] && !visited["hosts"] && !visited["server-address"]:
+		o, err = certmanage.InitializeDialog(in, out, o)
+	case action == "users" || action == "manage":
+		if in == nil {
+			err = fmt.Errorf("%s 需要交互式终端输入", action)
+		} else {
+			action, o, err = certmanage.UsersDialog(in, out, o)
+		}
+	case action == "user" && o.Name == "" && in != nil:
+		action, o, err = certmanage.CreateUserDialog(in, out, o)
+	}
+	if err != nil {
+		fmt.Fprintln(errOut, "sftd cert：", err)
+		return 1
 	}
 
 	res, err := certmanage.Execute(action, o)

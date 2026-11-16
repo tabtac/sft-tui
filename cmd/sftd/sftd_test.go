@@ -121,3 +121,54 @@ func TestSFTDUISubcommandNonTTYAndHelp(t *testing.T) {
 		t.Fatalf("expected non-TTY error for sftd ui, got code=%d stderr=%q", code, errOut.String())
 	}
 }
+
+func TestServerCLIRejectsMalformedArguments(t *testing.T) {
+	for _, args := range [][]string{{"serve", "extra"}, {"serve", "-log-level", "invalid"}, {"users", "extra"}, {"ui", "extra"}, {"-unknown"}} {
+		t.Run(strings.Join(args, "_"), func(t *testing.T) {
+			var out, stderr bytes.Buffer
+			if code := runCommand(args, &out, &stderr); code != 2 {
+				t.Errorf("invalid server arguments exit=%d stderr=%q", code, stderr.String())
+			}
+			if stderr.Len() == 0 {
+				t.Error("invalid server arguments omitted usage/error")
+			}
+		})
+	}
+}
+
+func TestInteractiveInitAndCertUsersWizard(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "configs", "server.local.json")
+	certDir := filepath.Join(dir, "certs")
+
+	var out, errOut bytes.Buffer
+	code := runCommandWithInput(
+		[]string{"init", "-config", cfgPath, "-dir", certDir},
+		strings.NewReader(strings.Repeat("\n", 6)),
+		&out, &errOut,
+	)
+	if code != 0 {
+		t.Fatalf("interactive sftd init failed (%d): %s %s", code, out.String(), errOut.String())
+	}
+	srv, err := config.LoadServer(cfgPath)
+	if err != nil || len(srv.AuthorizedClients) != 1 || srv.AuthorizedClients[0].UserID != "alice" {
+		t.Fatalf("interactive init config invalid: %+v %v", srv, err)
+	}
+
+	out.Reset()
+	errOut.Reset()
+	// 在 cert users 交互菜单中：2(新建用户) -> bob -> 30天 -> 默认地址 -> 默认SAN -> y(启用) -> y(上传) -> n(下载) -> y(继承带宽)
+	answers := "2\nbob\n30\n\n\ny\ny\nn\ny\n"
+	code = runCommandWithInput(
+		[]string{"cert", "users", "-server-config", cfgPath, "-client-config-dir", filepath.Join(dir, "configs")},
+		strings.NewReader(answers),
+		&out, &errOut,
+	)
+	if code != 0 {
+		t.Fatalf("interactive cert users failed (%d): %s %s", code, out.String(), errOut.String())
+	}
+	srv, err = config.LoadServer(cfgPath)
+	if err != nil || len(srv.AuthorizedClients) != 2 || srv.AuthorizedClients[1].UserID != "bob" || len(srv.AuthorizedClients[1].Permissions) != 1 {
+		t.Fatalf("interactive user wizard failed: %+v %v", srv.AuthorizedClients, err)
+	}
+}
