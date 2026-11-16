@@ -2,12 +2,14 @@ package tui
 
 import (
 	"context"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 
 	"sft-tui/internal/certmanage"
 	"sft-tui/internal/config"
@@ -124,4 +126,119 @@ func TestServerBubbleTeaPagesLiveControlAndUserPolicy(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	cancel()
 	_ = ctx
+}
+
+func TestPolicyEditorPreservesNilAndExplicitEmptyPermissions(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		permissions []string
+		up, down    bool
+	}{
+		{"legacy_nil", nil, true, true},
+		{"deny_all", []string{}, false, false},
+		{"upload_only", []string{"upload"}, true, false},
+		{"download_only", []string{"download"}, false, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := newServerModel(ServerOptions{ConfigPath: filepath.Join(t.TempDir(), "server.json")})
+			m.cfg = config.DefaultServer()
+			m.openEditPolicyModal(config.AuthorizedClient{UserID: "alice", Permissions: tc.permissions})
+			// BUG: len(Permissions)==0 把显式空权限误当作 nil 的默认全权限；原样保存会意外授权。
+			if m.formToggles[1] != tc.up || m.formToggles[2] != tc.down {
+				t.Errorf("BUG: policy editor changes permission semantics: upload=%v download=%v", m.formToggles[1], m.formToggles[2])
+			}
+		})
+	}
+}
+
+func TestServerModalCapturesDestructiveNavigationKeys(t *testing.T) {
+	for _, key := range []rune{'q', 's', 'x', 'R', '1', '6'} {
+		t.Run(string(key), func(t *testing.T) {
+			m := newServerModel(ServerOptions{ConfigPath: filepath.Join(t.TempDir(), "server.json")})
+			m.openNewUserModal()
+			m.Update(keyRune(key))
+			if m.modal != srvModalNewUser || m.page != 0 || m.busy {
+				t.Errorf("form input triggered a global action: modal=%v page=%d busy=%v", m.modal, m.page, m.busy)
+			}
+			if m.formInputs[0].Value() != string(key) {
+				t.Errorf("form did not capture key %q: %q", key, m.formInputs[0].Value())
+			}
+		})
+	}
+}
+
+func TestServerEmptyPagesClampStaleCursor(t *testing.T) {
+	m := newServerModel(ServerOptions{ConfigPath: filepath.Join(t.TempDir(), "server.json")})
+	for page := 0; page < 6; page++ {
+		m.page = page
+		m.cursors[page] = 100
+		m.clampCursors()
+		if m.cursors[page] != 0 {
+			t.Errorf("page %d retained out-of-range cursor=%d", page, m.cursors[page])
+		}
+		m.Update(keyType(tea.KeyEnter))
+		_ = m.View()
+	}
+}
+
+func TestServerThemePersistenceAndMouseInteraction(t *testing.T) {
+	exeDir := t.TempDir()
+	prefsPath := filepath.Join(exeDir, ".sftd-prefs.json")
+	m := newServerModel(ServerOptions{ExecutableDir: exeDir, ConfigPath: filepath.Join(t.TempDir(), "server.json"), PrefsPath: prefsPath})
+	m.Update(tea.WindowSizeMsg{Width: 110, Height: 30})
+	if !m.th.dark {
+		t.Fatal("default server theme should be dark")
+	}
+	_, cmd := m.Update(keyType(tea.KeyF6))
+	if cmd == nil {
+		t.Fatal("F6 did not emit save command")
+	}
+	m.Update(cmd())
+
+	reloaded := newServerModel(ServerOptions{ExecutableDir: exeDir, ConfigPath: filepath.Join(t.TempDir(), "server.json"), PrefsPath: prefsPath})
+	if reloaded.th.dark {
+		t.Fatal("server light theme preference did not persist")
+	}
+
+	// 点击标签栏第 2 个页签 "2 用户"
+	tab1W := lipgloss.Width(m.th.tabActive.Render("1 概览"))
+	m.Update(tea.MouseMsg{X: 1 + tab1W + 2, Y: 1, Button: tea.MouseButtonLeft, Action: tea.MouseActionPress})
+	if m.page != 1 {
+		t.Fatalf("tab click did not switch to users page: got page=%d", m.page)
+	}
+	m.cfg.AuthorizedClients = []config.AuthorizedClient{{UserID: "alice"}, {UserID: "bob"}, {UserID: "carol"}}
+	m.Update(tea.MouseMsg{X: 10, Y: 5, Button: tea.MouseButtonLeft, Action: tea.MouseActionPress})
+	if m.cursors[1] != 1 {
+		t.Fatalf("mouse click row on users page failed: cursor=%d", m.cursors[1])
+	}
+	m.Update(tea.MouseMsg{X: 10, Y: 5, Button: tea.MouseButtonWheelDown, Action: tea.MouseActionPress})
+	if m.cursors[1] != 2 {
+		t.Fatalf("mouse wheel down failed: cursor=%d", m.cursors[1])
+	}
+}
+
+func TestServerDeployWizardInitializesValidConfiguration(t *testing.T) {
+	root := t.TempDir()
+	cfgPath := filepath.Join(root, "configs", "server.local.json")
+	m := newServerModel(ServerOptions{ExecutableDir: root, ConfigPath: cfgPath})
+	m.Update(tea.WindowSizeMsg{Width: 110, Height: 32})
+	m.Update(serverConfigLoadedMsg{err: os.ErrNotExist})
+
+	m.Update(keyRune('I'))
+	if m.modal != srvModalDeployWizard {
+		t.Fatalf("I did not open deploy wizard: modal=%v", m.modal)
+	}
+	_, cmd := m.Update(keyType(tea.KeyEnter))
+	if cmd == nil {
+		t.Fatal("deploy wizard enter returned nil cmd")
+	}
+	res := cmd()
+	m.Update(res)
+	if action, ok := res.(serverActionResultMsg); !ok || action.err != nil {
+		t.Fatalf("deploy wizard execution failed: %+v", res)
+	}
+	loaded, err := config.LoadServer(cfgPath)
+	if err != nil || len(loaded.AuthorizedClients) != 1 || loaded.AuthorizedClients[0].UserID != "alice" {
+		t.Fatalf("wizard produced invalid server config: %+v %v", loaded, err)
+	}
 }

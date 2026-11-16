@@ -19,12 +19,14 @@ import (
 	"sft-tui/internal/pal"
 	"sft-tui/internal/security"
 	"sft-tui/internal/service"
+	"sft-tui/internal/setup"
 )
 
 type ServerOptions struct {
 	ExecutableDir string
 	ConfigPath    string
 	LogPath       string
+	PrefsPath     string
 	Page          int // 0=概览, 1=用户, 2=传输, 3=证书, 4=设置, 5=日志
 }
 
@@ -41,6 +43,7 @@ const (
 	srvModalCSR
 	srvModalEditSettings
 	srvModalRotateServer
+	srvModalDeployWizard
 )
 
 type certRow struct {
@@ -82,6 +85,7 @@ type serverTickMsg time.Time
 
 type serverModel struct {
 	opts          ServerOptions
+	prefsPath     string
 	th            theme
 	width, height int
 	page          int // 0..5
@@ -139,19 +143,26 @@ func RunServer(opts ServerOptions) error {
 		}
 	}
 	m := newServerModel(opts)
-	p := tea.NewProgram(m, tea.WithAltScreen())
+	p := tea.NewProgram(m, tea.WithAltScreen(), tea.WithMouseCellMotion())
 	_, err := p.Run()
 	return err
 }
 
 func newServerModel(opts ServerOptions) *serverModel {
+	if opts.ExecutableDir == "" {
+		if exe, err := os.Executable(); err == nil {
+			opts.ExecutableDir = filepath.Dir(exe)
+		}
+	}
+	prefsPath := resolvePrefsPath(opts.PrefsPath, opts.ExecutableDir, ".sftd-prefs.json")
 	qi := textinput.New()
 	qi.Placeholder = "输入关键字筛选…"
 	qi.CharLimit = 256
 	qi.Width = 40
 	return &serverModel{
 		opts:         opts,
-		th:           makeTheme(true),
+		prefsPath:    prefsPath,
+		th:           makeTheme(loadThemePref(prefsPath)),
 		page:         max(0, min(5, opts.Page)),
 		runtimeState: "正在连接本机控制端点…",
 		queryInput:   qi,
@@ -370,8 +381,17 @@ func (m *serverModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, tea.Batch(cmds...)
 
+	case themeSavedMsg:
+		if msg.err != nil {
+			m.statusToast = "无法保存主题偏好：" + msg.err.Error()
+		}
+		return m, nil
+
 	case tea.KeyMsg:
 		return m.handleKey(msg)
+
+	case tea.MouseMsg:
+		return m.handleMouse(msg)
 	}
 	return m, nil
 }
@@ -383,7 +403,12 @@ func (m *serverModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 	if k == "f6" {
 		m.th = makeTheme(!m.th.dark)
-		return m, nil
+		if m.th.dark {
+			m.statusToast = "已切换为深色主题"
+		} else {
+			m.statusToast = "已切换为浅色主题"
+		}
+		return m, saveThemePrefCmd(m.prefsPath, m.th.dark)
 	}
 
 	if m.editingQuery {
@@ -470,7 +495,8 @@ func (m *serverModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case 0: // 概览
 		switch k {
 		case "I":
-			return m, m.quickInitCmd()
+			m.openDeployWizardModal()
+			return m, textinput.Blink
 		case "enter":
 			if m.runtime != nil && m.cursors[0] < len(m.runtime.Peers) {
 				p := m.runtime.Peers[m.cursors[0]]
@@ -721,7 +747,7 @@ func (m *serverModel) openCSRModal(user string) {
 }
 
 func (m *serverModel) openEditPolicyModal(u config.AuthorizedClient) {
-	hasUp, hasDown := len(u.Permissions) == 0, len(u.Permissions) == 0
+	hasUp, hasDown := u.Permissions == nil, u.Permissions == nil
 	for _, p := range u.Permissions {
 		if p == "upload" {
 			hasUp = true
@@ -771,6 +797,81 @@ func (m *serverModel) openEditSettingsModal() {
 func (m *serverModel) openRotateServerModal() {
 	m.initForm([]string{"服务端 SAN(逗号分隔 DNS/IP，留空沿用)", "有效期(天)"}, []string{"", "30"}, nil, nil)
 	m.modal = srvModalRotateServer
+}
+
+func (m *serverModel) openDeployWizardModal() {
+	base := m.opts.ExecutableDir
+	if base == "" {
+		base = "."
+	}
+	d := setup.DefaultDeployment(m.opts.ConfigPath, base)
+	hosts := d.Hosts
+	if addrs := setup.LocalAddresses(); len(addrs) > 0 {
+		hosts += "," + strings.Join(addrs, ",")
+	}
+	m.initForm(
+		[]string{
+			"服务端监听地址 (host:port)",
+			"客户端连接地址 (host:port)",
+			"服务端 SAN (逗号分隔 DNS/IP)",
+			"证书目录",
+			"存储根目录",
+			"初始授权用户名",
+			"证书有效天数(用户/CA)",
+		},
+		[]string{d.Listen, d.Address, hosts, d.CertDir, d.Storage, d.User, "30/365"},
+		nil, nil,
+	)
+	m.modal = srvModalDeployWizard
+}
+
+func (m *serverModel) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
+	if msg.Action != tea.MouseActionPress || m.width <= 0 || m.height <= 0 || m.modal != srvModalNone {
+		return m, nil
+	}
+	if msg.Y == 1 && msg.Button == tea.MouseButtonLeft {
+		names := []string{"1 概览", "2 用户", "3 传输", "4 证书", "5 设置", "6 日志"}
+		if idx := tabHitIndex(msg.X, 1, names, m.th, m.page); idx >= 0 {
+			return m.switchPage(idx)
+		}
+		return m, nil
+	}
+	const bodyY = 2
+	bodyH := max(6, m.height-3)
+	if msg.Y < bodyY || msg.Y >= bodyY+bodyH {
+		return m, nil
+	}
+	total := m.currentPageLen()
+	switch msg.Button {
+	case tea.MouseButtonWheelUp:
+		if m.cursors[m.page] > 0 {
+			m.cursors[m.page]--
+		}
+	case tea.MouseButtonWheelDown:
+		if m.cursors[m.page] < total-1 {
+			m.cursors[m.page]++
+		}
+	case tea.MouseButtonLeft:
+		if total == 0 {
+			return m, nil
+		}
+		rowStartY := bodyY + 2
+		visRows := max(1, bodyH-3)
+		if m.page == 0 {
+			topH := min(max(6, bodyH/2), 11)
+			botH := max(5, bodyH-topH)
+			rowStartY = bodyY + topH + 2
+			visRows = max(1, botH-3)
+		}
+		relY := msg.Y - rowStartY
+		if relY >= 0 && relY < visRows {
+			idx := scrollOffset(m.cursors[m.page], total, visRows) + relY
+			if idx >= 0 && idx < total {
+				m.cursors[m.page] = idx
+			}
+		}
+	}
+	return m, nil
 }
 
 func (m *serverModel) showUserDetailModal(u config.AuthorizedClient) {
@@ -905,7 +1006,7 @@ func (m *serverModel) submitModalForm() (tea.Model, tea.Cmd) {
 		if err != nil || days < 1 {
 			days = 30
 		}
-		var perms []string
+		perms := []string{}
 		if m.formToggles[0] {
 			perms = append(perms, "upload")
 		}
@@ -934,7 +1035,7 @@ func (m *serverModel) submitModalForm() (tea.Model, tea.Cmd) {
 		}
 		u := *m.targetUser
 		m.targetUser = nil
-		var perms []string
+		perms := []string{}
 		if m.formToggles[1] {
 			perms = append(perms, "upload")
 		}
@@ -1014,6 +1115,59 @@ func (m *serverModel) submitModalForm() (tea.Model, tea.Cmd) {
 			}
 			return serverActionResultMsg{notice: notice, refresh: true, poll: true}
 		}
+
+	case srvModalDeployWizard:
+		base := m.opts.ExecutableDir
+		if base == "" {
+			base = "."
+		}
+		d := setup.DefaultDeployment(m.opts.ConfigPath, base)
+		d.Listen = strings.TrimSpace(m.formInputs[0].Value())
+		d.Address = strings.TrimSpace(m.formInputs[1].Value())
+		d.Hosts = strings.TrimSpace(m.formInputs[2].Value())
+		d.CertDir = strings.TrimSpace(m.formInputs[3].Value())
+		d.Storage = strings.TrimSpace(m.formInputs[4].Value())
+		d.User = strings.TrimSpace(m.formInputs[5].Value())
+		for _, field := range []*string{&d.CertDir, &d.Storage} {
+			if !filepath.IsAbs(*field) {
+				*field = filepath.Join(base, *field)
+			}
+			*field, _ = filepath.Abs(*field)
+		}
+		daysSpec := strings.Split(strings.TrimSpace(m.formInputs[6].Value()), "/")
+		if len(daysSpec) >= 1 && daysSpec[0] != "" {
+			if n, err := strconv.Atoi(strings.TrimSpace(daysSpec[0])); err == nil {
+				d.Days = n
+			} else {
+				m.statusToast = "证书有效天数格式错误（例如 30/365）"
+				return m, nil
+			}
+		}
+		if len(daysSpec) >= 2 && daysSpec[1] != "" {
+			if n, err := strconv.Atoi(strings.TrimSpace(daysSpec[1])); err == nil {
+				d.CADays = n
+			} else {
+				m.statusToast = "CA 有效天数格式错误（例如 30/365）"
+				return m, nil
+			}
+		}
+		dns, ips, err := security.ParseServerNames(d.Hosts)
+		if err != nil {
+			m.statusToast = err.Error()
+			return m, nil
+		}
+		if len(dns) > 0 && !strings.Contains(dns[0], "*") {
+			d.ServerName = dns[0]
+		} else if len(ips) > 0 {
+			d.ServerName = ips[0].String()
+		}
+		m.busy = true
+		return m, func() tea.Msg {
+			if _, err := setup.InitializeDeployment(d); err != nil {
+				return serverActionResultMsg{err: err}
+			}
+			return serverActionResultMsg{notice: "已完成部署初始化：" + d.Config, refresh: true, poll: true}
+		}
 	}
 	return m, nil
 }
@@ -1046,19 +1200,6 @@ func (m *serverModel) renewCACmd() tea.Cmd {
 	o.Renew = true
 	o.Days = 365
 	return m.execCertAndReload("ca", o, "CA 证书已续期 365 天")
-}
-
-func (m *serverModel) quickInitCmd() tea.Cmd {
-	o := certmanage.Options{
-		Dir:             "certs",
-		ServerConfig:    m.opts.ConfigPath,
-		ClientConfigDir: filepath.Dir(m.opts.ConfigPath),
-		Name:            "alice",
-		Hosts:           "localhost,127.0.0.1,::1",
-		CADays:          365,
-		Days:            30,
-	}
-	return m.execCertAndReload("init", o, "已完成默认 CA / 服务端 / alice 初始化")
 }
 
 func (m *serverModel) reloadServiceCmd() tea.Cmd {

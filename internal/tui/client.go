@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
@@ -26,6 +27,7 @@ type Options struct {
 	Directory     string
 	ConfigPath    string
 	BundleDir     string
+	PrefsPath     string
 }
 
 type focusArea int
@@ -89,8 +91,9 @@ type batchOpResultMsg struct {
 }
 
 type model struct {
-	opts Options
-	th   theme
+	opts      Options
+	prefsPath string
+	th        theme
 
 	width, height int
 	focus         focusArea
@@ -156,7 +159,7 @@ type model struct {
 func Run(opts Options) error {
 	m := newModel(opts)
 	defer m.cleanup()
-	p := tea.NewProgram(m, tea.WithAltScreen())
+	p := tea.NewProgram(m, tea.WithAltScreen(), tea.WithMouseCellMotion())
 	_, err := p.Run()
 	return err
 }
@@ -176,6 +179,7 @@ func newModel(opts Options) *model {
 			opts.ExecutableDir = opts.Directory
 		}
 	}
+	prefsPath := resolvePrefsPath(opts.PrefsPath, opts.ExecutableDir, ".sft-prefs.json")
 
 	makeInput := func(placeholder string) textinput.Model {
 		in := textinput.New()
@@ -187,7 +191,8 @@ func newModel(opts Options) *model {
 
 	m := &model{
 		opts:           opts,
-		th:             makeTheme(true),
+		prefsPath:      prefsPath,
+		th:             makeTheme(loadThemePref(prefsPath)),
 		focus:          areaLocal,
 		localDir:       opts.Directory,
 		connStatus:     "未连接",
@@ -358,9 +363,54 @@ func (m *model) activateChoiceCmd(ch identityChoice, customPath string) tea.Cmd 
 	oldRunner := m.runner
 	exeDir := m.opts.ExecutableDir
 	return func() tea.Msg {
+		wd, _ := os.Getwd()
+		var (
+			prof   identity.Profile
+			useSel bool
+			err    error
+		)
+		switch {
+		case customPath != "":
+			info, statErr := os.Stat(customPath)
+			if statErr != nil {
+				return identityActivatedMsg{err: statErr}
+			}
+			target := customPath
+			if info.IsDir() {
+				candidates, discErr := identity.Discover(exeDir, wd, customPath)
+				if discErr != nil {
+					return identityActivatedMsg{err: discErr}
+				}
+				if len(candidates) == 0 {
+					return identityActivatedMsg{err: fmt.Errorf("目录中未找到有效的客户端配置：%s", customPath)}
+				}
+				if len(candidates) > 1 {
+					return identityActivatedMsg{err: fmt.Errorf("目录中存在多个身份配置（%d 个），请直接指定配置文件路径", len(candidates))}
+				}
+				target = candidates[0]
+			}
+			prof, err = identity.PrepareImport(exeDir, wd, target)
+			if err != nil {
+				return identityActivatedMsg{err: err}
+			}
+		case ch.imported:
+			prof = ch.profile
+			if _, err = identity.Preview(prof.Path, wd); err != nil {
+				return identityActivatedMsg{err: err}
+			}
+			useSel = true
+		default:
+			prof, err = identity.PrepareImport(exeDir, wd, ch.profile.Path)
+			if err != nil {
+				return identityActivatedMsg{err: err}
+			}
+		}
+		if _, err = security.ClientTLS(prof.Config); err != nil {
+			return identityActivatedMsg{err: err}
+		}
 		if oldMgr != nil {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			err := oldMgr.Quiesce(ctx)
+			err = oldMgr.Quiesce(ctx)
 			cancel()
 			if err != nil {
 				return identityActivatedMsg{err: fmt.Errorf("切换身份前暂停当前任务失败：%w", err)}
@@ -368,46 +418,12 @@ func (m *model) activateChoiceCmd(ch identityChoice, customPath string) tea.Cmd 
 			_ = oldRunner.Close()
 			_ = oldMgr.Close()
 		}
-		wd, _ := os.Getwd()
-		if customPath != "" {
-			// 先尝试作为包目录或直接配置文件导入
-			info, statErr := os.Stat(customPath)
-			if statErr != nil {
-				return identityActivatedMsg{err: statErr}
-			}
-			if info.IsDir() {
-				cfg, err := identity.Resolve(exeDir, wd, customPath, "", true, nil)
-				if err != nil {
-					return identityActivatedMsg{err: err}
-				}
-				return openIdentityStack(cfg, "")
-			}
-			prof, err := identity.PrepareImport(exeDir, wd, customPath)
-			if err != nil {
-				return identityActivatedMsg{err: err}
-			}
-			cfg, err := identity.SelectPrepared(exeDir, prof, prof.Label)
-			if err != nil {
-				return identityActivatedMsg{err: err}
-			}
-			res := openIdentityStack(cfg, prof.Label)
-			res.activeID = prof.ID
-			return res
+		var cfg config.Client
+		if useSel {
+			cfg, err = identity.Select(exeDir, prof.ID, prof.Label)
+		} else {
+			cfg, err = identity.SelectPrepared(exeDir, prof, prof.Label)
 		}
-		if ch.imported {
-			cfg, err := identity.Select(exeDir, ch.profile.ID, ch.profile.Label)
-			if err != nil {
-				return identityActivatedMsg{err: err}
-			}
-			res := openIdentityStack(cfg, ch.profile.Label)
-			res.activeID = ch.profile.ID
-			return res
-		}
-		prof, err := identity.PrepareImport(exeDir, wd, ch.profile.Path)
-		if err != nil {
-			return identityActivatedMsg{err: err}
-		}
-		cfg, err := identity.SelectPrepared(exeDir, prof, prof.Label)
 		if err != nil {
 			return identityActivatedMsg{err: err}
 		}
@@ -507,8 +523,17 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
+	case themeSavedMsg:
+		if msg.err != nil {
+			m.statusToast = "无法保存主题偏好：" + msg.err.Error()
+		}
+		return m, nil
+
 	case tea.KeyMsg:
 		return m.handleKey(msg)
+
+	case tea.MouseMsg:
+		return m.handleMouse(msg)
 	}
 	return m, nil
 }
@@ -520,7 +545,12 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 	if k == "f6" {
 		m.th = makeTheme(!m.th.dark)
-		return m, nil
+		if m.th.dark {
+			m.statusToast = "已切换为深色主题"
+		} else {
+			m.statusToast = "已切换为浅色主题"
+		}
+		return m, saveThemePrefCmd(m.prefsPath, m.th.dark)
 	}
 
 	// 1. 文本编辑态优先独占输入（避免误触单字母快捷键）
@@ -663,6 +693,142 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	default:
 		return m.handleQueueKey(k)
 	}
+}
+
+func (m *model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
+	if msg.Action != tea.MouseActionPress || m.width <= 0 || m.height <= 0 {
+		return m, nil
+	}
+	if m.modal == modalIdentity {
+		switch msg.Button {
+		case tea.MouseButtonWheelUp:
+			if m.idCursor > 0 {
+				m.idCursor--
+			}
+		case tea.MouseButtonWheelDown:
+			if m.idCursor < len(m.idChoices)-1 {
+				m.idCursor++
+			}
+		}
+		return m, nil
+	}
+	if m.modal != modalNone {
+		return m, nil
+	}
+
+	const bodyY = 2
+	bodyH := max(6, m.height-3)
+	if msg.Y < bodyY || msg.Y >= bodyY+bodyH {
+		return m, nil
+	}
+
+	moveList := func(cursor *int, total, visRows, relY int) {
+		switch msg.Button {
+		case tea.MouseButtonWheelUp:
+			if *cursor > 0 {
+				*cursor--
+			}
+		case tea.MouseButtonWheelDown:
+			if *cursor < total-1 {
+				*cursor++
+			}
+		case tea.MouseButtonLeft:
+			if relY >= 0 && relY < visRows && total > 0 {
+				idx := scrollOffset(*cursor, total, visRows) + relY
+				if idx >= 0 && idx < total {
+					*cursor = idx
+				}
+			}
+		}
+	}
+
+	if m.width < 96 {
+		if msg.Y == bodyY {
+			if msg.Button == tea.MouseButtonLeft {
+				labels := []string{"1 本地文件", "2 远端文件", "3 活动队列", "4 历史归档"}
+				activeTab := int(m.focus)
+				if m.focus == areaQueue && m.historyView {
+					activeTab = 3
+				}
+				switch tabHitIndex(msg.X, 0, labels, m.th, activeTab) {
+				case 0:
+					m.focus = areaLocal
+				case 1:
+					m.focus = areaRemote
+				case 2:
+					m.focus = areaQueue
+					m.historyView = false
+					m.clampQueueCursor()
+				case 3:
+					m.focus = areaQueue
+					m.historyView = true
+					m.clampQueueCursor()
+				}
+			}
+			return m, nil
+		}
+		panelH := max(5, bodyH-1)
+		visRows := max(1, panelH-3)
+		relY := msg.Y - (bodyY + 3)
+		if m.focus == areaQueue && msg.Y == bodyY+2 && msg.Button == tea.MouseButtonLeft {
+			qLabels := []string{fmt.Sprintf("活动队列 (%d)", len(m.activeTasks)), fmt.Sprintf("历史归档 (%d)", len(m.historyTasks))}
+			activeQ := 0
+			if m.historyView {
+				activeQ = 1
+			}
+			if idx := tabHitIndex(msg.X, 2, qLabels, m.th, activeQ); idx >= 0 {
+				m.historyView = idx == 1
+				m.clampQueueCursor()
+			}
+			return m, nil
+		}
+		switch m.focus {
+		case areaLocal:
+			moveList(&m.localCursor, len(m.visibleLocal), visRows, relY)
+		case areaRemote:
+			moveList(&m.remoteCursor, len(m.visibleRemote), visRows, relY)
+		default:
+			moveList(&m.queueCursor, len(m.currentQueueTasks()), visRows, relY)
+		}
+		return m, nil
+	}
+
+	topH := max(5, (bodyH*55)/100)
+	botH := max(5, bodyH-topH)
+	if topH+botH > bodyH {
+		topH = bodyH - botH
+	}
+	leftW := m.width / 2
+	if msg.Y < bodyY+topH {
+		visRows := max(1, topH-3)
+		relY := msg.Y - (bodyY + 2)
+		if msg.X < leftW {
+			m.focus = areaLocal
+			moveList(&m.localCursor, len(m.visibleLocal), visRows, relY)
+		} else {
+			m.focus = areaRemote
+			moveList(&m.remoteCursor, len(m.visibleRemote), visRows, relY)
+		}
+		return m, nil
+	}
+
+	m.focus = areaQueue
+	queueY := bodyY + topH
+	if msg.Y == queueY+1 && msg.Button == tea.MouseButtonLeft {
+		qLabels := []string{fmt.Sprintf("活动队列 (%d)", len(m.activeTasks)), fmt.Sprintf("历史归档 (%d)", len(m.historyTasks))}
+		activeQ := 0
+		if m.historyView {
+			activeQ = 1
+		}
+		if idx := tabHitIndex(msg.X, 2, qLabels, m.th, activeQ); idx >= 0 {
+			m.historyView = idx == 1
+			m.clampQueueCursor()
+		}
+		return m, nil
+	}
+	visRows := max(1, botH-3)
+	moveList(&m.queueCursor, len(m.currentQueueTasks()), visRows, msg.Y-(queueY+2))
+	return m, nil
 }
 
 func (m *model) handleModalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
@@ -1297,19 +1463,49 @@ func (m *model) resolveConflictsSkip() []queue.Spec {
 	return out
 }
 
+func trimUTF8Bytes(s string, maxBytes int) string {
+	if maxBytes <= 0 {
+		return ""
+	}
+	if len(s) <= maxBytes {
+		return s
+	}
+	n := 0
+	for i, r := range s {
+		w := utf8.RuneLen(r)
+		if w < 0 || i+w > maxBytes {
+			return s[:n]
+		}
+		n = i + w
+	}
+	return s[:n]
+}
+
 func uniqueName(orig string, used map[string]bool) string {
 	if !used[orig] {
 		return orig
 	}
 	ext := filepath.Ext(orig)
 	stem := strings.TrimSuffix(orig, ext)
+	if len(ext) > 240 {
+		ext = ""
+		stem = orig
+	}
 	for i := 1; i < 10000; i++ {
-		cand := fmt.Sprintf("%s (%d)%s", stem, i, ext)
-		if !used[cand] {
+		suffix := fmt.Sprintf(" (%d)", i)
+		budget := protocol.MaxFileNameBytes - len(suffix) - len(ext)
+		trimmed := strings.TrimRight(trimUTF8Bytes(stem, budget), " .")
+		cand := fmt.Sprintf("%s%s%s", trimmed, suffix, ext)
+		if trimmed == "" && budget > 0 {
+			cand = fmt.Sprintf("%s-%d%s", trimUTF8Bytes(stem, budget-2), i, ext)
+		}
+		if len(cand) <= protocol.MaxFileNameBytes && protocol.ValidateName(cand) == nil && !used[cand] {
 			return cand
 		}
 	}
-	return fmt.Sprintf("%s-%d%s", stem, time.Now().UnixNano(), ext)
+	suffix := fmt.Sprintf("-%d", time.Now().UnixNano())
+	budget := protocol.MaxFileNameBytes - len(suffix) - len(ext)
+	return fmt.Sprintf("%s%s%s", trimUTF8Bytes(stem, budget), suffix, ext)
 }
 
 func (m *model) enqueueSpecsCmd(specs []queue.Spec) tea.Cmd {

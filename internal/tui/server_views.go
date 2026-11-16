@@ -482,6 +482,8 @@ func (m *serverModel) renderModal(base string) string {
 		title = "轮换服务端证书"
 	case srvModalEditSettings:
 		title = "修改服务端基础设置"
+	case srvModalDeployWizard:
+		title = "服务端首次部署与证书初始化向导"
 	}
 
 	var lines []string

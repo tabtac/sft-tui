@@ -1,7 +1,79 @@
 // Package tui 提供基于 Bubble Tea + Lip Gloss 的跨平台（Linux/Windows）交互式终端客户端。
 package tui
 
-import "github.com/charmbracelet/lipgloss"
+import (
+	"encoding/json"
+	"os"
+	"path/filepath"
+
+	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
+
+	"sft-tui/internal/pal"
+)
+
+type uiPrefs struct {
+	Light bool `json:"light"`
+}
+
+type themeSavedMsg struct {
+	err error
+}
+
+func resolvePrefsPath(override, exeDir, filename string) string {
+	if override != "" {
+		return override
+	}
+	if exeDir != "" {
+		return filepath.Join(exeDir, filename)
+	}
+	return filename
+}
+
+func loadThemePref(path string) bool {
+	data, err := pal.ReadSmall(path, 8192)
+	if err != nil {
+		return true
+	}
+	var prefs uiPrefs
+	if err := json.Unmarshal(data, &prefs); err != nil {
+		return true
+	}
+	return !prefs.Light
+}
+
+func saveThemePrefCmd(path string, dark bool) tea.Cmd {
+	if path == "" {
+		return nil
+	}
+	return func() tea.Msg {
+		data, err := json.MarshalIndent(uiPrefs{Light: !dark}, "", "  ")
+		if err != nil {
+			return themeSavedMsg{err: err}
+		}
+		if err := pal.EnsurePrivateDir(filepath.Dir(path)); err != nil && !os.IsExist(err) {
+			return themeSavedMsg{err: err}
+		}
+		return themeSavedMsg{err: pal.StageAndReplaceMode(path, append(data, '\n'), 0600, false)}
+	}
+}
+
+func tabHitIndex(x, startOffset int, labels []string, th theme, activeIdx int) int {
+	pos := startOffset
+	for i, lbl := range labels {
+		var w int
+		if i == activeIdx {
+			w = lipgloss.Width(th.tabActive.Render(lbl))
+		} else {
+			w = lipgloss.Width(th.tabInactive.Render(lbl))
+		}
+		if x >= pos && x < pos+w {
+			return i
+		}
+		pos += w
+	}
+	return -1
+}
 
 type theme struct {
 	dark        bool
