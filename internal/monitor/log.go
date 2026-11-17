@@ -55,6 +55,32 @@ func (l *Logs) appendLocked(e Event) {
 	}
 }
 
+func logLevelRank(level string) (int, bool) {
+	switch strings.ToUpper(strings.TrimSpace(level)) {
+	case "DEBUG":
+		return 0, true
+	case "INFO":
+		return 1, true
+	case "WARN", "WARNING":
+		return 2, true
+	case "ERROR":
+		return 3, true
+	default:
+		return 0, false
+	}
+}
+
+func matchesMinLogLevel(eventLevel, filterLevel string, minRank int, knownMin bool) bool {
+	if filterLevel == "" {
+		return true
+	}
+	if knownMin {
+		evRank, ok := logLevelRank(eventLevel)
+		return ok && evRank >= minRank
+	}
+	return strings.ToUpper(strings.TrimSpace(eventLevel)) == filterLevel
+}
+
 func (l *Logs) Query(q LogQuery) LogPage {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -62,11 +88,12 @@ func (l *Logs) Query(q LogQuery) LogPage {
 	if len(l.events) > 0 && q.After > 0 && q.After < l.events[0].Sequence-1 {
 		p.Lost = true
 	}
-	level, file, text := strings.ToUpper(q.Level), strings.ToLower(q.File), strings.ToLower(q.Text)
+	level, file, text := strings.ToUpper(strings.TrimSpace(q.Level)), strings.ToLower(q.File), strings.ToLower(q.Text)
+	minRank, knownMin := logLevelRank(level)
 	for _, e := range l.events {
 		if e.Sequence <= q.After ||
 			(!q.Since.IsZero() && e.Time.Before(q.Since)) ||
-			(q.Level != "" && e.Level != level) ||
+			!matchesMinLogLevel(e.Level, level, minRank, knownMin) ||
 			(q.User != "" && e.User != q.User) ||
 			(q.File != "" && !strings.Contains(strings.ToLower(e.File), file)) ||
 			(q.Text != "" && !strings.Contains(strings.ToLower(e.Message+" "+e.Detail), text)) {

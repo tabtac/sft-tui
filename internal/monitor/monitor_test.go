@@ -137,3 +137,36 @@ func TestRuntimeSnapshotsAreIndependentAndHistoryIsBounded(t *testing.T) {
 		t.Error("runtime history grew beyond its bound")
 	}
 }
+
+func TestLogsQueryMinimumLevelIncludesHigherSeverities(t *testing.T) {
+	logs := &Logs{}
+	var buf bytes.Buffer
+	logger := slog.New(logs.Handler(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	logger.Debug("dbg-msg")
+	logger.Info("info-msg")
+	logger.Warn("warn-msg")
+	logger.Error("err-msg")
+
+	warnPage := logs.Query(LogQuery{Level: "WARN"})
+	if len(warnPage.Events) != 2 {
+		t.Fatalf("WARN minimum level returned %d events, want 2 (WARN + ERROR): %+v", len(warnPage.Events), warnPage.Events)
+	}
+	if warnPage.Events[0].Level != "WARN" || warnPage.Events[1].Level != "ERROR" {
+		t.Fatalf("unexpected WARN query levels: %+v", warnPage.Events)
+	}
+
+	infoPage := logs.Query(LogQuery{Level: "INFO"})
+	if len(infoPage.Events) != 3 {
+		t.Fatalf("INFO minimum level returned %d events, want 3: %+v", len(infoPage.Events), infoPage.Events)
+	}
+
+	errPage := logs.Query(LogQuery{Level: "ERROR"})
+	if len(errPage.Events) != 1 || errPage.Events[0].Level != "ERROR" {
+		t.Fatalf("ERROR minimum level returned unexpected events: %+v", errPage.Events)
+	}
+
+	allPage := logs.Query(LogQuery{})
+	if len(allPage.Events) != 4 {
+		t.Fatalf("empty level filter returned %d events, want 4", len(allPage.Events))
+	}
+}
