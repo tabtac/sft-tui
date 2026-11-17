@@ -110,11 +110,13 @@ func (m *model) renderFooter() string {
 		hints = "本地：↑↓ 移动  Space 多选  Enter 进目录/详情  u/F5 上传选中  Backspace 上级  p 路径  / 筛选  o 排序  r 刷新  i 身份  Tab 切区  ? 帮助  q 退出"
 	case m.focus == areaRemote:
 		hints = "远端：↑↓ 移动  Space 多选  Enter 详情  d/F5 下载到当前目录  r 刷新  / 筛选  o 排序  i 身份  Tab 切区  ? 帮助  q 退出"
+	case m.focus == areaQueue:
+		fallthrough
 	default:
 		if m.historyView {
-			hints = "历史归档：↑↓ 移动  Enter 详情  r 重传  X 清空历史  Tab/v 切回活动队列  F6 主题  ? 帮助  q 退出"
+			hints = "历史归档：↑↓ 移动  Enter 详情  r/F5 重传  X 清空历史  Tab/v 切回活动队列  F6 主题  ? 帮助  q 退出"
 		} else {
-			hints = "活动队列：↑↓ 移动  Space 暂停/恢复  c 取消  a 全部暂停/恢复  n 改名重传  Enter 详情  Tab/v 切历史  ? 帮助  q 退出"
+			hints = "活动队列：↑↓ 移动  Space 暂停/恢复  F5 恢复/重试  c 取消  a 全部暂停/恢复  n 改名  Tab/v 切历史  ? 帮助  q 退出"
 		}
 	}
 	return m.th.footerBar.Width(m.width).Render(truncCell(hints, m.width-2))
@@ -186,6 +188,16 @@ func (m *model) renderBox(title string, lines []string, active bool, outerW, out
 	return renderPanelBox(m.th, title, lines, active, outerW, outerH)
 }
 
+// panelNameSizeWidths 计算文件面板的单行名称列与大小列宽度，保证在 80×24 等窄屏下大小与单位不换行。
+func panelNameSizeWidths(innerW, fixedOverhead int) (nameW, sizeW int) {
+	sizeW = 10
+	if innerW < fixedOverhead+sizeW+6 {
+		sizeW = max(5, innerW-fixedOverhead-6)
+	}
+	nameW = max(1, innerW-sizeW-fixedOverhead)
+	return nameW, sizeW
+}
+
 func (m *model) renderLocalPanel(outerW, outerH int) string {
 	innerW := max(10, outerW-4)
 	visRows := max(1, outerH-3)
@@ -195,14 +207,15 @@ func (m *model) renderLocalPanel(outerW, outerH int) string {
 	if m.loadingLocal {
 		title += m.th.badgeWarn.Render(" [读取中…]")
 	}
+	title = truncCell(title, innerW)
 
 	var lines []string
 	if len(m.visibleLocal) == 0 {
-		lines = append(lines, m.th.badgeMuted.Render("（当前目录无可匹配文件）"))
+		lines = append(lines, m.th.badgeMuted.Render(truncCell("（当前目录无可匹配文件）", innerW)))
 	} else {
 		start := scrollOffset(m.localCursor, len(m.visibleLocal), visRows)
-		sizeW := 10
-		nameW := max(8, innerW-sizeW-6)
+		// 行模板: mark(3) + ' '(1) + icon(2) + name(nameW) + ' '(1) + sz(sizeW) => 固定开销 7 列
+		nameW, sizeW := panelNameSizeWidths(innerW, 7)
 		for i := start; i < min(len(m.visibleLocal), start+visRows); i++ {
 			e := m.visibleLocal[i]
 			mark := "   "
@@ -219,7 +232,7 @@ func (m *model) renderLocalPanel(outerW, outerH int) string {
 				icon = "▸ "
 				sz = padLeftCell("<DIR>", sizeW)
 			}
-			row := fmt.Sprintf("%s %s%s %s", mark, icon, padRightCell(e.name, nameW), sz)
+			row := truncCell(fmt.Sprintf("%s %s%s %s", mark, icon, padRightCell(e.name, nameW), sz), innerW)
 			if i == m.localCursor && m.focus == areaLocal {
 				lines = append(lines, m.th.rowCursor.Render(padRightCell(row, innerW)))
 			} else if e.regular && m.localSelected[e.path] {
@@ -240,27 +253,28 @@ func (m *model) renderRemotePanel(outerW, outerH int) string {
 	if m.loadingRemote {
 		title += m.th.badgeWarn.Render(" [同步中…]")
 	}
+	title = truncCell(title, innerW)
 
 	var lines []string
 	switch {
 	case m.cfg == nil:
-		lines = append(lines, m.th.badgeMuted.Render("尚未配置或导入身份，按 i 打开身份配置"))
+		lines = append(lines, m.th.badgeMuted.Render(truncCell("尚未配置或导入身份，按 i 打开身份配置", innerW)))
 	case m.remoteErr != "":
 		lines = append(lines, m.th.badgeErr.Render(truncCell("远端列表暂不可用："+m.remoteErr, innerW)))
-		lines = append(lines, m.th.badgeMuted.Render("按 r 重新刷新连接，本地队列与断点继续可用"))
+		lines = append(lines, m.th.badgeMuted.Render(truncCell("按 r 重新刷新连接，本地队列与断点继续可用", innerW)))
 	case len(m.visibleRemote) == 0:
-		lines = append(lines, m.th.badgeMuted.Render("（远端暂无匹配文件，选中本地文件后按 u/F5 上传）"))
+		lines = append(lines, m.th.badgeMuted.Render(truncCell("（远端暂无匹配文件，选中本地文件后按 u/F5 上传）", innerW)))
 	default:
 		start := scrollOffset(m.remoteCursor, len(m.visibleRemote), visRows)
-		sizeW := 10
-		nameW := max(8, innerW-sizeW-5)
+		// 行模板: mark(3) + ' '(1) + name(nameW) + ' '(1) + sz(sizeW) => 固定开销 5 列
+		nameW, sizeW := panelNameSizeWidths(innerW, 5)
 		for i := start; i < min(len(m.visibleRemote), start+visRows); i++ {
 			f := m.visibleRemote[i]
 			mark := "[ ]"
 			if m.remoteSelected[f.FileName] {
 				mark = "[✓]"
 			}
-			row := fmt.Sprintf("%s %s %s", mark, padRightCell(f.FileName, nameW), padLeftCell(progress.FormatBytes(f.Size), sizeW))
+			row := truncCell(fmt.Sprintf("%s %s %s", mark, padRightCell(f.FileName, nameW), padLeftCell(progress.FormatBytes(f.Size), sizeW)), innerW)
 			if i == m.remoteCursor && m.focus == areaRemote {
 				lines = append(lines, m.th.rowCursor.Render(padRightCell(row, innerW)))
 			} else if m.remoteSelected[f.FileName] {
@@ -285,15 +299,15 @@ func (m *model) renderQueuePanel(outerW, outerH int) string {
 		activeTab = m.th.tabInactive.Render(fmt.Sprintf("活动队列 (%d)", len(m.activeTasks)))
 		histTab = m.th.tabActive.Render(fmt.Sprintf("历史归档 (%d)", len(m.historyTasks)))
 	}
-	title := activeTab + " " + histTab
+	title := truncCell(activeTab+" "+histTab, innerW)
 
 	tasks := m.currentQueueTasks()
 	var lines []string
 	if len(tasks) == 0 {
 		if m.historyView {
-			lines = append(lines, m.th.badgeMuted.Render("（历史归档为空）"))
+			lines = append(lines, m.th.badgeMuted.Render(truncCell("（历史归档为空）", innerW)))
 		} else {
-			lines = append(lines, m.th.badgeMuted.Render("（活动队列为空：在本地或远端选择文件并按 u / d / F5 开始传输）"))
+			lines = append(lines, m.th.badgeMuted.Render(truncCell("（活动队列为空：在本地或远端选择文件并按 u / d / F5 开始传输）", innerW)))
 		}
 	} else {
 		start := scrollOffset(m.queueCursor, len(tasks), visRows)
@@ -311,14 +325,14 @@ func (m *model) renderQueuePanel(outerW, outerH int) string {
 			bar := renderProgressBar(m.th, t.Done, t.Size, t.State, barW)
 			badge := stateBadge(m.th, t)
 			metrics := formatTaskMetrics(t)
-			rowText := fmt.Sprintf("%s%s  %s  %s  %s  %s",
+			rowText := truncCell(fmt.Sprintf("%s%s  %s  %s  %s  %s",
 				pointer,
 				directionIcon(t.Direction),
 				padRightCell(t.Remote, nameW),
 				badge,
 				bar,
 				truncCell(metrics, max(10, innerW-nameW-barW-26)),
-			)
+			), innerW)
 			if i == m.queueCursor && m.focus == areaQueue {
 				lines = append(lines, m.th.rowCursor.Render(padRightCell(rowText, innerW)))
 			} else {

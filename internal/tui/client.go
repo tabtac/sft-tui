@@ -99,6 +99,7 @@ type model struct {
 	focus         focusArea
 	historyView   bool
 	modal         modalKind
+	infoScroll    int
 
 	// 文本输入框
 	searchInput   textinput.Model
@@ -614,6 +615,7 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "q", "f10":
 		return m.requestExit()
 	case "?":
+		m.infoScroll = 0
 		m.modal = modalHelp
 		return m, nil
 	case "tab":
@@ -673,9 +675,12 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.idInput.Blur()
 		return m, m.scanIdentitiesCmd()
 	case "a":
-		return m, m.toggleAllCmd()
+		if m.focus == areaQueue && !m.historyView {
+			return m, m.toggleAllCmd()
+		}
+		return m, nil
 	case "c":
-		if m.focus == areaQueue {
+		if m.focus == areaQueue && !m.historyView {
 			return m, m.cancelSelectedCmd()
 		}
 		return m, nil
@@ -684,10 +689,14 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "d":
 		return m, m.prepareDownload()
 	case "f5":
-		if m.focus == areaRemote {
+		switch m.focus {
+		case areaRemote:
 			return m, m.prepareDownload()
+		case areaQueue:
+			return m, m.resumeOrRetrySelectedCmd()
+		default:
+			return m, m.prepareUpload()
 		}
-		return m, m.prepareUpload()
 	}
 
 	// 4. 分区按键处理
@@ -701,8 +710,26 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 }
 
+func (m *model) scrollClientInfoModal(k string) {
+	title, lines, footer := m.infoModalData()
+	_, maxScroll := renderModalScrollBox(m.width, m.height, m.th, title, lines, footer, m.infoScroll)
+	next, ok := modalScrollStep(k, m.infoScroll, maxScroll, modalScrollBoxPageRows(m.height, footer))
+	if ok {
+		m.infoScroll = next
+	}
+}
+
 func (m *model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 	if msg.Action != tea.MouseActionPress || m.width <= 0 || m.height <= 0 {
+		return m, nil
+	}
+	if m.modal == modalHelp || m.modal == modalDetail {
+		switch msg.Button {
+		case tea.MouseButtonWheelUp:
+			m.scrollClientInfoModal("up")
+		case tea.MouseButtonWheelDown:
+			m.scrollClientInfoModal("down")
+		}
 		return m, nil
 	}
 	if m.modal == modalIdentity {
@@ -872,13 +899,17 @@ func (m *model) handleModalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case modalHelp:
 		if k == "esc" || k == "?" || k == "enter" || k == "q" {
 			m.modal = modalNone
+			return m, nil
 		}
+		m.scrollClientInfoModal(k)
 		return m, nil
 
 	case modalDetail:
 		if k == "esc" || k == "enter" || k == "q" {
 			m.modal = modalNone
+			return m, nil
 		}
+		m.scrollClientInfoModal(k)
 		return m, nil
 
 	case modalIdentity:
@@ -898,12 +929,13 @@ func (m *model) handleModalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if m.idInputFocus {
 			if k == "enter" {
 				path := strings.TrimSpace(m.idInput.Value())
-				if path != "" {
-					m.idInput.SetValue("")
-					m.statusToast = "正在校验并导入身份…"
-					return m, m.activateChoiceCmd(identityChoice{}, path)
+				if path == "" {
+					m.statusToast = "请输入要导入的配置文件或目录路径"
+					return m, nil
 				}
-				return m, nil
+				m.idInput.SetValue("")
+				m.statusToast = "正在校验并导入身份…"
+				return m, m.activateChoiceCmd(identityChoice{}, path)
 			}
 			var cmd tea.Cmd
 			m.idInput, cmd = m.idInput.Update(msg)
@@ -955,13 +987,24 @@ func (m *model) handleModalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.renameTask = nil
 			return m, nil
 		case "enter":
-			newName := strings.TrimSpace(m.renameInput.Value())
 			t := m.renameTask
-			m.modal = modalNone
-			m.renameTask = nil
-			if t == nil || newName == "" {
+			if t == nil {
+				m.modal = modalNone
 				return m, nil
 			}
+			newName := strings.TrimSpace(m.renameInput.Value())
+			if newName == "" {
+				m.statusToast = "新文件名不能为空"
+				m.renameInput.Focus()
+				return m, textinput.Blink
+			}
+			if err := protocol.ValidateName(newName); err != nil {
+				m.statusToast = "文件名无效：" + err.Error()
+				m.renameInput.Focus()
+				return m, textinput.Blink
+			}
+			m.modal = modalNone
+			m.renameTask = nil
 			spec := queue.Spec{Direction: t.Direction, Remote: t.Remote, Path: t.Path, Size: t.Size}
 			if t.Direction == protocol.DirectionUpload {
 				spec.Remote = newName
@@ -1105,6 +1148,7 @@ func (m *model) handleLocalKey(k string) (tea.Model, tea.Cmd) {
 				"",
 				"按 u 或 F5 加入上传队列（按 Space 可多选）",
 			}
+			m.infoScroll = 0
 			m.modal = modalDetail
 		}
 	}
@@ -1157,6 +1201,7 @@ func (m *model) handleRemoteKey(k string) (tea.Model, tea.Cmd) {
 				"",
 				"按 d 或 F5 下载至当前本地目录（" + m.localDir + "）",
 			}
+			m.infoScroll = 0
 			m.modal = modalDetail
 		}
 	}
@@ -1227,6 +1272,7 @@ func (m *model) openTaskDetail(t queue.Task) {
 		t.Error,
 		t.Updated,
 	)
+	m.infoScroll = 0
 	m.modal = modalDetail
 }
 
@@ -1554,6 +1600,19 @@ func (m *model) enqueueSpecsCmd(specs []queue.Spec) tea.Cmd {
 	}
 }
 
+func resumePendingOrPausedTask(mgr *queue.Manager, task queue.Task) tea.Msg {
+	if task.WantCancel {
+		if err := mgr.Cancel(task.ID); err != nil {
+			return batchOpResultMsg{err: err}
+		}
+		return batchOpResultMsg{notice: "重试取消：" + task.Remote}
+	}
+	if err := mgr.Resume(task.ID); err != nil {
+		return batchOpResultMsg{err: err}
+	}
+	return batchOpResultMsg{notice: "已恢复任务：" + task.Remote}
+}
+
 func (m *model) toggleSelectedTaskCmd() tea.Cmd {
 	if m.manager == nil {
 		return nil
@@ -1572,19 +1631,36 @@ func (m *model) toggleSelectedTaskCmd() tea.Cmd {
 			}
 			return batchOpResultMsg{notice: "已请求暂停：" + task.Remote}
 		case task.State == queue.Paused || task.State == queue.Pending:
-			if task.WantCancel {
-				if err := mgr.Cancel(task.ID); err != nil {
-					return batchOpResultMsg{err: err}
-				}
-				return batchOpResultMsg{notice: "重试取消：" + task.Remote}
-			}
-			if err := mgr.Resume(task.ID); err != nil {
-				return batchOpResultMsg{err: err}
-			}
-			return batchOpResultMsg{notice: "已恢复任务：" + task.Remote}
+			return resumePendingOrPausedTask(mgr, task)
 		}
 		return batchOpResultMsg{}
 	}
+}
+
+// resumeOrRetrySelectedCmd 在队列/历史区按 F5 时根据选中任务状态执行恢复、重试或重传。
+func (m *model) resumeOrRetrySelectedCmd() tea.Cmd {
+	if m.manager == nil {
+		m.statusToast = "请先配置或导入身份（按 i）"
+		return nil
+	}
+	t := m.selectedTask()
+	if t == nil {
+		m.statusToast = "当前队列无选中任务"
+		return nil
+	}
+	task := *t
+	if m.historyView || task.Terminal() {
+		spec := queue.Spec{Direction: task.Direction, Remote: task.Remote, Path: task.Path, Size: task.Size}
+		return m.enqueueSpecsCmd([]queue.Spec{spec})
+	}
+	if task.State == queue.Paused || task.State == queue.Pending {
+		mgr := m.manager
+		return func() tea.Msg {
+			return resumePendingOrPausedTask(mgr, task)
+		}
+	}
+	m.statusToast = fmt.Sprintf("任务当前正在进行（%s），无需恢复或重试", task.State)
+	return nil
 }
 
 func (m *model) pauseSelectedCmd() tea.Cmd {

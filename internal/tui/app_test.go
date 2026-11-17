@@ -13,6 +13,7 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 
 	"sft-tui/internal/config"
 	"sft-tui/internal/protocol"
@@ -501,5 +502,241 @@ func TestClientMouseClickAndWheelInteraction(t *testing.T) {
 	m.Update(tea.MouseMsg{X: 2 + titlePrefix + 2, Y: 17, Button: tea.MouseButtonLeft, Action: tea.MouseActionPress})
 	if m.focus != areaQueue || !m.historyView {
 		t.Fatalf("queue history tab click failed: focus=%v historyView=%v", m.focus, m.historyView)
+	}
+}
+
+func TestClientShortcutScopesKeyAAndF5ToActiveArea(t *testing.T) {
+	cliCfg, _, cleanup := setupTestClientEnv(t)
+	defer cleanup()
+
+	mgr, err := queue.Open(queue.Config{
+		Identity: "alice-test-id",
+		StateDir: cliCfg.StateDir,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mgr.Close()
+
+	workDir := t.TempDir()
+	localFile := filepath.Join(workDir, "local.bin")
+	if err := os.WriteFile(localFile, []byte("hello"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	tasks, err := mgr.Enqueue([]queue.Spec{{
+		Direction: protocol.DirectionUpload,
+		Remote:    "queued.bin",
+		Path:      localFile,
+		Size:      5,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := mgr.Pause(tasks[0].ID); err != nil {
+		t.Fatal(err)
+	}
+
+	m := newModel(Options{ExecutableDir: workDir, Directory: workDir})
+	m.cfg = &cliCfg
+	m.manager = mgr
+	m.localDir = workDir
+	m.visibleLocal = []localEntry{{name: "local.bin", path: localFile, size: 5, regular: true}}
+	m.localSelected[localFile] = true
+	m.visibleRemote = []protocol.FileEntry{{FileName: "queued.bin", Size: 5}}
+	m.refreshQueueSnapshots()
+
+	// 1. 文件区域按 a 不得暂停/恢复全部队列
+	for _, area := range []focusArea{areaLocal, areaRemote} {
+		m.focus = area
+		_, cmd := m.Update(keyRune('a'))
+		if cmd != nil {
+			m.Update(cmd())
+		}
+		m.refreshQueueSnapshots()
+		if got := mgr.Task(tasks[0].ID); got == nil || got.State != queue.Paused {
+			t.Fatalf("pressing a in area %v unexpectedly altered queue state: %+v", area, got)
+		}
+	}
+
+	// 2. 队列区域按 F5 不得进入上传逻辑，而应恢复选中的暂停任务
+	m.focus = areaQueue
+	m.historyView = false
+	m.queueCursor = 0
+	_, f5Cmd := m.Update(keyType(tea.KeyF5))
+	if f5Cmd == nil {
+		t.Fatal("F5 in queue on paused task did not emit resume command")
+	}
+	res := f5Cmd()
+	m.Update(res)
+	m.refreshQueueSnapshots()
+	if m.modal != modalNone {
+		t.Fatalf("F5 in queue opened upload conflict modal=%v", m.modal)
+	}
+	if got := len(m.activeTasks); got != 1 {
+		t.Fatalf("F5 in queue unexpectedly uploaded another file: active=%d", got)
+	}
+	if got := mgr.Task(tasks[0].ID); got == nil || got.State != queue.Waiting {
+		t.Fatalf("F5 in queue did not resume paused task: %+v", got)
+	}
+
+	// 3. 队列区域选中执行中任务按 F5 也不触发上传
+	_, activeF5 := m.Update(keyType(tea.KeyF5))
+	if activeF5 != nil {
+		t.Fatal("F5 on running/waiting task in queue should not trigger upload cmd")
+	}
+	if !strings.Contains(m.statusToast, "无需恢复或重试") || len(m.activeTasks) != 1 {
+		t.Fatalf("unexpected toast or task count after F5 on active task: toast=%q active=%d", m.statusToast, len(m.activeTasks))
+	}
+
+	// 4. 队列区域按 a 正常触发暂停全部
+	_, qACmd := m.Update(keyRune('a'))
+	if qACmd == nil {
+		t.Fatal("pressing a in active queue did not trigger toggleAllCmd")
+	}
+	m.Update(qACmd())
+	m.refreshQueueSnapshots()
+	if got := mgr.Task(tasks[0].ID); got == nil || got.State != queue.Paused {
+		t.Fatalf("pressing a in queue did not pause queue: %+v", got)
+	}
+
+	// 5. 队列中 Cancelled/历史任务按 F5 应重新入队（重传）而非触发本地选中上传
+	if err := mgr.Cancel(tasks[0].ID); err != nil {
+		t.Fatal(err)
+	}
+	m.refreshQueueSnapshots()
+	m.historyView = true
+	m.queueCursor = 0
+	_, retryCmd := m.Update(keyType(tea.KeyF5))
+	if retryCmd == nil {
+		t.Fatal("F5 on history task did not emit re-enqueue command")
+	}
+	m.Update(retryCmd())
+	m.refreshQueueSnapshots()
+	requeued := false
+	for _, tk := range m.activeTasks {
+		if tk.ID != tasks[0].ID && tk.Remote == "queued.bin" && tk.State == queue.Waiting {
+			requeued = true
+			break
+		}
+	}
+	if !requeued {
+		t.Fatalf("F5 on history task failed to re-enqueue target task: active=%+v", m.activeTasks)
+	}
+}
+
+func TestClientFileListColumns80x24NeverWrapSizeUnit(t *testing.T) {
+	workDir := t.TempDir()
+	m := newModel(Options{ExecutableDir: workDir, Directory: workDir})
+	m.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
+	m.localDir = workDir
+	m.visibleLocal = []localEntry{
+		{name: "..", path: filepath.Dir(workDir), dir: true},
+		{name: strings.Repeat("long_local_archive_", 4) + ".tar.gz", path: filepath.Join(workDir, "a"), size: 25 * 1024 * 1024, regular: true},
+		{name: "中文名称超长测试文件数据包-2026-生产备份.bin", path: filepath.Join(workDir, "b"), size: 2 * 1024 * 1024 * 1024, regular: true},
+		{name: "small.txt", path: filepath.Join(workDir, "c"), size: 1536, regular: true},
+	}
+	cfg := config.DefaultClient()
+	m.cfg = &cfg
+	m.visibleRemote = []protocol.FileEntry{
+		{FileName: strings.Repeat("remote_dataset_part_", 4) + ".zst", Size: 25 * 1024 * 1024},
+		{FileName: "中文远端同步大数据镜像归档文件.img", Size: 2 * 1024 * 1024 * 1024},
+		{FileName: "tiny.log", Size: 512},
+	}
+
+	assertSingleLineRows := func(name, panel string, wants []string) {
+		t.Helper()
+		plain := ansi.Strip(panel)
+		lines := strings.Split(plain, "\n")
+		for _, ln := range lines {
+			trimmed := strings.TrimSpace(strings.Trim(ln, "│╭╮╰╯─ "))
+			switch trimmed {
+			case "B", "KiB", "MiB", "GiB", "TiB":
+				t.Fatalf("%s wrapped size unit onto separate line:\n%s", name, plain)
+			}
+		}
+		for _, want := range wants {
+			foundSameLine := false
+			for _, ln := range lines {
+				if strings.Contains(ln, want) {
+					foundSameLine = true
+					break
+				}
+			}
+			if !foundSameLine {
+				t.Fatalf("%s missing single-line token %q:\n%s", name, want, plain)
+			}
+		}
+	}
+
+	m.focus = areaLocal
+	localView := m.View()
+	if h := lipgloss.Height(localView); h > 24 {
+		t.Fatalf("80x24 local view overflowed height: got %d\n%s", h, ansi.Strip(localView))
+	}
+	assertSingleLineRows("local-80x24", localView, []string{"<DIR>", "25.0 MiB", "2.0 GiB", "1.5 KiB"})
+
+	m.focus = areaRemote
+	remoteView := m.View()
+	if h := lipgloss.Height(remoteView); h > 24 {
+		t.Fatalf("80x24 remote view overflowed height: got %d\n%s", h, ansi.Strip(remoteView))
+	}
+	assertSingleLineRows("remote-80x24", remoteView, []string{"25.0 MiB", "2.0 GiB", "512 B"})
+}
+
+func TestClientRenameModalAndScrollableInfoModals(t *testing.T) {
+	m := newModel(Options{ExecutableDir: t.TempDir(), Directory: t.TempDir()})
+	m.Update(tea.WindowSizeMsg{Width: 80, Height: 14})
+
+	// 1. 改名弹窗校验失败时保持打开并保留用户输入
+	m.modal = modalRename
+	m.renameTask = &queue.Task{ID: "t1", Direction: protocol.DirectionUpload, Remote: "a.bin", Path: "/tmp/a.bin", State: queue.Paused}
+	m.renameInput.SetValue("bad/name")
+	m.renameInput.Focus()
+	m.Update(keyType(tea.KeyEnter))
+	if m.modal != modalRename || m.renameTask == nil || m.renameInput.Value() != "bad/name" {
+		t.Fatalf("invalid rename closed modal or lost input: modal=%v task=%v val=%q toast=%q",
+			m.modal, m.renameTask, m.renameInput.Value(), m.statusToast)
+	}
+	m.modal = modalNone
+	m.renameTask = nil
+
+	// 2. 帮助弹窗与详情弹窗在 80x14 矮屏下不得溢出，标题与关闭提示始终可见并可滚动
+	m.Update(keyRune('?'))
+	v0 := ansi.Strip(m.View())
+	if h := lipgloss.Height(v0); h > 14 {
+		t.Fatalf("help modal exceeded 14 lines: got %d\n%s", h, v0)
+	}
+	if !strings.Contains(v0, "键盘快捷键说明") || !strings.Contains(v0, "关闭") {
+		t.Fatalf("help modal clipped title or footer:\n%s", v0)
+	}
+	m.Update(keyType(tea.KeyDown))
+	if m.infoScroll == 0 {
+		t.Fatal("down key did not scroll overflowing help modal")
+	}
+	v1 := ansi.Strip(m.View())
+	if lipgloss.Height(v1) > 14 || !strings.Contains(v1, "键盘快捷键说明") || !strings.Contains(v1, "关闭") {
+		t.Fatalf("scrolled help modal clipped title/footer or overflowed:\n%s", v1)
+	}
+
+	m.detailTitle = "长内容详情标题"
+	m.detailLines = make([]string, 30)
+	for i := range m.detailLines {
+		m.detailLines[i] = fmt.Sprintf("detail-row-%02d: %s", i, strings.Repeat("x", 85))
+	}
+	m.infoScroll = 0
+	m.modal = modalDetail
+	dv0 := ansi.Strip(m.View())
+	if lipgloss.Height(dv0) > 14 || !strings.Contains(dv0, "长内容详情标题") || !strings.Contains(dv0, "关闭") {
+		t.Fatalf("detail modal clipped or overflowed at 80x14:\n%s", dv0)
+	}
+	m.Update(tea.MouseMsg{X: 40, Y: 7, Button: tea.MouseButtonWheelDown, Action: tea.MouseActionPress})
+	if m.infoScroll == 0 {
+		t.Fatal("wheel down did not scroll detail modal")
+	}
+	m.Update(keyType(tea.KeyEnd))
+	dvEnd := ansi.Strip(m.View())
+	if lipgloss.Height(dvEnd) > 14 || !strings.Contains(dvEnd, "长内容详情标题") || !strings.Contains(dvEnd, "关闭") || !strings.Contains(dvEnd, "detail-row-29") {
+		t.Fatalf("detail modal scrolled to end missing last line or chrome:\n%s", dvEnd)
 	}
 }

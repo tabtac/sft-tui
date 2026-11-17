@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 
 	"sft-tui/internal/progress"
 	"sft-tui/internal/protocol"
@@ -24,9 +25,35 @@ const (
 	modalClearHistory
 )
 
+func modalBoxDimensions(width int) (boxW, innerW int) {
+	boxW = min(max(44, width-4), 86)
+	if width > 0 && width < 48 {
+		boxW = max(18, width-2)
+	}
+	innerW = max(8, boxW-6) // 2 border + 4 horizontal padding
+	return boxW, innerW
+}
+
+func wrapModalLines(lines []string, innerW int) []string {
+	if innerW < 4 || len(lines) == 0 {
+		out := make([]string, len(lines))
+		copy(out, lines)
+		return out
+	}
+	out := make([]string, 0, len(lines))
+	for _, ln := range lines {
+		if !strings.Contains(ln, "\n") && lipgloss.Width(ln) <= innerW {
+			out = append(out, ln)
+			continue
+		}
+		wrapped := ansi.Hardwrap(ln, innerW, false)
+		out = append(out, strings.Split(wrapped, "\n")...)
+	}
+	return out
+}
+
 func renderModalRawBox(width int, th theme, title string, lines []string, footer string) string {
-	boxW := min(max(44, width-4), 86)
-	innerW := boxW - 6 // 2 border + 4 horizontal padding
+	boxW, innerW := modalBoxDimensions(width)
 	var body []string
 	body = append(body, th.modalTitle.Render(truncCell(title, innerW)))
 	body = append(body, lipgloss.NewStyle().Foreground(th.border).Render(strings.Repeat("─", innerW)))
@@ -35,9 +62,92 @@ func renderModalRawBox(width int, th theme, title string, lines []string, footer
 	}
 	if footer != "" {
 		body = append(body, lipgloss.NewStyle().Foreground(th.border).Render(strings.Repeat("─", innerW)))
-		body = append(body, th.badgeMuted.Render(footer))
+		body = append(body, th.badgeMuted.Render(truncCell(footer, innerW)))
 	}
 	return th.modalBox.Width(boxW - 2).Render(strings.Join(body, "\n"))
+}
+
+// renderModalScrollBox 在任意终端高度下保证标题与关闭提示始终可见，超长内容支持按行/页滚动。
+func renderModalScrollBox(width, height int, th theme, title string, lines []string, footer string, scroll int) (rendered string, maxScroll int) {
+	_, innerW := modalBoxDimensions(width)
+	wrapped := wrapModalLines(lines, innerW)
+	chromeH := 6 // border(2) + padding(2) + title(1) + topRule(1)
+	if footer != "" {
+		chromeH = 8 // + bottomRule(1) + footer(1)
+	}
+
+	vis := len(wrapped)
+	showIndicator := false
+	if height > 0 {
+		avail := max(1, height-chromeH)
+		if len(wrapped) > avail {
+			if avail >= 3 {
+				vis = avail - 1
+				showIndicator = true
+			} else {
+				vis = avail
+			}
+		}
+	}
+
+	maxScroll = max(0, len(wrapped)-vis)
+	clamped := max(0, min(scroll, maxScroll))
+	end := min(len(wrapped), clamped+vis)
+
+	viewLines := make([]string, 0, vis+1)
+	if len(wrapped) > 0 && clamped < end {
+		viewLines = append(viewLines, wrapped[clamped:end]...)
+	}
+	footerText := footer
+	if maxScroll > 0 {
+		if showIndicator {
+			ind := fmt.Sprintf("↕ ↑↓/PgUp/PgDn/滚轮 滚动  第 %d–%d / 共 %d 行", clamped+1, end, len(wrapped))
+			viewLines = append(viewLines, th.badgeMuted.Render(truncCell(ind, innerW)))
+		} else if footerText != "" {
+			footerText = fmt.Sprintf("[%d-%d/%d] %s", clamped+1, end, len(wrapped), footerText)
+		}
+	}
+
+	box := renderModalRawBox(width, th, title, viewLines, footerText)
+	rendered = lipgloss.Place(width, height, lipgloss.Center, lipgloss.Center, box,
+		lipgloss.WithWhitespaceChars(" "),
+	)
+	return rendered, maxScroll
+}
+
+func modalScrollBoxPageRows(height int, footer string) int {
+	chromeH := 6
+	if footer != "" {
+		chromeH = 8
+	}
+	if height <= 0 {
+		return 10
+	}
+	avail := max(1, height-chromeH)
+	if avail >= 3 {
+		return max(1, avail-1)
+	}
+	return avail
+}
+
+func modalScrollStep(key string, scroll, maxScroll, pageRows int) (int, bool) {
+	step := max(1, pageRows-1)
+	switch key {
+	case "up", "k":
+		return max(0, scroll-1), true
+	case "down", "j":
+		return min(maxScroll, scroll+1), true
+	case "pgup", "b":
+		return max(0, scroll-step), true
+	case "pgdown", "f", " ":
+		return min(maxScroll, scroll+step), true
+	case "home", "g":
+		return 0, true
+	case "end", "G":
+		return maxScroll, true
+	default:
+		return scroll, false
+	}
 }
 
 func renderModalBox(width, height int, th theme, title string, lines []string, footer string) string {
@@ -51,10 +161,10 @@ func renderModalOverlay(_ string, title string, lines []string, footer string, m
 	return renderModalBox(m.width, m.height, m.th, title, lines, footer)
 }
 
-func (m *model) viewModal(base string) string {
+func (m *model) infoModalData() (title string, lines []string, footer string) {
 	switch m.modal {
 	case modalHelp:
-		lines := []string{
+		return "键盘快捷键说明", []string{
 			m.th.hintKey.Render("全局导航"),
 			"  Tab / Shift+Tab  在 本地 → 远端 → 活动队列 → 历史归档 间切换",
 			"  1 / 2 / 3 / 4    直接跳转 本地 / 远端 / 活动队列 / 历史归档",
@@ -70,13 +180,22 @@ func (m *model) viewModal(base string) string {
 			"",
 			m.th.hintKey.Render("队列与断点控制（统一 SQLite 断点）"),
 			"  Space            智能暂停正在传输的任务，或恢复已暂停/待处理任务",
-			"  p / c / a        暂停单项 / 取消任务 / 全部暂停或全部恢复",
+			"  F5 / r           在队列或历史中按任务状态恢复、重试或重新入队传输",
+			"  p / c / a        暂停单项 / 取消任务 / 全部暂停或恢复(仅队列区)",
 			"  n / X / Enter    冲突改名重传 / 清空历史归档 / 查看任务与校验详情",
-		}
-		return renderModalOverlay(base, "键盘快捷键说明", lines, "按 Esc 或 ? 关闭", m)
-
+		}, "↑↓/滚轮 滚动 · Esc 或 ? 关闭"
 	case modalDetail:
-		return renderModalOverlay(base, m.detailTitle, m.detailLines, "按 Enter 或 Esc 关闭", m)
+		return m.detailTitle, m.detailLines, "↑↓/滚轮 滚动 · Enter 或 Esc 关闭"
+	}
+	return "", nil, ""
+}
+
+func (m *model) viewModal(base string) string {
+	switch m.modal {
+	case modalHelp, modalDetail:
+		title, lines, footer := m.infoModalData()
+		view, _ := renderModalScrollBox(m.width, m.height, m.th, title, lines, footer, m.infoScroll)
+		return view
 
 	case modalIdentity:
 		lines := []string{
