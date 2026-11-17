@@ -119,6 +119,7 @@ type serverModel struct {
 	// 游标与详情弹窗
 	cursors     [6]int
 	modal       serverModalKind
+	infoScroll  int
 	detailTitle string
 	detailLines []string
 	statusToast string
@@ -502,6 +503,7 @@ func (m *serverModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "q", "f10":
 		return m, tea.Quit
 	case "?":
+		m.infoScroll = 0
 		m.modal = srvModalHelp
 		return m, nil
 	case "1", "2", "3", "4", "5", "6":
@@ -566,6 +568,7 @@ func (m *serverModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 					fmt.Sprintf("远端地址：%s", p.Remote),
 					fmt.Sprintf("建立时间：%s", p.Since.Local().Format("2006-01-02 15:04:05")),
 				}
+				m.infoScroll = 0
 				m.modal = srvModalDetail
 			}
 		}
@@ -616,6 +619,7 @@ func (m *serverModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			if t.Error != "" {
 				m.detailLines = append(m.detailLines, "", "错误信息：", "  "+t.Error)
 			}
+			m.infoScroll = 0
 			m.modal = srvModalDetail
 		}
 	case 3: // 证书状态
@@ -639,6 +643,7 @@ func (m *serverModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 					"到期/备注：" + c.Expiry,
 					"SHA-256： " + c.Fingerprint,
 				}
+				m.infoScroll = 0
 				m.modal = srvModalDetail
 			}
 		}
@@ -699,6 +704,7 @@ func (m *serverModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 					"文件：  " + e.File,
 					"详情：  " + e.Detail,
 				}
+				m.infoScroll = 0
 				m.modal = srvModalDetail
 			}
 		}
@@ -968,7 +974,17 @@ func (m *serverModel) showUserDetailModal(u config.AuthorizedClient) {
 		"证书路径：" + u.Certificate,
 		fmt.Sprintf("证书状态：%s · 指纹 %s", ins.State, ins.Fingerprint),
 	}
+	m.infoScroll = 0
 	m.modal = srvModalDetail
+}
+
+func (m *serverModel) scrollServerInfoModal(k string) {
+	title, lines, footer := m.infoModalData()
+	_, maxScroll := renderModalScrollBox(m.width, m.height, m.th, title, lines, footer, m.infoScroll)
+	next, ok := modalScrollStep(k, m.infoScroll, maxScroll, modalScrollBoxPageRows(m.height, footer))
+	if ok {
+		m.infoScroll = next
+	}
 }
 
 func (m *serverModel) handleModalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
@@ -980,9 +996,11 @@ func (m *serverModel) handleModalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 	if m.modal == srvModalHelp || m.modal == srvModalDetail {
-		if k == "enter" || k == "q" || k == "?" {
+		if k == "enter" || k == "q" || (m.modal == srvModalHelp && k == "?") {
 			m.modal = srvModalNone
+			return m, nil
 		}
+		m.scrollServerInfoModal(k)
 		return m, nil
 	}
 	if m.modal == srvModalStop {
@@ -1032,15 +1050,57 @@ func (m *serverModel) execCertAndReload(action string, o certmanage.Options, not
 	}
 }
 
+func parseStrictCertDays(raw string) (int, error) {
+	s := strings.TrimSpace(raw)
+	if s == "" {
+		return 0, fmt.Errorf("有效天数不能为空，请输入 1–3650 之间的整数")
+	}
+	days, err := strconv.Atoi(s)
+	if err != nil {
+		return 0, fmt.Errorf("有效天数 %q 无效：请输入 1–3650 之间的整数", s)
+	}
+	if days < 1 || days > 3650 {
+		return 0, fmt.Errorf("有效天数 %d 超出范围，须在 1–3650 天之间", days)
+	}
+	return days, nil
+}
+
+func (m *serverModel) validateBandwidthInputs(upIdx, dnIdx, burstIdx int) (*config.Bandwidth, int, error) {
+	fields := []struct {
+		idx   int
+		label string
+	}{
+		{upIdx, "上传速率"},
+		{dnIdx, "下载速率"},
+		{burstIdx, "突发配额"},
+	}
+	vals := make([]uint64, len(fields))
+	for i, f := range fields {
+		v, err := m.parseSizeInput(f.idx, f.label)
+		if err != nil {
+			return nil, f.idx, err
+		}
+		vals[i] = v
+	}
+	return &config.Bandwidth{
+		UploadBytesPerSecond:   vals[0],
+		DownloadBytesPerSecond: vals[1],
+		BurstBytes:             vals[2],
+	}, -1, nil
+}
+
 func (m *serverModel) submitModalForm() (tea.Model, tea.Cmd) {
-	kind := m.modal
-	m.modal = srvModalNone
-	switch kind {
+	switch m.modal {
 	case srvModalNewUser:
 		name := strings.TrimSpace(m.formInputs[0].Value())
-		days, err := strconv.Atoi(strings.TrimSpace(m.formInputs[1].Value()))
-		if err != nil || days < 1 {
-			days = 30
+		if !config.ValidUserPath(name) {
+			m.statusToast = "用户名无效（须为字母/数字/._-，且不能为系统保留名）"
+			return m, m.focusInputRow(0)
+		}
+		days, err := parseStrictCertDays(m.formInputs[1].Value())
+		if err != nil {
+			m.statusToast = err.Error()
+			return m, m.focusInputRow(1)
 		}
 		perms := []string{}
 		if m.formToggles[0] {
@@ -1051,21 +1111,14 @@ func (m *serverModel) submitModalForm() (tea.Model, tea.Cmd) {
 		}
 		var bw *config.Bandwidth
 		if len(m.formToggles) > 2 && !m.formToggles[2] {
-			up, e1 := m.parseSizeInput(2, "自定义上传速率")
-			dn, e2 := m.parseSizeInput(3, "自定义下载速率")
-			bu, e3 := m.parseSizeInput(4, "自定义突发配额")
-			if e1 != nil || e2 != nil || e3 != nil {
-				for _, e := range []error{e1, e2, e3} {
-					if e != nil {
-						m.statusToast = e.Error()
-						break
-					}
-				}
-				m.modal = srvModalNewUser
-				return m, nil
+			var badIdx int
+			bw, badIdx, err = m.validateBandwidthInputs(2, 3, 4)
+			if err != nil {
+				m.statusToast = err.Error()
+				return m, m.focusInputRow(badIdx)
 			}
-			bw = &config.Bandwidth{UploadBytesPerSecond: up, DownloadBytesPerSecond: dn, BurstBytes: bu}
 		}
+		m.modal = srvModalNone
 		o := m.certBaseOptions(name)
 		o.Days = days
 		o.Policy = &certmanage.UserPolicy{Permissions: perms, Bandwidth: bw}
@@ -1073,17 +1126,29 @@ func (m *serverModel) submitModalForm() (tea.Model, tea.Cmd) {
 
 	case srvModalCSR:
 		name := strings.TrimSpace(m.formInputs[0].Value())
+		if !config.ValidUserPath(name) {
+			m.statusToast = "用户名无效（须为字母/数字/._-，且不能为系统保留名）"
+			return m, m.focusInputRow(0)
+		}
 		csr := strings.TrimSpace(m.formInputs[1].Value())
-		days, _ := strconv.Atoi(strings.TrimSpace(m.formInputs[2].Value()))
+		if csr == "" {
+			m.statusToast = "CSR 文件路径不能为空"
+			return m, m.focusInputRow(1)
+		}
+		days, err := parseStrictCertDays(m.formInputs[2].Value())
+		if err != nil {
+			m.statusToast = err.Error()
+			return m, m.focusInputRow(2)
+		}
+		m.modal = srvModalNone
 		o := m.certBaseOptions(name)
 		o.CSR = csr
-		if days > 0 {
-			o.Days = days
-		}
+		o.Days = days
 		return m, m.execCertAndReload("user", o, "CSR 已签发给 "+name)
 
 	case srvModalEditPolicy:
 		if m.targetUser == nil {
+			m.modal = srvModalNone
 			return m, nil
 		}
 		u := *m.targetUser
@@ -1096,21 +1161,15 @@ func (m *serverModel) submitModalForm() (tea.Model, tea.Cmd) {
 		}
 		var bw *config.Bandwidth
 		if !m.formToggles[3] {
-			up, e1 := m.parseSizeInput(0, "上传速率")
-			dn, e2 := m.parseSizeInput(1, "下载速率")
-			bu, e3 := m.parseSizeInput(2, "突发配额")
-			if e1 != nil || e2 != nil || e3 != nil {
-				for _, e := range []error{e1, e2, e3} {
-					if e != nil {
-						m.statusToast = e.Error()
-						break
-					}
-				}
-				m.modal = srvModalEditPolicy
-				return m, nil
+			var badIdx int
+			var err error
+			bw, badIdx, err = m.validateBandwidthInputs(0, 1, 2)
+			if err != nil {
+				m.statusToast = err.Error()
+				return m, m.focusInputRow(badIdx)
 			}
-			bw = &config.Bandwidth{UploadBytesPerSecond: up, DownloadBytesPerSecond: dn, BurstBytes: bu}
 		}
+		m.modal = srvModalNone
 		m.targetUser = nil
 		o := m.certBaseOptions(u.UserID)
 		o.ExpectedUser = &u
@@ -1123,12 +1182,19 @@ func (m *serverModel) submitModalForm() (tea.Model, tea.Cmd) {
 
 	case srvModalExportUser:
 		if m.targetUser == nil {
+			m.modal = srvModalNone
 			return m, nil
 		}
+		out := strings.TrimSpace(m.formInputs[0].Value())
+		if out == "" {
+			m.statusToast = "导出目标目录不能为空"
+			return m, m.focusInputRow(0)
+		}
 		u := *m.targetUser
+		m.modal = srvModalNone
 		m.targetUser = nil
 		o := m.certBaseOptions(u.UserID)
-		o.Out = strings.TrimSpace(m.formInputs[0].Value())
+		o.Out = out
 		o.CertificateOnly = m.formToggles[0]
 		m.busy = true
 		return m, func() tea.Msg {
@@ -1139,13 +1205,18 @@ func (m *serverModel) submitModalForm() (tea.Model, tea.Cmd) {
 		}
 
 	case srvModalRotateServer:
+		days, err := parseStrictCertDays(m.formInputs[1].Value())
+		if err != nil {
+			m.statusToast = err.Error()
+			return m, m.focusInputRow(1)
+		}
+		m.modal = srvModalNone
 		o := m.certBaseOptions("")
 		o.Hosts = strings.TrimSpace(m.formInputs[0].Value())
-		if d, err := strconv.Atoi(strings.TrimSpace(m.formInputs[1].Value())); err == nil && d > 0 {
-			o.Days = d
-		}
+		o.Days = days
 		return m, m.execCertAndReload("server", o, "服务端证书已轮换")
 	}
+	m.modal = srvModalNone
 	return m, nil
 }
 
@@ -1167,9 +1238,14 @@ func (m *serverModel) toggleUserDisabledCmd(u config.AuthorizedClient) tea.Cmd {
 
 func (m *serverModel) renewUserCertCmd(u config.AuthorizedClient) tea.Cmd {
 	o := m.certBaseOptions(u.UserID)
+	uCopy := u
+	o.ExpectedUser = &uCopy
 	o.Renew = true
-	o.Enable = u.Disabled
-	return m.execCertAndReload("user", o, "已刷新用户证书 "+u.UserID)
+	notice := "已刷新用户证书 " + u.UserID
+	if u.Disabled {
+		notice += "（保留原禁用状态）"
+	}
+	return m.execCertAndReload("user", o, notice)
 }
 
 func (m *serverModel) renewCACmd() tea.Cmd {

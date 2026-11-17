@@ -302,13 +302,33 @@ func (m *serverModel) ensureFormRowVisible() {
 	}
 }
 
+func (m *serverModel) focusInputRow(inputIdx int) tea.Cmd {
+	for i, r := range m.formRows {
+		if (r.kind == formRowText || r.kind == formRowSizeUnit) && r.inputIdx == inputIdx {
+			m.setRowFocus(i, 0)
+			return textinput.Blink
+		}
+	}
+	return nil
+}
+
+func (m *serverModel) focusSelectRow(selectIdx int) tea.Cmd {
+	for i, r := range m.formRows {
+		if r.kind == formRowSelect && r.selectIdx == selectIdx {
+			m.setRowFocus(i, 0)
+			return nil
+		}
+	}
+	return nil
+}
+
 func (m *serverModel) formMaxVisibleRows() int {
 	h := m.height
 	if h <= 0 {
 		h = 30
 	}
 	// 扣除边框(2)+内边距(2)+标题(1)+分隔线(2)+页脚(1)+按钮(2)+安全留白(2)
-	return max(6, h-12)
+	return max(3, h-12)
 }
 
 func (m *serverModel) formRowHeight(r formRow) int {
@@ -764,7 +784,19 @@ func (m *serverModel) renderFormLines(innerW int) ([]string, string) {
 }
 
 func (m *serverModel) handleModalMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
-	if msg.Action != tea.MouseActionPress || len(m.formRows) == 0 {
+	if msg.Action != tea.MouseActionPress {
+		return m, nil
+	}
+	if m.modal == srvModalHelp || m.modal == srvModalDetail {
+		switch msg.Button {
+		case tea.MouseButtonWheelUp:
+			m.scrollServerInfoModal("up")
+		case tea.MouseButtonWheelDown:
+			m.scrollServerInfoModal("down")
+		}
+		return m, nil
+	}
+	if len(m.formRows) == 0 {
 		return m, nil
 	}
 	if msg.Button == tea.MouseButtonWheelUp {

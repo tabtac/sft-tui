@@ -145,15 +145,15 @@ func (m *serverModel) openDeployStep(step int) {
 				host, port, err := setup.ValidateAddress(w.d.Address)
 				if err != nil {
 					m.statusToast = err.Error()
-					return m, nil
+					return m, m.focusInputRow(addrIdx)
 				}
 				if w.scene == 0 && host != "localhost" && (net.ParseIP(host) == nil || !net.ParseIP(host).IsLoopback()) {
 					m.statusToast = "跨主机地址请将部署场景切换为「局域网 / 跨主机部署」"
-					return m, nil
+					return m, m.focusSelectRow(sceneIdx)
 				}
 				if _, lport, err := net.SplitHostPort(w.d.Listen); err != nil || lport == "" {
 					m.statusToast = "监听地址格式无效，须为 IP:端口（如 0.0.0.0:7443）"
-					return m, nil
+					return m, m.focusInputRow(listenIdx)
 				}
 				baseKey := fmt.Sprintf("%d:%s", w.scene, w.d.Address)
 				if w.addrBase != baseKey {
@@ -199,7 +199,7 @@ func (m *serverModel) openDeployStep(step int) {
 				capture2()
 				if w.d.Storage == "" {
 					m.statusToast = "存储目录不能为空"
-					return m, nil
+					return m, m.focusInputRow(stIdx)
 				}
 				if !filepath.IsAbs(w.d.Storage) {
 					w.d.Storage = filepath.Join(w.base, w.d.Storage)
@@ -207,7 +207,7 @@ func (m *serverModel) openDeployStep(step int) {
 				abs, err := filepath.Abs(w.d.Storage)
 				if err != nil {
 					m.statusToast = err.Error()
-					return m, nil
+					return m, m.focusInputRow(stIdx)
 				}
 				w.d.Storage = abs
 				m.openDeployStep(3)
@@ -236,25 +236,41 @@ func (m *serverModel) openDeployStep(step int) {
 			caDaysIdx = m.addTextRow("CA 根证书有效天数 (1–3650)", strconv.Itoa(w.d.CADays))
 		}
 
-		capture3 := func(validateNums bool) error {
+		capture3 := func(validateNums bool) (int, error) {
 			w.d.User = strings.TrimSpace(m.formInputs[userIdx].Value())
+			if validateNums && !config.ValidUserPath(w.d.User) {
+				return userIdx, fmt.Errorf("初始授权用户名无效（须为字母/数字/._-，且不能为系统保留名）")
+			}
 			if w.advanced {
 				w.d.CertDir = strings.TrimSpace(m.formInputs[certIdx].Value())
 				w.d.ClientDir = strings.TrimSpace(m.formInputs[cliIdx].Value())
 				w.d.ServerName = strings.TrimSpace(m.formInputs[snameIdx].Value())
 				w.d.Hosts = strings.TrimSpace(m.formInputs[sanIdx].Value())
-				if d, err := strconv.Atoi(strings.TrimSpace(m.formInputs[daysIdx].Value())); err == nil {
+				if validateNums {
+					if w.d.CertDir == "" {
+						return certIdx, fmt.Errorf("证书保存目录不能为空")
+					}
+					if w.d.ClientDir == "" {
+						return cliIdx, fmt.Errorf("用户配置输出目录不能为空")
+					}
+					if w.d.ServerName == "" {
+						return snameIdx, fmt.Errorf("客户端校验名称 (SAN) 不能为空")
+					}
+				}
+				if d, err := parseStrictCertDays(m.formInputs[daysIdx].Value()); err == nil {
 					w.d.Days = d
 				} else if validateNums {
-					return fmt.Errorf("证书有效天数须为整数")
+					return daysIdx, err
 				}
-				if cd, err := strconv.Atoi(strings.TrimSpace(m.formInputs[caDaysIdx].Value())); err == nil {
+				if cd, err := parseStrictCertDays(m.formInputs[caDaysIdx].Value()); err == nil {
 					w.d.CADays = cd
 				} else if validateNums {
-					return fmt.Errorf("CA 有效天数须为整数")
+					return caDaysIdx, fmt.Errorf("CA 证书%w", err)
+				}
+				if validateNums && w.d.CADays < w.d.Days {
+					return caDaysIdx, fmt.Errorf("CA 有效天数 (%d) 不得小于服务端/用户证书有效天数 (%d)", w.d.CADays, w.d.Days)
 				}
 			}
-			var err error
 			pairs := []struct {
 				idx    int
 				label  string
@@ -269,19 +285,17 @@ func (m *serverModel) openDeployStep(step int) {
 				v, e := m.parseSizeInput(p.idx, p.label)
 				if e != nil {
 					if validateNums {
-						return e
+						return p.idx, e
 					}
-					err = e
 				} else {
 					*p.target = v
 				}
 			}
-			_ = err
-			return nil
+			return -1, nil
 		}
 
 		advToggle := m.addToggleRow("展开/调整高级证书、SAN 与目录设置", w.advanced, func(v bool) {
-			_ = capture3(false)
+			_, _ = capture3(false)
 			w.advanced = v
 			focusRow := m.formFocus
 			m.openDeployStep(3)
@@ -297,14 +311,14 @@ func (m *serverModel) openDeployStep(step int) {
 
 		m.formButtons = []formButton{
 			{label: "◀ 上一步", onClick: func() (tea.Model, tea.Cmd) {
-				_ = capture3(false)
+				_, _ = capture3(false)
 				m.openDeployStep(2)
 				return m, textinput.Blink
 			}},
 			{label: "下一步 ▶", primary: true, onClick: func() (tea.Model, tea.Cmd) {
-				if err := capture3(true); err != nil {
+				if badIdx, err := capture3(true); err != nil {
 					m.statusToast = err.Error()
-					return m, nil
+					return m, m.focusInputRow(badIdx)
 				}
 				for _, p := range []*string{&w.d.CertDir, &w.d.ClientDir} {
 					if !filepath.IsAbs(*p) {
@@ -373,32 +387,32 @@ func (m *serverModel) openDeployStep(step int) {
 			}
 		}
 
-		capture35 := func(strict bool) error {
+		capture35 := func(strict bool) (int, error) {
 			if b, err := m.parseSizeInput(burstIdx, "默认突发量"); err == nil {
 				w.d.Burst = b
 			} else if strict {
-				return err
+				return burstIdx, err
 			}
 			if lb, err := m.parseSizeInput(logIdx, "日志单文件上限"); err == nil {
 				w.d.LogMaxBytes = lb
 			} else if strict {
-				return err
+				return logIdx, err
 			}
 			if w.useGlobal {
 				if u, err := m.parseSizeInput(gUpIdx, "全局上传带宽"); err == nil {
 					w.globalUp = u
 				} else if strict {
-					return err
+					return gUpIdx, err
 				}
 				if dn, err := m.parseSizeInput(gDnIdx, "全局下载带宽"); err == nil {
 					w.globalDown = dn
 				} else if strict {
-					return err
+					return gDnIdx, err
 				}
 				if bu, err := m.parseSizeInput(gBurIdx, "全局突发量"); err == nil {
 					w.globalBur = bu
 				} else if strict {
-					return err
+					return gBurIdx, err
 				}
 				gb := config.Bandwidth{UploadBytesPerSecond: w.globalUp, DownloadBytesPerSecond: w.globalDown, BurstBytes: w.globalBur}
 				w.d.GlobalBandwidth = &gb
@@ -410,26 +424,36 @@ func (m *serverModel) openDeployStep(step int) {
 					v, err := m.parseSizeInput(advInputIdx[i], f.Path)
 					if err != nil {
 						if strict {
-							return err
+							return advInputIdx[i], err
 						}
 						continue
 					}
 					if err := f.Set(strconv.FormatUint(v, 10)); err != nil && strict {
-						return err
+						return advInputIdx[i], err
 					}
 				} else {
 					if err := f.Set(m.formInputs[advInputIdx[i]].Value()); err != nil && strict {
-						return err
+						return advInputIdx[i], err
 					}
 				}
 			}
 			l, t, r := draft.Limits, draft.Timeouts, draft.Resources
 			w.d.Limits, w.d.Timeouts, w.d.Resources = &l, &t, &r
-			return nil
+			if strict && w.d.LogMaxBytes < 64<<10 || (strict && w.d.LogMaxBytes > 1<<30) {
+				return logIdx, fmt.Errorf("日志单文件上限须在 64 KiB–1 GiB 之间")
+			}
+			if strict && w.d.Limits.ChunkSize > w.d.Limits.WindowSize {
+				for i, f := range advFields {
+					if f.Path == "limits.chunk_size" {
+						return advInputIdx[i], fmt.Errorf("分块上限不能大于流接收窗口")
+					}
+				}
+			}
+			return -1, nil
 		}
 
 		m.addToggleRow("启用全局总带宽限速 (global_bandwidth)", w.useGlobal, func(v bool) {
-			_ = capture35(false)
+			_, _ = capture35(false)
 			w.useGlobal = v
 			focusRow := m.formFocus
 			m.openDeployStep(35)
@@ -438,14 +462,14 @@ func (m *serverModel) openDeployStep(step int) {
 
 		m.formButtons = []formButton{
 			{label: "◀ 返回第 3 步", onClick: func() (tea.Model, tea.Cmd) {
-				_ = capture35(false)
+				_, _ = capture35(false)
 				m.openDeployStep(3)
 				return m, textinput.Blink
 			}},
 			{label: "下一步：部署摘要 ▶", primary: true, onClick: func() (tea.Model, tea.Cmd) {
-				if err := capture35(true); err != nil {
+				if badIdx, err := capture35(true); err != nil {
 					m.statusToast = err.Error()
-					return m, nil
+					return m, m.focusInputRow(badIdx)
 				}
 				w.summaryErr = ""
 				m.openDeployStep(4)
@@ -613,15 +637,15 @@ func (m *serverModel) rebuildBasicSettingsForm() {
 		gBurIdx = m.addSizeUnitRow("全局总带宽突发量", gb.BurstBytes, false)
 	}
 
-	captureBasic := func(strict bool) error {
+	captureBasic := func(strict bool) (int, error) {
 		c.Listen = strings.TrimSpace(m.formInputs[listenIdx].Value())
 		c.StorageRoot = strings.TrimSpace(m.formInputs[storageIdx].Value())
 		if strict {
 			if _, _, err := net.SplitHostPort(c.Listen); err != nil {
-				return fmt.Errorf("监听地址须为 IP:端口")
+				return listenIdx, fmt.Errorf("监听地址须为 IP:端口")
 			}
 			if c.StorageRoot == "" {
-				return fmt.Errorf("存储根目录不能为空")
+				return storageIdx, fmt.Errorf("存储根目录不能为空")
 			}
 		}
 		pairs := []struct {
@@ -640,7 +664,7 @@ func (m *serverModel) rebuildBasicSettingsForm() {
 			v, err := m.parseSizeInput(p.idx, p.label)
 			if err != nil {
 				if strict {
-					return err
+					return p.idx, err
 				}
 			} else {
 				*p.target = v
@@ -659,7 +683,7 @@ func (m *serverModel) rebuildBasicSettingsForm() {
 				v, err := m.parseSizeInput(gp.idx, gp.label)
 				if err != nil {
 					if strict {
-						return err
+						return gp.idx, err
 					}
 				} else {
 					*gp.target = v
@@ -670,11 +694,19 @@ func (m *serverModel) rebuildBasicSettingsForm() {
 		} else {
 			c.GlobalBandwidth = nil
 		}
-		return nil
+		if strict {
+			if c.Logging.MaxFileBytes < 64<<10 || c.Logging.MaxFileBytes > 1<<30 {
+				return logIdx, fmt.Errorf("日志单文件上限须在 64 KiB–1 GiB 之间")
+			}
+			if err := c.ValidateDraft(); err != nil {
+				return upIdx, err
+			}
+		}
+		return -1, nil
 	}
 
 	m.addToggleRow("启用全局总带宽限速 (global_bandwidth)", useGlobal, func(v bool) {
-		_ = captureBasic(false)
+		_, _ = captureBasic(false)
 		if v {
 			copyGB := gb
 			c.GlobalBandwidth = &copyGB
@@ -693,17 +725,17 @@ func (m *serverModel) rebuildBasicSettingsForm() {
 			return m, nil
 		}},
 		{label: "下一步：协议与资源限额 ▶", onClick: func() (tea.Model, tea.Cmd) {
-			if err := captureBasic(true); err != nil {
+			if badIdx, err := captureBasic(true); err != nil {
 				m.statusToast = err.Error()
-				return m, nil
+				return m, m.focusInputRow(badIdx)
 			}
 			m.openAdvancedSettingsModal()
 			return m, textinput.Blink
 		}},
 		{label: "直接保存 ★", primary: true, onClick: func() (tea.Model, tea.Cmd) {
-			if err := captureBasic(true); err != nil {
+			if badIdx, err := captureBasic(true); err != nil {
 				m.statusToast = err.Error()
-				return m, nil
+				return m, m.focusInputRow(badIdx)
 			}
 			return m.saveServerSettingsCmd(*c)
 		}},
@@ -741,35 +773,43 @@ func (m *serverModel) openAdvancedSettingsModal() {
 		}
 	}
 
-	applyAdv := func() error {
+	applyAdv := func() (int, error) {
 		for i, f := range fields {
 			if isSize[i] {
 				v, err := m.parseSizeInput(idxMap[i], f.Path)
 				if err != nil {
-					return err
+					return idxMap[i], err
 				}
 				if err := f.Set(strconv.FormatUint(v, 10)); err != nil {
-					return err
+					return idxMap[i], err
 				}
 			} else {
 				if err := f.Set(m.formInputs[idxMap[i]].Value()); err != nil {
-					return err
+					return idxMap[i], err
 				}
 			}
 		}
-		return c.ValidateDraft()
+		if err := c.ValidateDraft(); err != nil {
+			for i, f := range fields {
+				if f.Path == "limits.chunk_size" {
+					return idxMap[i], err
+				}
+			}
+			return 0, err
+		}
+		return -1, nil
 	}
 
 	m.formButtons = []formButton{
 		{label: "◀ 返回基础设置", onClick: func() (tea.Model, tea.Cmd) {
-			_ = applyAdv()
+			_, _ = applyAdv()
 			m.rebuildBasicSettingsForm()
 			return m, textinput.Blink
 		}},
 		{label: "保存全部设置 ★", primary: true, onClick: func() (tea.Model, tea.Cmd) {
-			if err := applyAdv(); err != nil {
+			if badIdx, err := applyAdv(); err != nil {
 				m.statusToast = err.Error()
-				return m, nil
+				return m, m.focusInputRow(badIdx)
 			}
 			return m.saveServerSettingsCmd(*c)
 		}},
@@ -797,10 +837,14 @@ func (m *serverModel) openLogLimitModal() {
 			v, err := m.parseSizeInput(logIdx, "日志文件大小上限")
 			if err != nil {
 				m.statusToast = err.Error()
-				return m, nil
+				return m, m.focusInputRow(logIdx)
 			}
 			next := m.cfg
 			next.Logging.MaxFileBytes = v
+			if err := next.ValidateDraft(); err != nil {
+				m.statusToast = err.Error()
+				return m, m.focusInputRow(logIdx)
+			}
 			m.settingsExpected = m.cfg
 			return m.saveServerSettingsCmd(next)
 		}},

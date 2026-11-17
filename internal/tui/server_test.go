@@ -2,6 +2,7 @@ package tui
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -10,6 +11,7 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 
 	"sft-tui/internal/certmanage"
 	"sft-tui/internal/config"
@@ -455,5 +457,238 @@ func TestServerNarrowWidthPreservesTabsStatusAndRowsWithoutSpuriousEllipsis(t *t
 				t.Fatalf("width=%d users page truncated essential status:\n%s", w, view)
 			}
 		}
+	}
+}
+
+func TestServerRenewCertPreservesDisabledUserState(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "configs", "server.local.json")
+	certDir := filepath.Join(dir, "certs")
+
+	if _, err := certmanage.Execute("init", certmanage.Options{
+		ServerConfig:    cfgPath,
+		Dir:             certDir,
+		ClientConfigDir: filepath.Dir(cfgPath),
+		Name:            "alice",
+		Hosts:           "localhost,127.0.0.1",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.LoadServer(cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 先独立禁用用户 alice
+	u0 := cfg.AuthorizedClients[0]
+	if _, err := certmanage.Execute("policy", certmanage.Options{
+		ServerConfig: cfgPath,
+		Dir:          certDir,
+		Name:         u0.UserID,
+		ExpectedUser: &u0,
+		Policy: &certmanage.UserPolicy{
+			Disabled:    true,
+			Permissions: []string{"upload", "download"},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	m := newServerModel(ServerOptions{ConfigPath: cfgPath, Page: 1})
+	m.Update(m.loadConfigCmd()())
+	if !m.cfg.AuthorizedClients[0].Disabled {
+		t.Fatal("precondition failed: alice should be disabled before renewal")
+	}
+
+	// 按 w 续期用户证书，必须保持原禁用状态
+	_, cmd := m.Update(keyRune('w'))
+	if cmd == nil {
+		t.Fatal("w did not trigger renewUserCertCmd")
+	}
+	res := cmd()
+	m.Update(res)
+	m.Update(m.loadConfigCmd()())
+	if !m.cfg.AuthorizedClients[0].Disabled {
+		t.Fatalf("cert renewal unexpectedly re-enabled disabled user: %+v", m.cfg.AuthorizedClients[0])
+	}
+
+	// 重新启用必须是独立操作（例如按 t）
+	_, enableCmd := m.Update(keyRune('t'))
+	if enableCmd == nil {
+		t.Fatal("t did not trigger toggleUserDisabledCmd")
+	}
+	m.Update(enableCmd())
+	m.Update(m.loadConfigCmd()())
+	if m.cfg.AuthorizedClients[0].Disabled {
+		t.Fatal("independent enable action failed to re-enable user")
+	}
+}
+
+func TestServerFormsRejectInvalidInputKeepValuesAndFocusErrorField(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "configs", "server.local.json")
+	certDir := filepath.Join(dir, "certs")
+	if _, err := certmanage.Execute("init", certmanage.Options{
+		ServerConfig:    cfgPath,
+		Dir:             certDir,
+		ClientConfigDir: filepath.Dir(cfgPath),
+		Name:            "alice",
+		Hosts:           "localhost,127.0.0.1",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	m := newServerModel(ServerOptions{ConfigPath: cfgPath, Page: 1})
+	m.Update(tea.WindowSizeMsg{Width: 110, Height: 32})
+	m.Update(m.loadConfigCmd()())
+
+	// 1. 新建用户：非法有效天数（如 "bad" / "0" / "4000"）不得静默替换为 30，不得关闭弹窗，应定位到天数行
+	for _, badDays := range []string{"bad", "0", "-7", "4000", ""} {
+		m.openNewUserModal()
+		m.formInputs[0].SetValue("bob")
+		m.formInputs[1].SetValue(badDays)
+		m.formFocus = len(m.formRows) // 模拟从确认按钮按 Enter 提交
+		m.formBtnIdx = 1
+		_, cmd := m.Update(keyType(tea.KeyEnter))
+		if cmd != nil {
+			// 只允许 Blink 命令，绝不能返回 execCertAndReload 命令
+			if msg := cmd(); msg != nil {
+				if _, isAction := msg.(serverActionResultMsg); isAction {
+					t.Fatalf("invalid days %q submitted cert creation action", badDays)
+				}
+			}
+		}
+		if m.modal != srvModalNewUser {
+			t.Fatalf("modal closed prematurely on invalid days %q", badDays)
+		}
+		if m.formInputs[0].Value() != "bob" || m.formInputs[1].Value() != badDays {
+			t.Fatalf("form inputs lost user entries on invalid days %q: name=%q days=%q", badDays, m.formInputs[0].Value(), m.formInputs[1].Value())
+		}
+		if m.formFocus != 1 || !m.formInputs[1].Focused() {
+			t.Fatalf("focus did not jump to offending days field on %q: focus=%d inputFocused=%v", badDays, m.formFocus, m.formInputs[1].Focused())
+		}
+		saved, _ := config.LoadServer(cfgPath)
+		for _, u := range saved.AuthorizedClients {
+			if u.UserID == "bob" {
+				t.Fatalf("invalid days %q silently created user bob", badDays)
+			}
+		}
+	}
+
+	// 2. CSR 签发弹窗：非法天数禁止提交且定位到天数行 (row 2)
+	m.openCSRModal("carol")
+	m.formInputs[1].SetValue("/tmp/carol.csr")
+	m.formInputs[2].SetValue("invalid")
+	m.formFocus = len(m.formRows)
+	m.formBtnIdx = 1
+	m.Update(keyType(tea.KeyEnter))
+	if m.modal != srvModalCSR || m.formInputs[1].Value() != "/tmp/carol.csr" || m.formFocus != 2 || !m.formInputs[2].Focused() {
+		t.Fatalf("CSR modal failed validation focus check: modal=%v focus=%d csr=%q", m.modal, m.formFocus, m.formInputs[1].Value())
+	}
+
+	// 3. 轮换服务端证书：非法天数禁止提交且定位到天数行 (row 1)
+	m.openRotateServerModal()
+	m.formInputs[0].SetValue("example.com")
+	m.formInputs[1].SetValue("9999")
+	m.formFocus = len(m.formRows)
+	m.formBtnIdx = 1
+	m.Update(keyType(tea.KeyEnter))
+	if m.modal != srvModalRotateServer || m.formInputs[0].Value() != "example.com" || m.formFocus != 1 || !m.formInputs[1].Focused() {
+		t.Fatalf("rotate server modal failed validation focus check: modal=%v focus=%d", m.modal, m.formFocus)
+	}
+
+	// 4. 用户策略编辑器：非法自定义带宽保持弹窗、保留 targetUser 并定位到错误框
+	m.Update(keyRune('2'))
+	m.openEditPolicyModal(m.cfg.AuthorizedClients[0])
+	m.formToggles[3] = false
+	m.formInputs[1].SetValue("bad-num")
+	m.formFocus = len(m.formRows)
+	m.formBtnIdx = 1
+	m.Update(keyType(tea.KeyEnter))
+	if m.modal != srvModalEditPolicy || m.targetUser == nil || m.formInputs[1].Value() != "bad-num" || !m.formInputs[1].Focused() {
+		t.Fatalf("edit policy modal did not retain targetUser or focus input[1]: modal=%v target=%v focus=%d", m.modal, m.targetUser, m.formFocus)
+	}
+
+	// 5. 导出分发包弹窗：空目标目录保持弹窗、保留 targetUser 并聚焦目录输入框
+	m.openExportUserModal(m.cfg.AuthorizedClients[0])
+	m.formInputs[0].SetValue("   ")
+	m.formFocus = len(m.formRows)
+	m.formBtnIdx = 1
+	m.Update(keyType(tea.KeyEnter))
+	if m.modal != srvModalExportUser || m.targetUser == nil || !m.formInputs[0].Focused() {
+		t.Fatalf("export modal closed or lost focus on empty out dir: modal=%v target=%v focus=%d", m.modal, m.targetUser, m.formFocus)
+	}
+	m.Update(keyType(tea.KeyEsc))
+
+	// 6. 基础设置编辑器：空存储根目录保持弹窗、保留已输入并定位到存储目录行
+	m.openEditSettingsModal()
+	m.formInputs[1].SetValue("")
+	m.formFocus = len(m.formRows)
+	m.formBtnIdx = 2 // "直接保存 ★"
+	m.Update(keyType(tea.KeyEnter))
+	if m.modal != srvModalEditSettings || !m.formInputs[1].Focused() {
+		t.Fatalf("settings modal closed or did not focus storage row: modal=%v focus=%d", m.modal, m.formFocus)
+	}
+	m.Update(keyType(tea.KeyEsc))
+
+	// 7. 部署向导第 3 步（未初始化配置模型）：非法有效天数阻塞跳转并定位到天数行
+	wm := newServerModel(ServerOptions{ExecutableDir: dir, ConfigPath: filepath.Join(dir, "configs", "new.json")})
+	wm.Update(tea.WindowSizeMsg{Width: 110, Height: 34})
+	wm.Update(serverConfigLoadedMsg{err: os.ErrNotExist})
+	if wm.deploy == nil {
+		t.Fatal("missing config did not initialize deploy wizard")
+	}
+	wm.deploy.advanced = true
+	wm.openDeployStep(3)
+	// 找到有效期 inputIdx (内容默认为 "30")
+	daysIdx := -1
+	for i, in := range wm.formInputs {
+		if in.Value() == "30" {
+			daysIdx = i
+			break
+		}
+	}
+	if daysIdx < 0 {
+		t.Fatal("could not locate days input in deploy step 3")
+	}
+	wm.formInputs[daysIdx].SetValue("0")
+	wm.formFocus = len(wm.formRows)
+	wm.formBtnIdx = 1
+	wm.Update(keyType(tea.KeyEnter))
+	if wm.deploy.step != 3 || !wm.formInputs[daysIdx].Focused() {
+		t.Fatalf("deploy step 3 advanced on invalid days or failed focus: step=%d focus=%d", wm.deploy.step, wm.formFocus)
+	}
+}
+
+func TestServerHelpAndDetailModalsScrollWithinTerminalHeight(t *testing.T) {
+	m := newServerModel(ServerOptions{ExecutableDir: t.TempDir(), ConfigPath: "configs/server.local.json"})
+	m.Update(tea.WindowSizeMsg{Width: 80, Height: 14})
+
+	// 1. 帮助弹窗在 80x14 下支持滚动，标题与关闭提示始终在框内
+	m.Update(keyRune('?'))
+	h0 := ansi.Strip(m.View())
+	if lipgloss.Height(h0) > 14 || !strings.Contains(h0, "服务端管理快捷键") || !strings.Contains(h0, "关闭") {
+		t.Fatalf("server help modal overflowed or clipped chrome:\n%s", h0)
+	}
+	m.Update(keyType(tea.KeyDown))
+	if m.infoScroll == 0 {
+		t.Fatal("server help modal did not scroll on down key")
+	}
+
+	// 2. 长详情弹窗在 80x14 下通过键盘与滚轮滚动且保留底部分页/关闭栏
+	m.detailTitle = "证书链详情测试"
+	m.detailLines = make([]string, 25)
+	for i := range m.detailLines {
+		m.detailLines[i] = fmt.Sprintf("cert-line-%02d: %s", i, strings.Repeat("Z", 82))
+	}
+	m.infoScroll = 0
+	m.modal = srvModalDetail
+	m.Update(tea.MouseMsg{X: 40, Y: 7, Button: tea.MouseButtonWheelDown, Action: tea.MouseActionPress})
+	if m.infoScroll == 0 {
+		t.Fatal("server detail modal did not scroll on wheel down")
+	}
+	m.Update(keyType(tea.KeyEnd))
+	vEnd := ansi.Strip(m.View())
+	if lipgloss.Height(vEnd) > 14 || !strings.Contains(vEnd, "证书链详情测试") || !strings.Contains(vEnd, "关闭") || !strings.Contains(vEnd, "cert-line-24") {
+		t.Fatalf("server detail modal clipped chrome or failed scroll to bottom:\n%s", vEnd)
 	}
 }

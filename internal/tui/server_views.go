@@ -582,10 +582,10 @@ func (m *serverModel) modalTitle() string {
 	return "管理操作"
 }
 
-func (m *serverModel) renderModal(base string) string {
+func (m *serverModel) infoModalData() (title string, lines []string, footer string) {
 	switch m.modal {
 	case srvModalHelp:
-		lines := []string{
+		return "服务端管理快捷键", []string{
 			m.th.hintKey.Render("全局快捷键"),
 			"  1–6 / Tab      在 概览 / 用户 / 传输 / 证书 / 设置 / 日志 页面间切换",
 			"  s / x / R      后台启动 sftd / 停止 sftd / 热加载证书与 ACL 配置",
@@ -598,11 +598,20 @@ func (m *serverModel) renderModal(base string) string {
 			"  证书页：  [K] 续期CA(365d)  [S] 轮换服务端证书  [C] 签发客户端CSR",
 			"  设置页：  [m] 基础/带宽/存储  [a] 高级协议/超时/资源  [L] 日志上限  [A] 热加载",
 			"  日志页：  [p] 暂停/跟随  [l] 切换日志等级  [L] 日志上限  [Enter] 事件详情",
-		}
-		return renderModalBox(m.width, m.height, m.th, "服务端管理快捷键", lines, "按 Esc / Enter / ? 关闭")
+		}, "↑↓/滚轮 滚动 · Esc / Enter / ? 关闭"
 
 	case srvModalDetail:
-		return renderModalBox(m.width, m.height, m.th, m.detailTitle, m.detailLines, "按 Enter 或 Esc 关闭")
+		return m.detailTitle, m.detailLines, "↑↓/滚轮 滚动 · Enter / Esc 关闭"
+	}
+	return "", nil, ""
+}
+
+func (m *serverModel) renderModal(base string) string {
+	switch m.modal {
+	case srvModalHelp, srvModalDetail:
+		title, lines, footer := m.infoModalData()
+		view, _ := renderModalScrollBox(m.width, m.height, m.th, title, lines, footer, m.infoScroll)
+		return view
 
 	case srvModalStop:
 		lines := []string{
@@ -611,7 +620,8 @@ func (m *serverModel) renderModal(base string) string {
 			"  " + m.th.hintKey.Render("[g / Enter]") + "  优雅停服（拒接新连接并等待当前活动传输安全落盘完成后退出）",
 			"  " + m.th.hintKey.Render("[f]") + "          立即强制停服（断开所有连接）",
 		}
-		return renderModalBox(m.width, m.height, m.th, "停止 sftd 服务", lines, "g 优雅停服 · f 强制停服 · Esc 取消")
+		view, _ := renderModalScrollBox(m.width, m.height, m.th, "停止 sftd 服务", lines, "g 优雅停服 · f 强制停服 · Esc 取消", 0)
+		return view
 	}
 
 	boxW := min(max(44, m.width-4), 86)
