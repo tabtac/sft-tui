@@ -57,6 +57,26 @@ type formButton struct {
 	onClick func() (tea.Model, tea.Cmd)
 }
 
+// formState 封装服务端模态框/向导的多控件表单状态与字段索引映射。
+type formState struct {
+	formRows       []formRow
+	formInputs     []textinput.Model
+	formUnits      []*formUnitField
+	formSelects    []formSelectField
+	formLabels     []string
+	formFocus      int
+	formSubFocus   int
+	formScroll     int
+	formToggles    []bool
+	formToggleLbl  []string
+	formButtons    []formButton
+	formBtnIdx     int
+	dropdownOpen   bool
+	dropdownRow    int
+	dropdownCursor int
+	formKeyIdx     map[string]int
+}
+
 type deployWizardDraft struct {
 	d          setup.Deployment
 	scene      int // 0=本机演示, 1=局域网部署
@@ -106,22 +126,23 @@ func decomposeBytes(val uint64, isRate bool) (string, []string, int) {
 	return strconv.FormatUint(val, 10), opts, 0
 }
 
-func (m *serverModel) resetForm() {
-	m.formRows = nil
-	m.formInputs = nil
-	m.formUnits = nil
-	m.formSelects = nil
-	m.formLabels = nil
-	m.formToggles = nil
-	m.formToggleLbl = nil
-	m.formButtons = nil
-	m.formBtnIdx = 0
-	m.formFocus = 0
-	m.formSubFocus = 0
-	m.formScroll = 0
-	m.dropdownOpen = false
-	m.dropdownRow = -1
-	m.dropdownCursor = 0
+func (f *formState) resetForm() {
+	f.formRows = nil
+	f.formInputs = nil
+	f.formUnits = nil
+	f.formSelects = nil
+	f.formLabels = nil
+	f.formToggles = nil
+	f.formToggleLbl = nil
+	f.formButtons = nil
+	f.formBtnIdx = 0
+	f.formFocus = 0
+	f.formSubFocus = 0
+	f.formScroll = 0
+	f.dropdownOpen = false
+	f.dropdownRow = -1
+	f.dropdownCursor = 0
+	f.formKeyIdx = make(map[string]int)
 }
 
 func makeModalInput(val string) textinput.Model {
@@ -132,12 +153,27 @@ func makeModalInput(val string) textinput.Model {
 	return ti
 }
 
-func (m *serverModel) addTextRow(label, value string) int {
-	idx := len(m.formInputs)
-	m.formInputs = append(m.formInputs, makeModalInput(value))
-	m.formUnits = append(m.formUnits, nil)
-	m.formLabels = append(m.formLabels, label)
-	m.formRows = append(m.formRows, formRow{
+func (f *formState) setInputKey(inputIdx int, key string) {
+	if key == "" {
+		return
+	}
+	if f.formKeyIdx == nil {
+		f.formKeyIdx = make(map[string]int)
+	}
+	f.formKeyIdx[key] = inputIdx
+}
+
+func (f *formState) inputByKey(key string) (int, bool) {
+	idx, ok := f.formKeyIdx[key]
+	return idx, ok
+}
+
+func (f *formState) addTextRow(label, value string) int {
+	idx := len(f.formInputs)
+	f.formInputs = append(f.formInputs, makeModalInput(value))
+	f.formUnits = append(f.formUnits, nil)
+	f.formLabels = append(f.formLabels, label)
+	f.formRows = append(f.formRows, formRow{
 		kind:     formRowText,
 		label:    label,
 		inputIdx: idx,
@@ -145,15 +181,21 @@ func (m *serverModel) addTextRow(label, value string) int {
 	return idx
 }
 
-func (m *serverModel) addSizeUnitRow(label string, bytesVal uint64, isRate bool) int {
+func (f *formState) addKeyedTextRow(key, label, value string) int {
+	idx := f.addTextRow(label, value)
+	f.setInputKey(idx, key)
+	return idx
+}
+
+func (f *formState) addSizeUnitRow(label string, bytesVal uint64, isRate bool) int {
 	numStr, opts, sel := decomposeBytes(bytesVal, isRate)
-	idx := len(m.formInputs)
+	idx := len(f.formInputs)
 	ti := makeModalInput(numStr)
 	ti.Width = 18
-	m.formInputs = append(m.formInputs, ti)
-	m.formUnits = append(m.formUnits, &formUnitField{options: opts, selected: sel})
-	m.formLabels = append(m.formLabels, label)
-	m.formRows = append(m.formRows, formRow{
+	f.formInputs = append(f.formInputs, ti)
+	f.formUnits = append(f.formUnits, &formUnitField{options: opts, selected: sel})
+	f.formLabels = append(f.formLabels, label)
+	f.formRows = append(f.formRows, formRow{
 		kind:     formRowSizeUnit,
 		label:    label,
 		inputIdx: idx,
@@ -161,18 +203,24 @@ func (m *serverModel) addSizeUnitRow(label string, bytesVal uint64, isRate bool)
 	return idx
 }
 
-func (m *serverModel) addSelectRow(label string, options []string, selected int, onChange func(string, int)) int {
+func (f *formState) addKeyedSizeUnitRow(key, label string, bytesVal uint64, isRate bool) int {
+	idx := f.addSizeUnitRow(label, bytesVal, isRate)
+	f.setInputKey(idx, key)
+	return idx
+}
+
+func (f *formState) addSelectRow(label string, options []string, selected int, onChange func(string, int)) int {
 	if selected < 0 || selected >= len(options) {
 		selected = 0
 	}
-	idx := len(m.formSelects)
-	m.formSelects = append(m.formSelects, formSelectField{
+	idx := len(f.formSelects)
+	f.formSelects = append(f.formSelects, formSelectField{
 		label:    label,
 		options:  options,
 		selected: selected,
 		onChange: onChange,
 	})
-	m.formRows = append(m.formRows, formRow{
+	f.formRows = append(f.formRows, formRow{
 		kind:      formRowSelect,
 		label:     label,
 		selectIdx: idx,
@@ -180,11 +228,11 @@ func (m *serverModel) addSelectRow(label string, options []string, selected int,
 	return idx
 }
 
-func (m *serverModel) addToggleRow(label string, checked bool, onToggle func(bool)) int {
-	idx := len(m.formToggles)
-	m.formToggles = append(m.formToggles, checked)
-	m.formToggleLbl = append(m.formToggleLbl, label)
-	m.formRows = append(m.formRows, formRow{
+func (f *formState) addToggleRow(label string, checked bool, onToggle func(bool)) int {
+	idx := len(f.formToggles)
+	f.formToggles = append(f.formToggles, checked)
+	f.formToggleLbl = append(f.formToggleLbl, label)
+	f.formRows = append(f.formRows, formRow{
 		kind:      formRowToggle,
 		label:     label,
 		toggleIdx: idx,
@@ -193,12 +241,100 @@ func (m *serverModel) addToggleRow(label string, checked bool, onToggle func(boo
 	return idx
 }
 
-func (m *serverModel) addNoteRow(lines []string, accent bool) {
-	m.formRows = append(m.formRows, formRow{
+func (f *formState) addNoteRow(lines []string, accent bool) {
+	f.formRows = append(f.formRows, formRow{
 		kind:       formRowNote,
 		lines:      lines,
 		noteAccent: accent,
 	})
+}
+
+func (f *formState) parseSizeInput(inputIdx int, errLabel string) (uint64, error) {
+	num := strings.TrimSpace(f.formInputs[inputIdx].Value())
+	if num == "" {
+		return 0, fmt.Errorf("%s不能为空", errLabel)
+	}
+	u := f.formUnits[inputIdx]
+	if u != nil && u.selected >= 0 && u.selected < len(u.options) {
+		num += " " + u.options[u.selected]
+	}
+	v, err := setup.ParseBytes(num)
+	if err != nil {
+		return 0, fmt.Errorf("%s：%w", errLabel, err)
+	}
+	return v, nil
+}
+
+func (f *formState) nextFocusableRow(from, dir int) int {
+	n := len(f.formRows)
+	hasBtns := len(f.formButtons) > 0
+	totalSlots := n
+	if hasBtns {
+		totalSlots = n + 1
+	}
+	if totalSlots == 0 {
+		return 0
+	}
+	cur := from
+	for step := 0; step < totalSlots; step++ {
+		cur = (cur + dir + totalSlots) % totalSlots
+		if cur == n && hasBtns {
+			return cur
+		}
+		if cur >= 0 && cur < n && f.formRows[cur].kind != formRowNote {
+			return cur
+		}
+	}
+	return 0
+}
+
+func (f *formState) currentDropdownOptions() []string {
+	if f.dropdownRow < 0 || f.dropdownRow >= len(f.formRows) {
+		return nil
+	}
+	r := f.formRows[f.dropdownRow]
+	if r.kind == formRowSelect {
+		return f.formSelects[r.selectIdx].options
+	}
+	if r.kind == formRowSizeUnit && f.formUnits[r.inputIdx] != nil {
+		return f.formUnits[r.inputIdx].options
+	}
+	return nil
+}
+
+func (f *formState) stepUnitOrSelect(rowIdx, delta int) bool {
+	if rowIdx < 0 || rowIdx >= len(f.formRows) {
+		return false
+	}
+	r := f.formRows[rowIdx]
+	switch r.kind {
+	case formRowSelect:
+		sf := &f.formSelects[r.selectIdx]
+		if len(sf.options) == 0 {
+			return false
+		}
+		sf.selected = (sf.selected + delta + len(sf.options)) % len(sf.options)
+		if sf.onChange != nil {
+			sf.onChange(sf.options[sf.selected], sf.selected)
+		}
+		return true
+	case formRowSizeUnit:
+		if f.formSubFocus != 1 {
+			return false
+		}
+		if u := f.formUnits[r.inputIdx]; u != nil && len(u.options) > 0 {
+			u.selected = (u.selected + delta + len(u.options)) % len(u.options)
+			return true
+		}
+	}
+	return false
+}
+
+func (f *formState) activateFormButton(idx int) (tea.Model, tea.Cmd) {
+	if idx >= 0 && idx < len(f.formButtons) && f.formButtons[idx].onClick != nil {
+		return f.formButtons[idx].onClick()
+	}
+	return nil, nil
 }
 
 func (m *serverModel) finalizeFormFocus(focusFirstInput bool) {
@@ -219,45 +355,6 @@ func (m *serverModel) finalizeFormFocus(focusFirstInput bool) {
 			break
 		}
 	}
-}
-
-func (m *serverModel) parseSizeInput(inputIdx int, errLabel string) (uint64, error) {
-	num := strings.TrimSpace(m.formInputs[inputIdx].Value())
-	if num == "" {
-		return 0, fmt.Errorf("%s不能为空", errLabel)
-	}
-	u := m.formUnits[inputIdx]
-	if u != nil && u.selected >= 0 && u.selected < len(u.options) {
-		num += " " + u.options[u.selected]
-	}
-	v, err := setup.ParseBytes(num)
-	if err != nil {
-		return 0, fmt.Errorf("%s：%w", errLabel, err)
-	}
-	return v, nil
-}
-
-func (m *serverModel) nextFocusableRow(from, dir int) int {
-	n := len(m.formRows)
-	hasBtns := len(m.formButtons) > 0
-	totalSlots := n
-	if hasBtns {
-		totalSlots = n + 1
-	}
-	if totalSlots == 0 {
-		return 0
-	}
-	cur := from
-	for step := 0; step < totalSlots; step++ {
-		cur = (cur + dir + totalSlots) % totalSlots
-		if cur == n && hasBtns {
-			return cur
-		}
-		if cur >= 0 && cur < n && m.formRows[cur].kind != formRowNote {
-			return cur
-		}
-	}
-	return 0
 }
 
 func (m *serverModel) setRowFocus(rowIdx, sub int) {
@@ -282,24 +379,21 @@ func (m *serverModel) setRowFocus(rowIdx, sub int) {
 }
 
 func (m *serverModel) ensureFormRowVisible() {
-	if m.formFocus < 0 || m.formFocus >= len(m.formRows) {
-		if len(m.formRows) == 0 {
-			m.formScroll = 0
-		}
+	if len(m.formRows) == 0 {
+		m.formScroll = 0
 		return
 	}
-	maxRows := m.formMaxVisibleRows()
-	if maxRows <= 0 {
-		return
+	_, innerW := modalBoxDimensions(m.width)
+	noticeLines := m.modalFormNoticeLines(innerW)
+	btnBlock, _ := m.layoutFormButtons(innerW, 0)
+	rowBudget, maxPopupH := m.formRowBudget(innerW, len(noticeLines), len(btnBlock))
+	opts := m.currentDropdownOptions()
+	popupH := 0
+	if m.dropdownOpen {
+		popupH = min(len(opts), maxPopupH)
 	}
-	if m.formFocus < m.formScroll {
-		m.formScroll = m.formFocus
-	} else {
-		// 统计 m.formScroll..m.formFocus 的显示行数
-		for m.formScroll < m.formFocus && m.formSliceLines(m.formScroll, m.formFocus) > maxRows {
-			m.formScroll++
-		}
-	}
+	start, _ := m.solveFormVisibleRange(innerW, rowBudget, popupH)
+	m.formScroll = start
 }
 
 func (m *serverModel) focusInputRow(inputIdx int) tea.Cmd {
@@ -312,74 +406,19 @@ func (m *serverModel) focusInputRow(inputIdx int) tea.Cmd {
 	return nil
 }
 
+func (m *serverModel) focusInputKey(key string, fallbackIdx int) int {
+	if idx, ok := m.inputByKey(key); ok {
+		return idx
+	}
+	return fallbackIdx
+}
+
 func (m *serverModel) focusSelectRow(selectIdx int) tea.Cmd {
 	for i, r := range m.formRows {
 		if r.kind == formRowSelect && r.selectIdx == selectIdx {
 			m.setRowFocus(i, 0)
 			return nil
 		}
-	}
-	return nil
-}
-
-func (m *serverModel) formMaxVisibleRows() int {
-	h := m.height
-	if h <= 0 {
-		h = 30
-	}
-	// 扣除边框(2)+内边距(2)+标题(1)+分隔线(2)+页脚(1)+按钮(2)+安全留白(2)
-	return max(3, h-12)
-}
-
-func (m *serverModel) formRowHeight(r formRow) int {
-	switch r.kind {
-	case formRowNote:
-		return max(1, len(r.lines))
-	case formRowToggle:
-		return 1
-	default:
-		return 2
-	}
-}
-
-func (m *serverModel) formSliceLines(start, endInclusive int) int {
-	lines := 0
-	for i := start; i <= endInclusive && i < len(m.formRows); i++ {
-		lines += m.formRowHeight(m.formRows[i])
-	}
-	return lines
-}
-
-func (m *serverModel) formVisibleRange() (start, end int) {
-	n := len(m.formRows)
-	if n == 0 {
-		return 0, 0
-	}
-	start = max(0, min(n-1, m.formScroll))
-	maxH := m.formMaxVisibleRows()
-	used := 0
-	end = start
-	for end < n {
-		h := m.formRowHeight(m.formRows[end])
-		if end > start && used+h > maxH {
-			break
-		}
-		used += h
-		end++
-	}
-	return start, end
-}
-
-func (m *serverModel) currentDropdownOptions() []string {
-	if m.dropdownRow < 0 || m.dropdownRow >= len(m.formRows) {
-		return nil
-	}
-	r := m.formRows[m.dropdownRow]
-	if r.kind == formRowSelect {
-		return m.formSelects[r.selectIdx].options
-	}
-	if r.kind == formRowSizeUnit && m.formUnits[r.inputIdx] != nil {
-		return m.formUnits[r.inputIdx].options
 	}
 	return nil
 }
@@ -401,6 +440,7 @@ func (m *serverModel) openDropdownAt(rowIdx int) {
 			m.dropdownOpen = true
 		}
 	}
+	m.ensureFormRowVisible()
 }
 
 func (m *serverModel) applyDropdownSelection(idx int) {
@@ -425,41 +465,7 @@ func (m *serverModel) applyDropdownSelection(idx int) {
 	}
 	m.dropdownOpen = false
 	m.dropdownRow = -1
-}
-
-func (m *serverModel) stepUnitOrSelect(rowIdx, delta int) bool {
-	if rowIdx < 0 || rowIdx >= len(m.formRows) {
-		return false
-	}
-	r := m.formRows[rowIdx]
-	switch r.kind {
-	case formRowSelect:
-		sf := &m.formSelects[r.selectIdx]
-		if len(sf.options) == 0 {
-			return false
-		}
-		sf.selected = (sf.selected + delta + len(sf.options)) % len(sf.options)
-		if sf.onChange != nil {
-			sf.onChange(sf.options[sf.selected], sf.selected)
-		}
-		return true
-	case formRowSizeUnit:
-		if m.formSubFocus != 1 {
-			return false
-		}
-		if u := m.formUnits[r.inputIdx]; u != nil && len(u.options) > 0 {
-			u.selected = (u.selected + delta + len(u.options)) % len(u.options)
-			return true
-		}
-	}
-	return false
-}
-
-func (m *serverModel) activateFormButton(idx int) (tea.Model, tea.Cmd) {
-	if idx >= 0 && idx < len(m.formButtons) && m.formButtons[idx].onClick != nil {
-		return m.formButtons[idx].onClick()
-	}
-	return m, nil
+	m.ensureFormRowVisible()
 }
 
 func (m *serverModel) triggerPrimaryButton() (tea.Model, tea.Cmd) {
@@ -484,6 +490,7 @@ func (m *serverModel) handleFormKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		case "esc":
 			m.dropdownOpen = false
 			m.dropdownRow = -1
+			m.ensureFormRowVisible()
 		case "up", "k":
 			if m.dropdownCursor > 0 {
 				m.dropdownCursor--
@@ -636,18 +643,216 @@ const (
 
 type formHitBox struct {
 	y0, y1 int // 相对表单起始行的 Y 范围 [y0, y1)
-	x0, x1 int // 相对盒内左边界的 X 范围（仅弹窗按钮或单位下拉使用）
+	x0, x1 int // 相对盒内左边界的 X 范围
 	kind   formHitKind
 	row    int
 	idx    int
 }
 
-func (m *serverModel) buildFormViewAndHits(innerW int) ([]string, string, []formHitBox) {
+type dropdownLine struct {
+	text   string
+	optIdx int
+}
+
+func (m *serverModel) formMaxTotalLines() int {
+	if m.height <= 0 {
+		return 1 << 20
+	}
+	// renderModalRawBox(width, th, title, lines, footer) 固定占用 8 行边框/内边距/标题/分隔线/页脚。
+	return max(3, m.height-8)
+}
+
+func (m *serverModel) formRowBaseHeight(r formRow, innerW int) int {
+	switch r.kind {
+	case formRowNote:
+		return max(1, len(wrapModalLines(r.lines, innerW)))
+	case formRowToggle:
+		return 1
+	default:
+		return 2
+	}
+}
+
+func (m *serverModel) modalFormNoticeLines(innerW int) []string {
+	toast := strings.TrimSpace(m.statusToast)
+	if toast == "" {
+		return nil
+	}
+	wrapped := wrapModalLines([]string{"! " + toast}, innerW)
+	out := make([]string, 0, len(wrapped))
+	for _, ln := range wrapped {
+		out = append(out, m.th.toast.Render(ln))
+	}
+	return out
+}
+
+func (m *serverModel) layoutFormButtons(innerW, baseY int) ([]string, []formHitBox) {
+	if len(m.formButtons) == 0 {
+		return nil, nil
+	}
 	var lines []string
 	var hits []formHitBox
-	start, end := m.formVisibleRange()
+	// 按行自动换行放置按钮，避免窄终端折行导致高度和命中区偏移。
+	lines = append(lines, "")
+	btnLineFocused := m.formFocus == len(m.formRows)
+
+	var curParts []string
+	curX := 2
+	curY := baseY + len(lines)
+	flushLine := func() {
+		lines = append(lines, "  "+strings.Join(curParts, "  "))
+		curParts = nil
+		curX = 2
+		curY = baseY + len(lines)
+	}
+
+	for i, b := range m.formButtons {
+		lbl := " " + b.label + " "
+		var rendered string
+		switch {
+		case btnLineFocused && i == m.formBtnIdx:
+			rendered = m.th.tabActive.Render("▸" + lbl + "◂")
+		case b.primary:
+			rendered = m.th.badgeID.Render("[" + lbl + "]")
+		default:
+			rendered = m.th.tabInactive.Render("[" + lbl + "]")
+		}
+		w := lipgloss.Width(rendered)
+		if len(curParts) > 0 && curX+w > innerW {
+			flushLine()
+		}
+		hits = append(hits, formHitBox{y0: curY, y1: curY + 1, x0: curX, x1: curX + w, kind: hitButton, idx: i})
+		curParts = append(curParts, rendered)
+		curX += w + 2
+	}
+	if len(curParts) > 0 {
+		lines = append(lines, "  "+strings.Join(curParts, "  "))
+	}
+	return lines, hits
+}
+
+func (m *serverModel) formRowBudget(innerW, noticeH, btnH int) (rowBudget, maxPopupH int) {
+	totalMax := m.formMaxTotalLines()
+	fixed := noticeH + btnH
+	if noticeH > 0 && btnH == 0 {
+		fixed++
+	}
+	rowBudget = max(2, totalMax-fixed)
+	baseH := 2
+	indReserve := 0
+	if len(m.formRows) > 1 {
+		indReserve = 2
+	}
+	maxPopupH = max(1, rowBudget-baseH-indReserve)
+	return rowBudget, maxPopupH
+}
+
+func (m *serverModel) solveFormVisibleRange(innerW, rowBudget, popupH int) (start, end int) {
+	n := len(m.formRows)
+	if n == 0 {
+		return 0, 0
+	}
+	rowH := func(idx int) int {
+		h := m.formRowBaseHeight(m.formRows[idx], innerW)
+		if m.dropdownOpen && m.dropdownRow == idx {
+			h += popupH
+		}
+		return h
+	}
+	fitEnd := func(s int) int {
+		used := 0
+		e := s
+		for e < n {
+			h := rowH(e)
+			ind := 0
+			if s > 0 {
+				ind++
+			}
+			if e+1 < n {
+				ind++
+			}
+			if e > s && used+h+ind > rowBudget {
+				break
+			}
+			used += h
+			e++
+		}
+		return e
+	}
+
+	target := m.formFocus
+	if m.dropdownOpen && m.dropdownRow >= 0 && m.dropdownRow < n {
+		target = m.dropdownRow
+	} else if target < 0 || target >= n {
+		s := max(0, min(n-1, m.formScroll))
+		return s, fitEnd(s)
+	}
+
+	s := max(0, min(n-1, m.formScroll))
+	if target < s {
+		s = target
+	}
+	e := fitEnd(s)
+	for s < target && target >= e {
+		s++
+		e = fitEnd(s)
+	}
+	return s, e
+}
+
+func (m *serverModel) renderDropdownPopup(opts []string, innerW, maxH int) []dropdownLine {
+	if len(opts) == 0 || maxH <= 0 {
+		return nil
+	}
+	maxW := 18
+	for _, o := range opts {
+		if w := lipgloss.Width(o); w > maxW {
+			maxW = w
+		}
+	}
+	maxW = min(max(12, maxW+4), max(12, innerW-6))
+
+	vis := min(len(opts), maxH)
+	start := 0
+	if len(opts) > vis {
+		cur := max(0, min(len(opts)-1, m.dropdownCursor))
+		start = scrollOffset(cur, len(opts), vis)
+	}
+	end := min(len(opts), start+vis)
+
+	out := make([]dropdownLine, 0, end-start)
+	for idx := start; idx < end; idx++ {
+		mark := "  "
+		st := m.th.rowNormal
+		if idx == m.dropdownCursor {
+			mark = "▶ "
+			st = m.th.rowCursor
+		}
+		text := padRightCell(mark+truncCell(opts[idx], max(4, maxW-2)), maxW)
+		out = append(out, dropdownLine{
+			text:   "    " + st.Render(text),
+			optIdx: idx,
+		})
+	}
+	return out
+}
+
+func (m *serverModel) buildFormViewAndHits(innerW int) ([]string, string, []formHitBox) {
+	noticeLines := m.modalFormNoticeLines(innerW)
+	preBtnLines, _ := m.layoutFormButtons(innerW, 0)
+	rowBudget, maxPopupH := m.formRowBudget(innerW, len(noticeLines), len(preBtnLines))
+
+	var popup []dropdownLine
+	if m.dropdownOpen && m.dropdownRow >= 0 && m.dropdownRow < len(m.formRows) {
+		popup = m.renderDropdownPopup(m.currentDropdownOptions(), innerW, maxPopupH)
+	}
+	start, end := m.solveFormVisibleRange(innerW, rowBudget, len(popup))
+
+	var lines []string
+	var hits []formHitBox
 	if start > 0 {
-		lines = append(lines, m.th.badgeMuted.Render(fmt.Sprintf("▲ 上方还有 %d 项（方向键/滚轮浏览）", start)))
+		ind := truncCell(fmt.Sprintf("▲ 上方还有 %d 项（方向键/滚轮浏览）", start), innerW)
+		lines = append(lines, m.th.badgeMuted.Render(ind))
 	}
 	for i := start; i < end; i++ {
 		r := m.formRows[i]
@@ -659,7 +864,7 @@ func (m *serverModel) buildFormViewAndHits(innerW int) ([]string, string, []form
 		yStart := len(lines)
 		switch r.kind {
 		case formRowNote:
-			for _, ln := range r.lines {
+			for _, ln := range wrapModalLines(r.lines, innerW) {
 				if r.noteAccent {
 					lines = append(lines, m.th.toast.Render(ln))
 				} else {
@@ -668,8 +873,10 @@ func (m *serverModel) buildFormViewAndHits(innerW int) ([]string, string, []form
 			}
 
 		case formRowText:
-			lines = append(lines, prefix+m.th.hintKey.Render(r.label))
-			lines = append(lines, "  "+m.formInputs[r.inputIdx].View())
+			lines = append(lines, prefix+m.th.hintKey.Render(truncCell(r.label, max(8, innerW-2))))
+			ti := m.formInputs[r.inputIdx]
+			ti.Width = min(ti.Width, max(8, innerW-6))
+			lines = append(lines, "  "+ti.View())
 			hits = append(hits, formHitBox{y0: yStart, y1: len(lines), x0: 0, x1: innerW, kind: hitFormRow, row: i})
 
 		case formRowSizeUnit:
@@ -679,7 +886,7 @@ func (m *serverModel) buildFormViewAndHits(innerW int) ([]string, string, []form
 			if unitFocused {
 				lblMark = "▸ "
 			}
-			lines = append(lines, lblMark+m.th.hintKey.Render(r.label))
+			lines = append(lines, lblMark+m.th.hintKey.Render(truncCell(r.label, max(8, innerW-2))))
 			unit := m.formUnits[r.inputIdx]
 			unitText := ""
 			if unit != nil && unit.selected >= 0 && unit.selected < len(unit.options) {
@@ -691,9 +898,11 @@ func (m *serverModel) buildFormViewAndHits(innerW int) ([]string, string, []form
 			} else if numFocused {
 				unitView = m.th.rowNormal.Render(unitText)
 			}
-			inView := m.formInputs[r.inputIdx].View()
-			inW := lipgloss.Width(inView)
 			unitW := lipgloss.Width(unitView)
+			ti := m.formInputs[r.inputIdx]
+			ti.Width = min(ti.Width, max(6, innerW-unitW-8))
+			inView := ti.View()
+			inW := lipgloss.Width(inView)
 			rowLine := "  " + inView + "  " + unitView
 			lineY := len(lines)
 			lines = append(lines, rowLine)
@@ -702,21 +911,20 @@ func (m *serverModel) buildFormViewAndHits(innerW int) ([]string, string, []form
 				formHitBox{y0: yStart, y1: len(lines), x0: 0, x1: innerW, kind: hitFormRow, row: i},
 			)
 			if m.dropdownOpen && m.dropdownRow == i && unit != nil {
-				pLines := m.renderDropdownPopup(unit.options)
-				for idx, pl := range pLines {
-					hits = append(hits, formHitBox{y0: len(lines), y1: len(lines) + 1, x0: 0, x1: innerW, kind: hitPopupOpt, row: i, idx: idx})
-					lines = append(lines, pl)
+				for _, pl := range popup {
+					hits = append(hits, formHitBox{y0: len(lines), y1: len(lines) + 1, x0: 0, x1: innerW, kind: hitPopupOpt, row: i, idx: pl.optIdx})
+					lines = append(lines, pl.text)
 				}
 			}
 
 		case formRowSelect:
 			sf := m.formSelects[r.selectIdx]
-			lines = append(lines, prefix+m.th.hintKey.Render(r.label))
+			lines = append(lines, prefix+m.th.hintKey.Render(truncCell(r.label, max(8, innerW-2))))
 			cur := ""
 			if sf.selected >= 0 && sf.selected < len(sf.options) {
 				cur = sf.options[sf.selected]
 			}
-			box := fmt.Sprintf("[ %s ▼ ]", truncCell(cur, max(12, innerW-12)))
+			box := fmt.Sprintf("[ %s ▼ ]", truncCell(cur, max(8, innerW-12)))
 			if focused {
 				lines = append(lines, "  "+m.th.tabActive.Render(box))
 			} else {
@@ -724,10 +932,9 @@ func (m *serverModel) buildFormViewAndHits(innerW int) ([]string, string, []form
 			}
 			hits = append(hits, formHitBox{y0: yStart, y1: len(lines), x0: 0, x1: innerW, kind: hitUnitBox, row: i})
 			if m.dropdownOpen && m.dropdownRow == i {
-				pLines := m.renderDropdownPopup(sf.options)
-				for idx, pl := range pLines {
-					hits = append(hits, formHitBox{y0: len(lines), y1: len(lines) + 1, x0: 0, x1: innerW, kind: hitPopupOpt, row: i, idx: idx})
-					lines = append(lines, pl)
+				for _, pl := range popup {
+					hits = append(hits, formHitBox{y0: len(lines), y1: len(lines) + 1, x0: 0, x1: innerW, kind: hitPopupOpt, row: i, idx: pl.optIdx})
+					lines = append(lines, pl.text)
 				}
 			}
 
@@ -740,35 +947,25 @@ func (m *serverModel) buildFormViewAndHits(innerW int) ([]string, string, []form
 			if focused {
 				st = m.th.rowCursor
 			}
-			lines = append(lines, st.Render(fmt.Sprintf("%s%s %s", prefix, box, r.label)))
+			rowStr := truncCell(fmt.Sprintf("%s%s %s", prefix, box, r.label), innerW)
+			lines = append(lines, st.Render(rowStr))
 			hits = append(hits, formHitBox{y0: yStart, y1: len(lines), x0: 0, x1: innerW, kind: hitFormRow, row: i})
 		}
 	}
 	if end < len(m.formRows) {
-		lines = append(lines, m.th.badgeMuted.Render(fmt.Sprintf("▼ 下方还有 %d 项（方向键/滚轮浏览）", len(m.formRows)-end)))
+		ind := truncCell(fmt.Sprintf("▼ 下方还有 %d 项（方向键/滚轮浏览）", len(m.formRows)-end), innerW)
+		lines = append(lines, m.th.badgeMuted.Render(ind))
+	}
+	if len(noticeLines) > 0 {
+		if len(m.formButtons) == 0 {
+			lines = append(lines, "")
+		}
+		lines = append(lines, noticeLines...)
 	}
 	if len(m.formButtons) > 0 {
-		var btns []string
-		btnLineFocused := m.formFocus == len(m.formRows)
-		xCursor := 2
-		btnY := len(lines) + 1
-		for i, b := range m.formButtons {
-			lbl := " " + b.label + " "
-			var rendered string
-			switch {
-			case btnLineFocused && i == m.formBtnIdx:
-				rendered = m.th.tabActive.Render("▸" + lbl + "◂")
-			case b.primary:
-				rendered = m.th.badgeID.Render("[" + lbl + "]")
-			default:
-				rendered = m.th.tabInactive.Render("[" + lbl + "]")
-			}
-			w := lipgloss.Width(rendered)
-			hits = append(hits, formHitBox{y0: btnY, y1: btnY + 1, x0: xCursor, x1: xCursor + w, kind: hitButton, idx: i})
-			xCursor += w + 2
-			btns = append(btns, rendered)
-		}
-		lines = append(lines, "", "  "+strings.Join(btns, "  "))
+		btnLines, btnHits := m.layoutFormButtons(innerW, len(lines))
+		lines = append(lines, btnLines...)
+		hits = append(hits, btnHits...)
 	}
 
 	footer := "Tab/↑↓ 切项 · Space 勾选/下拉 · ←→ 切换单位 · Enter 确认 · Esc 返回"
@@ -825,12 +1022,12 @@ func (m *serverModel) handleModalMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
-	boxW := min(max(44, m.width-4), 86)
-	innerW := boxW - 6
+	_, innerW := modalBoxDimensions(m.width)
 	lines, footer, hits := m.buildFormViewAndHits(innerW)
 	boxStr := renderModalRawBox(m.width, m.th, m.modalTitle(), lines, footer)
+	actualBoxW := lipgloss.Width(boxStr)
 	boxH := lipgloss.Height(boxStr)
-	boxX := max(0, (m.width-boxW)/2)
+	boxX := max(0, (m.width-actualBoxW)/2)
 	boxY := max(0, (m.height-boxH)/2)
 	// 内容行起始：border(1)+pad(1)+title(1)+rule(1) = 4；左起始 boxX+3 (border1+pad2)
 	relY := msg.Y - (boxY + 4)
@@ -838,7 +1035,7 @@ func (m *serverModel) handleModalMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 
 	// 优先命中下拉菜单项，其次单位框/按钮/普通行
 	for _, h := range hits {
-		if h.kind == hitPopupOpt && relY >= h.y0 && relY < h.y1 {
+		if h.kind == hitPopupOpt && relY >= h.y0 && relY < h.y1 && relX >= h.x0 && relX < h.x1 {
 			m.applyDropdownSelection(h.idx)
 			return m, nil
 		}
@@ -846,6 +1043,7 @@ func (m *serverModel) handleModalMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 	if m.dropdownOpen {
 		m.dropdownOpen = false
 		m.dropdownRow = -1
+		m.ensureFormRowVisible()
 		return m, nil
 	}
 	for _, h := range hits {
@@ -867,7 +1065,7 @@ func (m *serverModel) handleModalMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 		}
 	}
 	for _, h := range hits {
-		if h.kind == hitFormRow && relY >= h.y0 && relY < h.y1 {
+		if h.kind == hitFormRow && relY >= h.y0 && relY < h.y1 && relX >= h.x0 && relX < h.x1 {
 			r := m.formRows[h.row]
 			m.setRowFocus(h.row, 0)
 			if r.kind == formRowToggle {
@@ -881,27 +1079,6 @@ func (m *serverModel) handleModalMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 		}
 	}
 	return m, nil
-}
-
-func (m *serverModel) renderDropdownPopup(opts []string) []string {
-	var out []string
-	maxW := 18
-	for _, o := range opts {
-		if w := lipgloss.Width(o); w > maxW {
-			maxW = w
-		}
-	}
-	maxW = min(maxW+4, 48)
-	for idx, o := range opts {
-		mark := "  "
-		st := m.th.rowNormal
-		if idx == m.dropdownCursor {
-			mark = "▶ "
-			st = m.th.rowCursor
-		}
-		out = append(out, "    "+st.Render(padRightCell(mark+o, maxW)))
-	}
-	return out
 }
 
 func settingLabel(key string) string {

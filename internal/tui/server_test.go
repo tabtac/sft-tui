@@ -2,6 +2,11 @@ package tui
 
 import (
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -500,13 +505,21 @@ func TestServerRenewCertPreservesDisabledUserState(t *testing.T) {
 	}
 
 	// 按 w 续期用户证书，必须保持原禁用状态
+	oldCertificate := m.cfg.AuthorizedClients[0].Certificate
 	_, cmd := m.Update(keyRune('w'))
 	if cmd == nil {
 		t.Fatal("w did not trigger renewUserCertCmd")
 	}
 	res := cmd()
+	action, ok := res.(serverActionResultMsg)
+	if !ok || action.err != nil {
+		t.Fatalf("certificate renewal must succeed before checking disable state: result=%T error=%v", res, action.err)
+	}
 	m.Update(res)
 	m.Update(m.loadConfigCmd()())
+	if m.cfg.AuthorizedClients[0].Certificate == oldCertificate {
+		t.Error("certificate renewal did not publish a new certificate generation")
+	}
 	if !m.cfg.AuthorizedClients[0].Disabled {
 		t.Fatalf("cert renewal unexpectedly re-enabled disabled user: %+v", m.cfg.AuthorizedClients[0])
 	}
@@ -690,5 +703,118 @@ func TestServerHelpAndDetailModalsScrollWithinTerminalHeight(t *testing.T) {
 	vEnd := ansi.Strip(m.View())
 	if lipgloss.Height(vEnd) > 14 || !strings.Contains(vEnd, "证书链详情测试") || !strings.Contains(vEnd, "关闭") || !strings.Contains(vEnd, "cert-line-24") {
 		t.Fatalf("server detail modal clipped chrome or failed scroll to bottom:\n%s", vEnd)
+	}
+}
+
+func TestServerExternalKeyCSRRenewAndModalGuards(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "configs", "server.local.json")
+	certDir := filepath.Join(dir, "certs")
+	if _, err := certmanage.Execute("init", certmanage.Options{
+		ServerConfig:    cfgPath,
+		Dir:             certDir,
+		ClientConfigDir: filepath.Dir(cfgPath),
+		Name:            "alice",
+		Hosts:           "localhost,127.0.0.1",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	writeCSR := func(cn, name string) string {
+		_, priv, err := ed25519.GenerateKey(rand.Reader)
+		if err != nil {
+			t.Fatal(err)
+		}
+		der, err := x509.CreateCertificateRequest(rand.Reader, &x509.CertificateRequest{Subject: pkix.Name{CommonName: cn}}, priv)
+		if err != nil {
+			t.Fatal(err)
+		}
+		p := filepath.Join(dir, name)
+		if err := os.WriteFile(p, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE REQUEST", Bytes: der}), 0600); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+
+	csrPath := writeCSR("carol", "carol.csr")
+	if _, err := certmanage.Execute("user", certmanage.Options{
+		ServerConfig:    cfgPath,
+		Dir:             certDir,
+		ClientConfigDir: filepath.Dir(cfgPath),
+		Name:            "carol",
+		CSR:             csrPath,
+		Days:            30,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := certmanage.Execute("policy", certmanage.Options{
+		ServerConfig:    cfgPath,
+		Dir:             certDir,
+		ClientConfigDir: filepath.Dir(cfgPath),
+		Name:            "carol",
+		Policy:          &certmanage.UserPolicy{Disabled: true, Permissions: []string{"download"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	m := newServerModel(ServerOptions{ExecutableDir: dir, ConfigPath: cfgPath, Page: 1})
+	m.Update(tea.WindowSizeMsg{Width: 110, Height: 32})
+	m.Update(m.loadConfigCmd()())
+
+	// 1. 后台任务执行期间按 q 不得直接退出
+	m.busy = true
+	_, qCmd := m.Update(keyRune('q'))
+	if qCmd != nil {
+		t.Fatal("expected q to be blocked while busy")
+	}
+	m.busy = false
+
+	// 2. 新建用户校验重复用户名与保留名，禁止提前关闭弹窗
+	m.openNewUserModal()
+	m.formInputs[0].SetValue("alice")
+	m.Update(keyType(tea.KeyEnter))
+	if m.modal != srvModalNewUser || !strings.Contains(ansi.Strip(m.View()), "已存在") {
+		t.Fatalf("expected duplicate user error inside srvModalNewUser, modal=%v view:\n%s", m.modal, m.View())
+	}
+	m.Update(keyType(tea.KeyEsc))
+
+	// 3. 轮换服务端证书：非法 SAN 在提交前被拦截并聚焦第 0 项
+	m.openRotateServerModal()
+	m.formInputs[0].SetValue("bad host name with spaces")
+	m.formInputs[1].SetValue("30")
+	m.formFocus = len(m.formRows)
+	m.formBtnIdx = 1
+	m.Update(keyType(tea.KeyEnter))
+	if m.modal != srvModalRotateServer || m.formFocus != 0 {
+		t.Fatalf("expected invalid SAN to keep srvModalRotateServer open and focus SAN field, modal=%v focus=%d", m.modal, m.formFocus)
+	}
+	m.Update(keyType(tea.KeyEsc))
+
+	// 4. 对 ExternalKey CSR 用户 carol 按 w 必须弹出 CSR 续期弹窗，校验 CSR 文件并保留 Disabled 状态
+	m.cursors[1] = 1 // carol
+	m.Update(keyRune('w'))
+	if m.modal != srvModalCSR || m.formInputs[0].Value() != "carol" || m.targetUser == nil {
+		t.Fatalf("expected w on ExternalKey user to open prefilled srvModalCSR, modal=%v user=%q target=%v", m.modal, m.formInputs[0].Value(), m.targetUser)
+	}
+	// 不存在的 CSR 路径不得关闭弹窗
+	m.formInputs[1].SetValue(filepath.Join(dir, "missing.csr"))
+	m.formInputs[2].SetValue("60")
+	m.formFocus = len(m.formRows)
+	m.formBtnIdx = 1
+	m.Update(keyType(tea.KeyEnter))
+	if m.modal != srvModalCSR || m.formFocus != 1 {
+		t.Fatalf("expected missing CSR to keep modal open on path row, modal=%v focus=%d", m.modal, m.formFocus)
+	}
+	// 提供新 CSR 并提交后完成续期，且必须保留原 Disabled 状态
+	nextCSR := writeCSR("carol", "carol-renew.csr")
+	m.formInputs[1].SetValue(nextCSR)
+	_, submitCmd := m.Update(keyType(tea.KeyEnter))
+	if submitCmd == nil {
+		t.Fatal("expected valid CSR renewal submit cmd")
+	}
+	m.Update(submitCmd())
+	m.Update(m.loadConfigCmd()())
+	if len(m.cfg.AuthorizedClients) < 2 || !m.cfg.AuthorizedClients[1].Disabled {
+		t.Fatalf("expected carol Disabled state preserved after CSR renewal: %+v", m.cfg.AuthorizedClients)
 	}
 }

@@ -44,7 +44,13 @@ func (m *serverModel) beginDeployWizard() {
 		if base == "" {
 			base = "."
 		}
-		d := setup.DefaultDeployment(m.opts.ConfigPath, base)
+		cfgPath := m.opts.ConfigPath
+		if cfgPath != "" && !filepath.IsAbs(cfgPath) {
+			if abs, err := filepath.Abs(cfgPath); err == nil {
+				cfgPath = abs
+			}
+		}
+		d := setup.DefaultDeployment(cfgPath, base)
 		d.Storage = filepath.Join("var", "storage")
 		def := config.DefaultServer()
 		m.deploy = &deployWizardDraft{
@@ -73,6 +79,7 @@ func (m *serverModel) openDeployStep(step int) {
 	}
 	w.step = step
 	m.resetForm()
+	m.statusToast = ""
 	m.modal = srvModalDeployWizard
 
 	switch step {
@@ -361,13 +368,13 @@ func (m *serverModel) openDeployStep(step int) {
 		if w.d.LogMaxBytes == 0 {
 			w.d.LogMaxBytes = def.Logging.MaxFileBytes
 		}
-		burstIdx := m.addSizeUnitRow("默认单用户带宽突发量", w.d.Burst, false)
-		logIdx := m.addSizeUnitRow("日志单文件上限 (64 KiB–1 GiB)", w.d.LogMaxBytes, false)
+		burstIdx := m.addKeyedSizeUnitRow("bandwidth.burst_bytes", "默认单用户带宽突发量", w.d.Burst, false)
+		logIdx := m.addKeyedSizeUnitRow("logging.max_file_bytes", "日志单文件上限 (64 KiB–1 GiB)", w.d.LogMaxBytes, false)
 		var gUpIdx, gDnIdx, gBurIdx int
 		if w.useGlobal {
-			gUpIdx = m.addSizeUnitRow("全局总上传带宽", w.globalUp, true)
-			gDnIdx = m.addSizeUnitRow("全局总下载带宽", w.globalDown, true)
-			gBurIdx = m.addSizeUnitRow("全局总带宽突发量", w.globalBur, false)
+			gUpIdx = m.addKeyedSizeUnitRow("global_bandwidth.upload", "全局总上传带宽", w.globalUp, true)
+			gDnIdx = m.addKeyedSizeUnitRow("global_bandwidth.download", "全局总下载带宽", w.globalDown, true)
+			gBurIdx = m.addKeyedSizeUnitRow("global_bandwidth.burst", "全局总带宽突发量", w.globalBur, false)
 		}
 
 		draft := config.DefaultServer()
@@ -381,9 +388,9 @@ func (m *serverModel) openDeployStep(step int) {
 			_, key, _ := strings.Cut(f.Path, ".")
 			if key == "chunk_size" || key == "window_size" {
 				advIsSize[i] = true
-				advInputIdx[i] = m.addSizeUnitRow(settingLabel(key), f.Uint(), false)
+				advInputIdx[i] = m.addKeyedSizeUnitRow(f.Path, settingLabel(key), f.Uint(), false)
 			} else {
-				advInputIdx[i] = m.addTextRow(settingLabel(key), strconv.FormatUint(f.Uint(), 10))
+				advInputIdx[i] = m.addKeyedTextRow(f.Path, settingLabel(key), strconv.FormatUint(f.Uint(), 10))
 			}
 		}
 
@@ -439,14 +446,24 @@ func (m *serverModel) openDeployStep(step int) {
 			}
 			l, t, r := draft.Limits, draft.Timeouts, draft.Resources
 			w.d.Limits, w.d.Timeouts, w.d.Resources = &l, &t, &r
-			if strict && w.d.LogMaxBytes < 64<<10 || (strict && w.d.LogMaxBytes > 1<<30) {
-				return logIdx, fmt.Errorf("日志单文件上限须在 64 KiB–1 GiB 之间")
-			}
-			if strict && w.d.Limits.ChunkSize > w.d.Limits.WindowSize {
-				for i, f := range advFields {
-					if f.Path == "limits.chunk_size" {
-						return advInputIdx[i], fmt.Errorf("分块上限不能大于流接收窗口")
-					}
+			if strict {
+				full := config.DefaultServer()
+				full.Bandwidth = config.Bandwidth{
+					UploadBytesPerSecond:   w.d.Upload,
+					DownloadBytesPerSecond: w.d.Download,
+					BurstBytes:             w.d.Burst,
+				}
+				full.GlobalBandwidth = w.d.GlobalBandwidth
+				full.Logging.MaxFileBytes = w.d.LogMaxBytes
+				full.Limits = draft.Limits
+				full.Timeouts = draft.Timeouts
+				full.Resources = draft.Resources
+				full.Resources.MaxFileBytes = w.d.MaxFile
+				full.Resources.UserStorageBytes = w.d.UserStorage
+				full.TLS = config.TLSFiles{CACertificate: "ca.pem", Certificate: "server.pem", PrivateKey: "server-key.pem"}
+				full.AuthorizedClients = []config.AuthorizedClient{{UserID: "user", Certificate: "user.pem"}}
+				if err := full.ValidateDraft(); err != nil {
+					return m.settingsValidationFocus(full, err, burstIdx), err
 				}
 			}
 			return -1, nil
@@ -497,6 +514,16 @@ func (m *serverModel) openDeployStep(step int) {
 				progress.FormatRate(float64(d.GlobalBandwidth.DownloadBytesPerSecond)),
 				progress.FormatBytes(d.GlobalBandwidth.BurstBytes)))
 		}
+		if d.Limits != nil && d.Timeouts != nil && d.Resources != nil {
+			summary = append(summary,
+				fmt.Sprintf("高级流控与资源：每连接流=%d · 分块=%s · 窗口=%s · 最大连接=%d · 并发握手=%d",
+					d.Limits.MaxStreams, progress.FormatBytes(uint64(d.Limits.ChunkSize)),
+					progress.FormatBytes(uint64(d.Limits.WindowSize)), d.Resources.MaxConnections, d.Resources.MaxHandshakes),
+				fmt.Sprintf("突发/日志/超时：默认突发 %s · 日志上限 %s · 握手=%ds / 空闲=%ds",
+					progress.FormatBytes(d.Burst), progress.FormatBytes(d.LogMaxBytes),
+					d.Timeouts.HandshakeSeconds, d.Timeouts.IdleSeconds),
+			)
+		}
 		if w.summaryErr != "" {
 			m.addNoteRow([]string{"保存失败：" + w.summaryErr}, true)
 		}
@@ -510,7 +537,7 @@ func (m *serverModel) openDeployStep(step int) {
 			m.busy = true
 			m.modal = srvModalNone
 			m.statusToast = "正在生成证书与初始化部署…"
-			cfgPath := m.opts.ConfigPath
+			cfgPath := d.Config
 			return m, func() tea.Msg {
 				if _, err := setup.InitializeDeployment(d); err != nil {
 					return deployInitDoneMsg{d: d, err: err}
@@ -608,18 +635,19 @@ func (m *serverModel) rebuildBasicSettingsForm() {
 		return
 	}
 	m.resetForm()
+	m.statusToast = ""
 	m.modal = srvModalEditSettings
 	m.addNoteRow([]string{
 		"说明：除全局总带宽可通过 [A] 热加载外，其余设置修改保存后需重启 sftd 生效。",
 	}, false)
-	listenIdx := m.addTextRow("监听地址 (listen)", c.Listen)
-	storageIdx := m.addTextRow("存储根目录 (storage_root)", c.StorageRoot)
-	upIdx := m.addSizeUnitRow("默认上传带宽", c.Bandwidth.UploadBytesPerSecond, true)
-	dnIdx := m.addSizeUnitRow("默认下载带宽", c.Bandwidth.DownloadBytesPerSecond, true)
-	burIdx := m.addSizeUnitRow("默认突发配额", c.Bandwidth.BurstBytes, false)
-	maxIdx := m.addSizeUnitRow("单文件大小上限", c.Resources.MaxFileBytes, false)
-	quotaIdx := m.addSizeUnitRow("每用户存储上限", c.Resources.UserStorageBytes, false)
-	logIdx := m.addSizeUnitRow("日志单文件上限 (64 KiB–1 GiB)", c.Logging.MaxFileBytes, false)
+	listenIdx := m.addKeyedTextRow("listen", "监听地址 (listen)", c.Listen)
+	storageIdx := m.addKeyedTextRow("storage_root", "存储根目录 (storage_root)", c.StorageRoot)
+	upIdx := m.addKeyedSizeUnitRow("bandwidth.upload_bytes_per_second", "默认上传带宽", c.Bandwidth.UploadBytesPerSecond, true)
+	dnIdx := m.addKeyedSizeUnitRow("bandwidth.download_bytes_per_second", "默认下载带宽", c.Bandwidth.DownloadBytesPerSecond, true)
+	burIdx := m.addKeyedSizeUnitRow("bandwidth.burst_bytes", "默认突发配额", c.Bandwidth.BurstBytes, false)
+	maxIdx := m.addKeyedSizeUnitRow("resources.max_file_bytes", "单文件大小上限", c.Resources.MaxFileBytes, false)
+	quotaIdx := m.addKeyedSizeUnitRow("resources.user_storage_bytes", "每用户存储上限", c.Resources.UserStorageBytes, false)
+	logIdx := m.addKeyedSizeUnitRow("logging.max_file_bytes", "日志单文件上限 (64 KiB–1 GiB)", c.Logging.MaxFileBytes, false)
 
 	useGlobal := c.GlobalBandwidth != nil
 	gb := config.Bandwidth{
@@ -632,9 +660,9 @@ func (m *serverModel) rebuildBasicSettingsForm() {
 	}
 	var gUpIdx, gDnIdx, gBurIdx int
 	if useGlobal {
-		gUpIdx = m.addSizeUnitRow("全局总上传带宽", gb.UploadBytesPerSecond, true)
-		gDnIdx = m.addSizeUnitRow("全局总下载带宽", gb.DownloadBytesPerSecond, true)
-		gBurIdx = m.addSizeUnitRow("全局总带宽突发量", gb.BurstBytes, false)
+		gUpIdx = m.addKeyedSizeUnitRow("global_bandwidth.upload", "全局总上传带宽", gb.UploadBytesPerSecond, true)
+		gDnIdx = m.addKeyedSizeUnitRow("global_bandwidth.download", "全局总下载带宽", gb.DownloadBytesPerSecond, true)
+		gBurIdx = m.addKeyedSizeUnitRow("global_bandwidth.burst", "全局总带宽突发量", gb.BurstBytes, false)
 	}
 
 	captureBasic := func(strict bool) (int, error) {
@@ -699,7 +727,7 @@ func (m *serverModel) rebuildBasicSettingsForm() {
 				return logIdx, fmt.Errorf("日志单文件上限须在 64 KiB–1 GiB 之间")
 			}
 			if err := c.ValidateDraft(); err != nil {
-				return upIdx, err
+				return m.settingsValidationFocus(*c, err, upIdx), err
 			}
 		}
 		return -1, nil
@@ -755,6 +783,7 @@ func (m *serverModel) openAdvancedSettingsModal() {
 	}
 	c := m.settingsDraft
 	m.resetForm()
+	m.statusToast = ""
 	m.modal = srvModalEditAdvancedSettings
 	m.addNoteRow([]string{
 		"高级协议、超时与资源限额（↑↓/Tab/鼠标浏览完整 18 项配置，全部项保存后重启服务生效）：",
@@ -767,9 +796,9 @@ func (m *serverModel) openAdvancedSettingsModal() {
 		_, key, _ := strings.Cut(f.Path, ".")
 		if key == "chunk_size" || key == "window_size" {
 			isSize[i] = true
-			idxMap[i] = m.addSizeUnitRow(settingLabel(key), f.Uint(), false)
+			idxMap[i] = m.addKeyedSizeUnitRow(f.Path, settingLabel(key), f.Uint(), false)
 		} else {
-			idxMap[i] = m.addTextRow(settingLabel(key), strconv.FormatUint(f.Uint(), 10))
+			idxMap[i] = m.addKeyedTextRow(f.Path, settingLabel(key), strconv.FormatUint(f.Uint(), 10))
 		}
 	}
 
@@ -790,12 +819,7 @@ func (m *serverModel) openAdvancedSettingsModal() {
 			}
 		}
 		if err := c.ValidateDraft(); err != nil {
-			for i, f := range fields {
-				if f.Path == "limits.chunk_size" {
-					return idxMap[i], err
-				}
-			}
-			return 0, err
+			return m.settingsValidationFocus(*c, err, idxMap[0]), err
 		}
 		return -1, nil
 	}
@@ -823,6 +847,7 @@ func (m *serverModel) openLogLimitModal() {
 		return
 	}
 	m.resetForm()
+	m.statusToast = ""
 	m.modal = srvModalEditLogLimit
 	m.addNoteRow([]string{
 		"日志单文件大小上限 (64 KiB–1 GiB)；写满后自动清空旧内容重用当前文件，保存后需重启生效。",
@@ -872,7 +897,11 @@ func (m *serverModel) saveServerSettingsCmd(proposed config.Server) (tea.Model, 
 		}
 		notice := "配置已保存到磁盘"
 		if gbChanged {
-			if applied, rErr := control.Reload(cfgPath, saved.StorageRoot); rErr == nil && applied {
+			applied, rErr := control.Reload(cfgPath, saved.StorageRoot)
+			switch {
+			case rErr != nil:
+				notice += "；但热重载运行中服务失败：" + rErr.Error()
+			case applied:
 				notice += "（全局总带宽已热重载生效）"
 			}
 		}
@@ -881,4 +910,109 @@ func (m *serverModel) saveServerSettingsCmd(proposed config.Server) (tea.Model, 
 		}
 		return serverActionResultMsg{notice: notice, refresh: true, poll: true}
 	}
+}
+
+func (m *serverModel) settingsValidationFocus(c config.Server, err error, fallbackIdx int) int {
+	msg := err.Error()
+	pick := func(key string) (int, bool) {
+		return m.inputByKey(key)
+	}
+	switch {
+	case strings.Contains(msg, "全局带宽"):
+		if c.GlobalBandwidth != nil {
+			switch {
+			case c.GlobalBandwidth.UploadBytesPerSecond == 0:
+				if idx, ok := pick("global_bandwidth.upload"); ok {
+					return idx
+				}
+			case c.GlobalBandwidth.DownloadBytesPerSecond == 0:
+				if idx, ok := pick("global_bandwidth.download"); ok {
+					return idx
+				}
+			default:
+				if idx, ok := pick("global_bandwidth.burst"); ok {
+					return idx
+				}
+			}
+		}
+	case strings.Contains(msg, "突发量"), strings.Contains(msg, "带宽必须为正"):
+		switch {
+		case c.Bandwidth.UploadBytesPerSecond == 0:
+			if idx, ok := pick("bandwidth.upload_bytes_per_second"); ok {
+				return idx
+			}
+		case c.Bandwidth.DownloadBytesPerSecond == 0:
+			if idx, ok := pick("bandwidth.download_bytes_per_second"); ok {
+				return idx
+			}
+		default:
+			if idx, ok := pick("bandwidth.burst_bytes"); ok {
+				return idx
+			}
+		}
+	case strings.Contains(msg, "日志文件大小"):
+		if idx, ok := pick("logging.max_file_bytes"); ok {
+			return idx
+		}
+	case strings.Contains(msg, "分块"), strings.Contains(msg, "窗口"):
+		if c.Limits.MaxStreams <= 0 {
+			if idx, ok := pick("limits.max_streams"); ok {
+				return idx
+			}
+		}
+		if c.Limits.WindowSize < c.Limits.ChunkSize || c.Limits.WindowSize <= 0 {
+			if idx, ok := pick("limits.window_size"); ok {
+				return idx
+			}
+		}
+		if idx, ok := pick("limits.chunk_size"); ok {
+			return idx
+		}
+	case strings.Contains(msg, "超时"):
+		checks := []struct {
+			bad bool
+			key string
+		}{
+			{c.Timeouts.HandshakeSeconds <= 0, "timeouts.handshake_seconds"},
+			{c.Timeouts.HelloSeconds <= 0, "timeouts.hello_seconds"},
+			{c.Timeouts.FrameReadSeconds <= 0, "timeouts.frame_read_seconds"},
+			{c.Timeouts.WriteSeconds <= 0, "timeouts.write_seconds"},
+			{c.Timeouts.IdleSeconds <= 0, "timeouts.idle_seconds"},
+		}
+		for _, ch := range checks {
+			if ch.bad {
+				if idx, ok := pick(ch.key); ok {
+					return idx
+				}
+			}
+		}
+	default:
+		checks := []struct {
+			bad bool
+			key string
+		}{
+			{strings.TrimSpace(c.Listen) == "", "listen"},
+			{strings.TrimSpace(c.StorageRoot) == "", "storage_root"},
+			{c.Resources.MaxFileBytes == 0, "resources.max_file_bytes"},
+			{c.Resources.UserStorageBytes < c.Resources.MaxFileBytes || c.Resources.UserStorageBytes == 0, "resources.user_storage_bytes"},
+			{c.Resources.MaxConnections <= 0, "resources.max_connections"},
+			{c.Resources.MaxHandshakes <= 0 || c.Resources.MaxHandshakes > c.Resources.MaxConnections, "resources.max_handshakes"},
+			{c.Resources.MaxUnauthenticatedPerIP <= 0, "resources.max_unauthenticated_per_ip"},
+			{c.Resources.MaxConnectionsPerUser <= 0, "resources.max_connections_per_user"},
+			{c.Resources.MaxStreamsPerUser <= 0, "resources.max_streams_per_user"},
+			{c.Resources.MaxPendingTransfersPerUser <= 0, "resources.max_pending_transfers_per_user"},
+			{c.Resources.MaxFilesPerUser <= 0, "resources.max_files_per_user"},
+			{c.Resources.MaxNewTasksPerMinute <= 0, "resources.max_new_tasks_per_minute"},
+			{c.Resources.MaxUploadCheckpointsPerSecond <= 0, "resources.max_upload_checkpoints_per_second"},
+			{c.Resources.TransferRetentionSeconds <= 0, "resources.transfer_retention_seconds"},
+		}
+		for _, ch := range checks {
+			if ch.bad {
+				if idx, ok := pick(ch.key); ok {
+					return idx
+				}
+			}
+		}
+	}
+	return fallbackIdx
 }

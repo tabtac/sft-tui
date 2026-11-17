@@ -2,6 +2,7 @@ package tui
 
 import (
 	"fmt"
+	"reflect"
 	"strings"
 	"time"
 
@@ -137,7 +138,7 @@ func (m *serverModel) renderFooter() string {
 	default:
 		hints = "日志：[p] 暂停/跟随实时日志  [l] 最低等级(" + logLevelLabel(m.logMinLevel) + ")  [L] 日志上限  [/] 关键字过滤  [Enter] 详情"
 	}
-	return m.th.footerBar.Width(m.width).Render(hints)
+	return m.th.footerBar.Width(m.width).Render(truncCell(hints, max(1, m.width-2)))
 }
 
 func logLevelLabel(l string) string {
@@ -249,7 +250,7 @@ func (m *serverModel) renderOverviewPage(bodyH int) string {
 			if i == m.cursors[0] {
 				peerLines = append(peerLines, m.th.rowCursor.Render(padRightCell(line, innerW)))
 			} else {
-				peerLines = append(peerLines, line)
+				peerLines = append(peerLines, truncCell(line, innerW))
 			}
 		}
 	}
@@ -331,7 +332,7 @@ func (m *serverModel) renderUsersPage(bodyH int) string {
 			if i == m.cursors[1] {
 				lines = append(lines, m.th.rowCursor.Render(padRightCell(row, innerW)))
 			} else {
-				lines = append(lines, row)
+				lines = append(lines, truncCell(row, innerW))
 			}
 		}
 	}
@@ -366,7 +367,7 @@ func (m *serverModel) renderTransfersPage(bodyH int) string {
 			if i == m.cursors[2] {
 				lines = append(lines, m.th.rowCursor.Render(padRightCell(row, innerW)))
 			} else {
-				lines = append(lines, row)
+				lines = append(lines, truncCell(row, innerW))
 			}
 		}
 	}
@@ -413,7 +414,7 @@ func (m *serverModel) renderCertsPage(bodyH int) string {
 			if i == m.cursors[3] {
 				lines = append(lines, m.th.rowCursor.Render(padRightCell(row, innerW)))
 			} else {
-				lines = append(lines, row)
+				lines = append(lines, truncCell(row, innerW))
 			}
 		}
 	}
@@ -424,10 +425,13 @@ func (m *serverModel) settingsLines() []string {
 	c := m.cfg
 	diffTag := m.th.badgeMuted.Render("（服务离线，修改配置启动后生效）")
 	if m.runtime != nil {
-		if config.RestartRequired(m.runtime.Config, c) {
+		switch {
+		case config.RestartRequired(m.runtime.Config, c):
 			diffTag = m.th.badgeWarn.Render("⚠ 磁盘配置与运行实例存在非热更差异（需重启生效）")
-		} else {
-			diffTag = m.th.badgeOk.Render("✔ 磁盘配置与运行实例基本设置一致")
+		case !reflect.DeepEqual(m.runtime.Config, c):
+			diffTag = m.th.badgeWarn.Render("⚠ 磁盘配置与运行实例存在未热加载的差异（按 [A] 应用热加载）")
+		default:
+			diffTag = m.th.badgeOk.Render("✔ 磁盘配置与运行实例一致")
 		}
 	}
 	gbLine := "未启用（仅受单用户策略与全局物理接口限制）"
@@ -477,6 +481,7 @@ func (m *serverModel) settingsLines() []string {
 }
 
 func (m *serverModel) renderSettingsPage(bodyH int) string {
+	innerW := max(20, m.width-4)
 	visRows := max(1, bodyH-3)
 	var lines []string
 	if m.cfgErr != nil {
@@ -489,9 +494,9 @@ func (m *serverModel) renderSettingsPage(bodyH int) string {
 		for i := start; i < end; i++ {
 			ln := all[i]
 			if i == m.cursors[4] {
-				lines = append(lines, m.th.rowCursor.Render("▸ "+ln))
+				lines = append(lines, m.th.rowCursor.Render(truncCell("▸ "+ln, innerW)))
 			} else {
-				lines = append(lines, ln)
+				lines = append(lines, truncCell(ln, innerW))
 			}
 		}
 	}
@@ -519,7 +524,7 @@ func (m *serverModel) renderLogsPage(bodyH int) string {
 		raw := strings.Split(strings.TrimRight(m.logFallback, "\n"), "\n")
 		start := scrollOffset(m.cursors[5], len(raw), visRows)
 		for i := start; i < min(len(raw), start+visRows); i++ {
-			lines = append(lines, truncCell(raw[i], innerW))
+			lines = append(lines, truncCell(sanitizeInline(raw[i]), innerW))
 		}
 	case len(m.logEvents) == 0:
 		lines = append(lines, m.th.badgeMuted.Render("（暂无匹配日志事件）"))
@@ -531,7 +536,7 @@ func (m *serverModel) renderLogsPage(bodyH int) string {
 			if i == m.cursors[5] {
 				mark = "▶ "
 			}
-			row := fmt.Sprintf("%s#%d %s [%s] %s %s", mark, e.Sequence, e.Time.Local().Format("15:04:05"), e.Level, e.Message, e.Detail)
+			row := fmt.Sprintf("%s#%d %s [%s] %s %s", mark, e.Sequence, e.Time.Local().Format("15:04:05"), e.Level, sanitizeInline(e.Message), sanitizeInline(e.Detail))
 			if i == m.cursors[5] {
 				lines = append(lines, m.th.rowCursor.Render(truncCell(row, innerW)))
 			} else {
@@ -624,8 +629,7 @@ func (m *serverModel) renderModal(base string) string {
 		return view
 	}
 
-	boxW := min(max(44, m.width-4), 86)
-	innerW := boxW - 6
+	_, innerW := modalBoxDimensions(m.width)
 	lines, footer := m.renderFormLines(innerW)
 	return renderModalBox(m.width, m.height, m.th, m.modalTitle(), lines, footer)
 }
