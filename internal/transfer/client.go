@@ -348,6 +348,7 @@ func clearTaskCheckpoint(t *queue.Task) {
 	t.TempName = ""
 	t.TempDevice = 0
 	t.TempInode = 0
+	t.Publishing = false
 	t.Published = false
 }
 
@@ -661,10 +662,16 @@ func (c *Client) executeDownload(ctx context.Context, task *queue.Task, op *queu
 		return result, fmt.Errorf("下载临时文件名与任务状态键不匹配")
 	}
 
-	// 检查最终发布目标是否存在（禁止覆盖未由本断点发布的已有文件）
-	if _, statErr := root.Lstat(base); statErr == nil {
+	// 检查最终发布目标是否存在（禁止覆盖未由本断点发布的已有文件；兼容 Link/Rename 后、SQLite 持久化前的崩溃恢复）
+	if baseStat, statErr := root.Lstat(base); statErr == nil {
 		if !task.Published {
-			return result, fmt.Errorf("下载目标已存在，禁止覆盖：%s", absPath)
+			recovered, recErr := recoverCrashPublished(runCtx, root, base, baseStat, tempName, task, update)
+			if recErr != nil {
+				return result, recErr
+			}
+			if !recovered {
+				return result, fmt.Errorf("下载目标已存在，禁止覆盖：%s", absPath)
+			}
 		}
 	} else if !os.IsNotExist(statErr) {
 		return result, statErr
@@ -934,17 +941,33 @@ func (c *Client) executeDownload(ctx context.Context, task *queue.Task, op *queu
 			return result, &protocol.RemoteError{Code: protocol.CodeHashMismatch, Message: "下载文件 SHA-256 校验失败"}
 		}
 
-		// 防覆盖发布：先确定目标不存在，再在 pal.Root 内硬链接/重命名发布
+		// 防覆盖发布：先确定目标不存在，记录 Publishing 标记，再在 pal.Root 内硬链接/重命名发布
 		if _, err = root.Lstat(base); err == nil {
 			return result, fmt.Errorf("下载目标已存在，禁止覆盖：%s", absPath)
 		} else if !os.IsNotExist(err) {
 			return result, err
 		}
+		if !task.Publishing {
+			if err = update(func(cur *queue.Task) {
+				cur.Publishing = true
+			}); err != nil {
+				return result, err
+			}
+			task.Publishing = true
+		}
 		if linkErr := root.Link(tempName, base); linkErr != nil {
 			if errors.Is(linkErr, os.ErrExist) || os.IsExist(linkErr) {
+				_ = update(func(cur *queue.Task) {
+					cur.Publishing = false
+				})
+				task.Publishing = false
 				return result, fmt.Errorf("下载目标已存在，禁止覆盖：%s", absPath)
 			}
 			if renameErr := root.Rename(tempName, base); renameErr != nil {
+				_ = update(func(cur *queue.Task) {
+					cur.Publishing = false
+				})
+				task.Publishing = false
 				return result, fmt.Errorf("发布下载文件失败：%w", renameErr)
 			}
 		}
@@ -952,10 +975,12 @@ func (c *Client) executeDownload(ctx context.Context, task *queue.Task, op *queu
 
 		if err = update(func(cur *queue.Task) {
 			cur.Published = true
+			cur.Publishing = false
 		}); err != nil {
 			return result, err
 		}
 		task.Published = true
+		task.Publishing = false
 	}
 
 	if err = st.SendContext(st.Context(), protocol.TypeAck, protocol.Ack{NextOffset: size}); err != nil {
@@ -1203,6 +1228,57 @@ func (c *Client) abortCheckpoint(parent context.Context, task *queue.Task, updat
 		}
 		return err
 	}
+}
+
+func recoverCrashPublished(ctx context.Context, root *pal.Root, base string, baseStat os.FileInfo, tempName string, task *queue.Task, update CheckpointUpdater) (bool, error) {
+	if task.TempName != tempName || task.TransferID == "" || task.SHA256 == "" {
+		return false, nil
+	}
+	if baseStat.Mode()&os.ModeSymlink != 0 || !baseStat.Mode().IsRegular() || uint64(baseStat.Size()) != task.Size {
+		return false, nil
+	}
+	expected, err := decodeDigestHex(task.SHA256)
+	if err != nil {
+		return false, nil
+	}
+
+	bf, err := root.OpenFile(base, os.O_RDONLY, 0)
+	if err != nil {
+		return false, err
+	}
+	devB, inoB, _, idBErr := pal.FileIdentity(bf)
+	actual, actualSize, hashErr := pal.DigestReaderContext(ctx, bf)
+	_ = bf.Close()
+	if idBErr != nil || hashErr != nil || actualSize != task.Size || actual != expected {
+		return false, nil
+	}
+
+	matchedTemp := false
+	if tf, err := root.OpenFile(tempName, os.O_RDONLY, 0); err == nil {
+		devT, inoT, _, idTErr := pal.FileIdentity(tf)
+		_ = tf.Close()
+		if idTErr == nil && devB == devT && inoB == inoT &&
+			(task.TempInode == 0 || (devT == task.TempDevice && inoT == task.TempInode)) {
+			matchedTemp = true
+		}
+	} else if task.Publishing && os.IsNotExist(err) {
+		matchedTemp = true
+	}
+	if !matchedTemp {
+		return false, nil
+	}
+
+	if err = update(func(cur *queue.Task) {
+		cur.Done = task.Size
+		cur.Published = true
+		cur.Publishing = false
+	}); err != nil {
+		return false, err
+	}
+	task.Done = task.Size
+	task.Published = true
+	task.Publishing = false
+	return true, nil
 }
 
 func removeDownloadPart(root *pal.Root, t queue.Task) error {

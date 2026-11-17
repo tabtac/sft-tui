@@ -23,6 +23,7 @@ import (
 type ServerHooks struct {
 	Authorize        func(user, operation string) (security.Principal, error)
 	AcquireStream    func(user string, bw config.Bandwidth) (release func(), err error)
+	AcquireList      func(user string, bw config.Bandwidth) (release func(), err error)
 	WaitBandwidth    func(ctx context.Context, user string, bw config.Bandwidth, dir protocol.Direction, n int) error
 	WaitCheckpoint   func(ctx context.Context, user string, bw config.Bandwidth) error
 	OnConnect        func(user, remote string) (connID uint64, ok bool)
@@ -269,6 +270,13 @@ func (s *Server) acquireStream(user string, bw config.Bandwidth) (func(), error)
 	return func() {}, nil
 }
 
+func (s *Server) acquireList(user string, bw config.Bandwidth) (func(), error) {
+	if s.hooks.AcquireList != nil {
+		return s.hooks.AcquireList(user, bw)
+	}
+	return s.acquireStream(user, bw)
+}
+
 func (s *Server) waitBandwidth(ctx context.Context, user string, bw config.Bandwidth, dir protocol.Direction, n int) error {
 	if s.hooks.WaitBandwidth != nil && n > 0 {
 		return s.hooks.WaitBandwidth(ctx, user, bw, dir, n)
@@ -334,7 +342,7 @@ func (s *Server) runStream(user string, st *session.Stream, initial protocol.Fra
 	if err != nil {
 		return err
 	}
-	release, err := s.acquireStream(user, principal.Bandwidth)
+	release, err := s.acquireList(user, principal.Bandwidth)
 	if err != nil {
 		return err
 	}
@@ -357,7 +365,7 @@ func (s *Server) runList(user string, st *session.Stream, initial protocol.Frame
 	if err != nil {
 		return err
 	}
-	release, err := s.acquireStream(user, principal.Bandwidth)
+	release, err := s.acquireList(user, principal.Bandwidth)
 	if err != nil {
 		return err
 	}

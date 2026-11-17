@@ -102,13 +102,22 @@ func (u *Users) getLocked(user string, b config.Bandwidth) *allowance {
 
 // Acquire 检查单用户最大并发流数及每分钟新建任务频率，并返回幂等的释放函数。
 func (u *Users) Acquire(user string, b config.Bandwidth) (func(), error) {
+	return u.acquire(user, b, true)
+}
+
+// AcquireList 仅检查并占用单用户最大并发流数，不消耗每分钟新建任务频率配额。
+func (u *Users) AcquireList(user string, b config.Bandwidth) (func(), error) {
+	return u.acquire(user, b, false)
+}
+
+func (u *Users) acquire(user string, b config.Bandwidth, consumeTaskQuota bool) (func(), error) {
 	u.mu.Lock()
 	a := u.getLocked(user, b)
 	if a.streams >= u.maxStreams {
 		u.mu.Unlock()
 		return nil, &protocol.RemoteError{Code: protocol.CodeQuotaExceeded, Message: "用户活跃流超限"}
 	}
-	if !a.tasks.Allow() {
+	if consumeTaskQuota && !a.tasks.Allow() {
 		u.mu.Unlock()
 		return nil, &protocol.RemoteError{Code: protocol.CodeTempUnavailable, Message: "用户任务初始化频率超限"}
 	}

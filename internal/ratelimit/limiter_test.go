@@ -112,6 +112,40 @@ func TestStreamAndRequestLimits(t *testing.T) {
 	other()
 }
 
+func TestAcquireListDoesNotConsumeNewTaskQuota(t *testing.T) {
+	u := New(1, 1, 64)
+	b := config.DefaultServer().Bandwidth
+
+	for i := 0; i < 10; i++ {
+		rel, err := u.AcquireList("alice", b)
+		if err != nil {
+			t.Fatalf("AcquireList #%d failed: %v", i, err)
+		}
+		// 并发数仍受 maxStreams 限制
+		if _, err := u.AcquireList("alice", b); err == nil {
+			t.Fatal("AcquireList bypassed maxStreams")
+		}
+		rel()
+	}
+
+	// 即使连续 List 多次，新建传输配额仍完好
+	rel, err := u.Acquire("alice", b)
+	if err != nil {
+		t.Fatalf("Acquire after lists failed: %v", err)
+	}
+	rel()
+
+	// 新建任务配额耗尽后，AcquireList 仍不受新建任务配额阻断
+	if _, err := u.Acquire("alice", b); err == nil {
+		t.Fatal("expected second Acquire to hit tasksPerMinute limit")
+	}
+	listRel, err := u.AcquireList("alice", b)
+	if err != nil {
+		t.Fatalf("AcquireList blocked by tasksPerMinute exhaustion: %v", err)
+	}
+	listRel()
+}
+
 func TestUploadCheckpointBudgetSurvivesPolicyChangesAndCancellation(t *testing.T) {
 	u := New(8, 100, 8)
 	b := config.DefaultServer().Bandwidth

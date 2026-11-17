@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"io"
 	"net"
@@ -672,5 +673,118 @@ func TestPersistedRequestIDCannotBeSilentlyRegenerated(t *testing.T) {
 				t.Errorf("BUG: invalid persisted request ID regenerated: updates=%d err=%v", updates, err)
 			}
 		})
+	}
+}
+
+func TestDownloadCrashAfterLinkPublishRecoversWithoutOverwriteError(t *testing.T) {
+	h := startTestServer(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	c, err := Dial(ctx, h.cliCfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	content := []byte("crash-publish-recovery-payload")
+	digest := sha256.Sum256(content)
+	src := filepath.Join(h.dir, "pub.bin")
+	if err := os.WriteFile(src, content, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.UploadFile(ctx, src, "pub.bin", nil); err != nil {
+		t.Fatal(err)
+	}
+
+	// 启动一条服务端主动下载任务但不走完 Commit，模拟崩溃前已在服务端产生 TransferID
+	dlDir := filepath.Join(h.dir, "crash-pub")
+	if err := os.MkdirAll(dlDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	dst := filepath.Join(dlDir, "pub.bin")
+	key, err := queue.StateKeyForIdentity(c.Identity(), protocol.DirectionDownload, "pub.bin", dst)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	root, err := pal.OpenRoot(dlDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+
+	// 先制造一半下载后暂停（或者新建临时文件并硬链接到 dst，模拟 Link 成功但 Published=false 崩溃）
+	tempName := ".sft-" + key + ".part"
+	tf, err := root.OpenFile(tempName, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tf.Write(content); err != nil {
+		tf.Close()
+		t.Fatal(err)
+	}
+	dev, ino, _, err := pal.FileIdentity(tf)
+	_ = tf.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 硬链接存在（或仅 Rename+Publishing=true）均应安全恢复，但绝不允许外部不同文件通过恢复校验
+	if err := root.Link(tempName, "pub.bin"); err != nil {
+		t.Skipf("hardlink unavailable: %v", err)
+	}
+
+	task := queue.Task{
+		ID:         key,
+		Identity:   c.Identity(),
+		StateKey:   key,
+		Direction:  protocol.DirectionDownload,
+		Remote:     "pub.bin",
+		Path:       dst,
+		Size:       uint64(len(content)),
+		Done:       uint64(len(content)),
+		SHA256:     hex.EncodeToString(digest[:]),
+		TransferID: strings.Repeat("1", 32),
+		TempName:   tempName,
+		TempDevice: dev,
+		TempInode:  ino,
+		Publishing: true,
+		Published:  false,
+	}
+	// TransferID 不存在于服务端（未走 BeginDownload），但先确认 recoverCrashPublished 本身能识别硬链接并推进 Published
+	info, err := root.Lstat("pub.bin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ok, err := recoverCrashPublished(ctx, root, "pub.bin", info, tempName, &task, func(fn func(*queue.Task)) error {
+		fn(&task)
+		return nil
+	})
+	if err != nil || !ok || !task.Published || task.Publishing {
+		t.Fatalf("expected crash publish recovery to succeed: ok=%v err=%v task=%+v", ok, err, task)
+	}
+
+	// 验证外部无关同名文件即使存在也不会被误认为可覆盖/恢复
+	evilDir := filepath.Join(h.dir, "evil-pub")
+	if err := os.MkdirAll(evilDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	evilDst := filepath.Join(evilDir, "pub.bin")
+	if err := os.WriteFile(evilDst, content, 0600); err != nil {
+		t.Fatal(err)
+	}
+	evilRoot, err := pal.OpenRoot(evilDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer evilRoot.Close()
+	evilTask := task
+	evilTask.Path = evilDst
+	evilTask.Published = false
+	evilTask.Publishing = false
+	evilInfo, _ := evilRoot.Lstat("pub.bin")
+	okEvil, err := recoverCrashPublished(ctx, evilRoot, "pub.bin", evilInfo, tempName, &evilTask, func(func(*queue.Task)) error { return nil })
+	if err != nil || okEvil || evilTask.Published {
+		t.Fatalf("unrelated pre-existing target must not be accepted: ok=%v err=%v", okEvil, err)
 	}
 }

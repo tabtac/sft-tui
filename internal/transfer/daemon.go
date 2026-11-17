@@ -61,6 +61,7 @@ func NewDaemonWithLogger(c config.Server, logger *slog.Logger) (*Daemon, error) 
 	rt := monitor.New()
 	hooks := ServerHooks{
 		AcquireStream:    rates.Acquire,
+		AcquireList:      rates.AcquireList,
 		WaitBandwidth:    rates.Wait,
 		WaitCheckpoint:   rates.WaitUploadCheckpoint,
 		OnStreamBegin:    rt.Begin,
@@ -134,6 +135,10 @@ func (d *Daemon) Serve(ctx context.Context, listener net.Listener) error {
 			case now := <-ticker.C:
 				if _, err := d.store.ExpireTasks(ctx, now); err != nil && !errors.Is(err, context.Canceled) {
 					d.logger.Error("任务清理失败", "error", err)
+				}
+				retention := max(24*time.Hour, time.Duration(d.cfg.Resources.TransferRetentionSeconds)*time.Second)
+				if _, err := d.store.CleanupExpired(ctx, retention); err != nil && !errors.Is(err, context.Canceled) {
+					d.logger.Error("过期终态记录清理失败", "error", err)
 				}
 			}
 		}

@@ -150,3 +150,44 @@ func TestDaemonACLRatesConnLimitHotReloadAndGracefulStop(t *testing.T) {
 		t.Fatal("daemon did not shut down gracefully")
 	}
 }
+
+func TestDaemonListDoesNotConsumeNewTaskQuota(t *testing.T) {
+	srvCfg, aliceCfg, _ := daemonFixture(t)
+	srvCfg.Resources.MaxNewTasksPerMinute = 1
+	d, err := NewDaemon(srvCfg)
+	if err != nil {
+		t.Fatalf("NewDaemon: %v", err)
+	}
+	defer d.Close()
+
+	ln, err := net.Listen("tcp", srvCfg.Listen)
+	if err != nil {
+		t.Fatal(err)
+	}
+	aliceCfg.ServerAddress = ln.Addr().String()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = d.Serve(ctx, ln) }()
+
+	opCtx, opCancel := context.WithTimeout(ctx, 10*time.Second)
+	defer opCancel()
+	cli, err := Dial(opCtx, aliceCfg)
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	defer cli.Close()
+
+	for i := 0; i < 5; i++ {
+		if err := cli.ListFiles(opCtx, func(protocol.FileEntry) error { return nil }); err != nil {
+			t.Fatalf("ListFiles #%d failed: %v", i, err)
+		}
+	}
+	src := filepath.Join(t.TempDir(), "ok.bin")
+	if err := os.WriteFile(src, []byte("ok"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := cli.UploadFile(opCtx, src, "ok.bin", nil); err != nil {
+		t.Fatalf("UploadFile after repeated LIST failed: %v", err)
+	}
+}
