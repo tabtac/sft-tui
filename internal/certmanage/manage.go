@@ -195,7 +195,7 @@ func withCertLock(dir string, fn func() error) error {
 	return fn()
 }
 
-// SaveSettings 在证书锁下保留最新热更新证书/授权，原子保存服务端非热更字段。
+// SaveSettings 在证书锁下保留最新热更新证书/授权，原子保存服务端配置（含全局总带宽）。
 func SaveSettings(path, dir string, expected, proposed config.Server) (config.Server, error) {
 	var out config.Server
 	err := withCertLock(dir, func() error {
@@ -203,11 +203,13 @@ func SaveSettings(path, dir string, expected, proposed config.Server) (config.Se
 		if err != nil {
 			return err
 		}
-		if config.RestartRequired(current, expected) {
+		if config.RestartRequired(current, expected) || !reflect.DeepEqual(current.GlobalBandwidth, expected.GlobalBandwidth) {
 			out = current
 			return fmt.Errorf("配置在编辑期间已被修改，请刷新后重新编辑")
 		}
+		gb := proposed.GlobalBandwidth
 		proposed = config.MergeHot(proposed, current)
+		proposed.GlobalBandwidth = gb
 		if err := proposed.ValidateDraft(); err != nil {
 			out = current
 			return err

@@ -79,6 +79,12 @@ func TestServerInitPreservesUsersAndDoesNotWriteOnEOF(t *testing.T) {
 	if err != nil || len(c.AuthorizedClients) != 1 || c.AuthorizedClients[0].Certificate != old.AuthorizedClients[0].Certificate || c.Resources != old.Resources {
 		t.Fatalf("existing settings were lost: %+v %v", c, err)
 	}
+
+	// 开启高级参数输入 y 后可完整配置 Limits/Timeouts/Resources
+	advInput := strings.Repeat("\n", 10) + "y\n" + strings.Repeat("\n", 30)
+	if err := Server(strings.NewReader(advInput), io.Discard, path, dir); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestParseBytesExactRationalBoundaries(t *testing.T) {

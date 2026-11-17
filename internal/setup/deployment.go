@@ -20,21 +20,27 @@ import (
 
 // Deployment 描述服务端全新部署的完整安全参数与输出路径。
 type Deployment struct {
-	Config      string
-	CertDir     string
-	ClientDir   string
-	Storage     string
-	Listen      string
-	Address     string
-	ServerName  string
-	Hosts       string
-	User        string
-	Upload      uint64
-	Download    uint64
-	MaxFile     uint64
-	UserStorage uint64
-	Days        int
-	CADays      int
+	Config          string
+	CertDir         string
+	ClientDir       string
+	Storage         string
+	Listen          string
+	Address         string
+	ServerName      string
+	Hosts           string
+	User            string
+	Upload          uint64
+	Download        uint64
+	Burst           uint64
+	MaxFile         uint64
+	UserStorage     uint64
+	LogMaxBytes     uint64
+	GlobalBandwidth *config.Bandwidth
+	Limits          *config.Limits
+	Timeouts        *config.Timeouts
+	Resources       *config.Resources
+	Days            int
+	CADays          int
 }
 
 func DefaultDeployment(path, base string) Deployment {
@@ -59,8 +65,10 @@ func DefaultDeployment(path, base string) Deployment {
 		User:        "alice",
 		Upload:      c.Bandwidth.UploadBytesPerSecond,
 		Download:    c.Bandwidth.DownloadBytesPerSecond,
+		Burst:       c.Bandwidth.BurstBytes,
 		MaxFile:     c.Resources.MaxFileBytes,
 		UserStorage: c.Resources.UserStorageBytes,
+		LogMaxBytes: c.Logging.MaxFileBytes,
 		Days:        30,
 		CADays:      365,
 	}
@@ -115,12 +123,31 @@ func (d Deployment) Validate() error {
 
 func (d Deployment) serverConfig() config.Server {
 	c := config.DefaultServer()
+	if d.Limits != nil {
+		c.Limits = *d.Limits
+	}
+	if d.Timeouts != nil {
+		c.Timeouts = *d.Timeouts
+	}
+	if d.Resources != nil {
+		c.Resources = *d.Resources
+	}
 	c.Listen = d.Listen
 	c.StorageRoot = d.Storage
 	c.Bandwidth.UploadBytesPerSecond = d.Upload
 	c.Bandwidth.DownloadBytesPerSecond = d.Download
+	if d.Burst > 0 {
+		c.Bandwidth.BurstBytes = d.Burst
+	}
 	c.Resources.MaxFileBytes = d.MaxFile
 	c.Resources.UserStorageBytes = d.UserStorage
+	if d.LogMaxBytes > 0 {
+		c.Logging.MaxFileBytes = d.LogMaxBytes
+	}
+	if d.GlobalBandwidth != nil {
+		gb := *d.GlobalBandwidth
+		c.GlobalBandwidth = &gb
+	}
 	return c
 }
 

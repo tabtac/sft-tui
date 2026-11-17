@@ -219,6 +219,21 @@ func Server(in io.Reader, out io.Writer, path, scanDir string) error {
 			return err
 		}
 	}
+	advanced, err := d.Bool("设置全部高级参数（流、块、窗口、超时、资源限额）", false)
+	if err != nil {
+		return err
+	}
+	if advanced {
+		for _, field := range config.ServerNumericFields(&c) {
+			n, err := d.Uint(field.Path, field.Uint(), 1, field.Max())
+			if err != nil {
+				return err
+			}
+			if err := field.Set(fmt.Sprint(n)); err != nil {
+				return err
+			}
+		}
+	}
 	for i := range c.AuthorizedClients {
 		c.AuthorizedClients[i].Certificate, err = filepath.Abs(c.AuthorizedClients[i].Certificate)
 		if err != nil {
