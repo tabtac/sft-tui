@@ -24,7 +24,7 @@ const (
 	modalClearHistory
 )
 
-func renderModalBox(width, height int, th theme, title string, lines []string, footer string) string {
+func renderModalRawBox(width int, th theme, title string, lines []string, footer string) string {
 	boxW := min(max(44, width-4), 86)
 	innerW := boxW - 6 // 2 border + 4 horizontal padding
 	var body []string
@@ -37,7 +37,11 @@ func renderModalBox(width, height int, th theme, title string, lines []string, f
 		body = append(body, lipgloss.NewStyle().Foreground(th.border).Render(strings.Repeat("─", innerW)))
 		body = append(body, th.badgeMuted.Render(footer))
 	}
-	box := th.modalBox.Width(boxW - 2).Render(strings.Join(body, "\n"))
+	return th.modalBox.Width(boxW - 2).Render(strings.Join(body, "\n"))
+}
+
+func renderModalBox(width, height int, th theme, title string, lines []string, footer string) string {
+	box := renderModalRawBox(width, th, title, lines, footer)
 	return lipgloss.Place(width, height, lipgloss.Center, lipgloss.Center, box,
 		lipgloss.WithWhitespaceChars(" "),
 	)
@@ -76,7 +80,7 @@ func (m *model) viewModal(base string) string {
 
 	case modalIdentity:
 		lines := []string{
-			"已保存或发现的身份包（↑/↓ 选择后按 Enter 激活切换）：",
+			"已保存或发现的身份包（↑/↓ 或鼠标点击选择后按 Enter 激活）：",
 			"",
 		}
 		if len(m.idChoices) == 0 {

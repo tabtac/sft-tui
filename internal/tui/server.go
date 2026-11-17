@@ -19,7 +19,6 @@ import (
 	"sft-tui/internal/pal"
 	"sft-tui/internal/security"
 	"sft-tui/internal/service"
-	"sft-tui/internal/setup"
 )
 
 type ServerOptions struct {
@@ -42,6 +41,8 @@ const (
 	srvModalExportUser
 	srvModalCSR
 	srvModalEditSettings
+	srvModalEditAdvancedSettings
+	srvModalEditLogLimit
 	srvModalRotateServer
 	srvModalDeployWizard
 )
@@ -123,13 +124,27 @@ type serverModel struct {
 	statusToast string
 	busy        bool
 
-	// 多字段表单输入
-	formInputs    []textinput.Model
-	formLabels    []string
-	formFocus     int
-	formToggles   []bool
-	formToggleLbl []string
-	targetUser    *config.AuthorizedClient
+	// 多字段表单输入与向导状态
+	formRows           []formRow
+	formInputs         []textinput.Model
+	formUnits          []*formUnitField
+	formSelects        []formSelectField
+	formLabels         []string
+	formFocus          int
+	formSubFocus       int
+	formScroll         int
+	formToggles        []bool
+	formToggleLbl      []string
+	formButtons        []formButton
+	formBtnIdx         int
+	dropdownOpen       bool
+	dropdownRow        int
+	dropdownCursor     int
+	targetUser         *config.AuthorizedClient
+	deployAutoPrompted bool
+	deploy             *deployWizardDraft
+	settingsExpected   config.Server
+	settingsDraft      *config.Server
 }
 
 // RunServer 启动服务端 Bubble Tea 管理面板并阻塞直至管理员按 q/Esc/F10 退出。
@@ -336,8 +351,14 @@ func (m *serverModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.cfg = msg.cfg
 		m.certs = msg.certs
 		m.cfgErr = msg.err
-		if msg.err == nil && m.endpointRoot == "" {
-			m.endpointRoot = msg.cfg.StorageRoot
+		if msg.err == nil {
+			if m.endpointRoot == "" {
+				m.endpointRoot = msg.cfg.StorageRoot
+			}
+			m.deployAutoPrompted = true
+		} else if os.IsNotExist(msg.err) && !m.deployAutoPrompted && m.modal == srvModalNone {
+			m.deployAutoPrompted = true
+			m.beginDeployWizard()
 		}
 		m.clampCursors()
 		return m, nil
@@ -380,6 +401,44 @@ func (m *serverModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			cmds = append(cmds, m.pollRuntimeCmd())
 		}
 		return m, tea.Batch(cmds...)
+
+	case deployInitDoneMsg:
+		m.busy = false
+		if msg.err != nil {
+			if m.deploy != nil {
+				m.deploy.summaryErr = msg.err.Error()
+				m.openDeployStep(4)
+			} else {
+				m.statusToast = "部署初始化失败：" + msg.err.Error()
+			}
+			return m, nil
+		}
+		if m.deploy != nil {
+			m.deploy.d = msg.d
+			m.deploy.saved = true
+			m.deploy.started = msg.started
+			m.deploy.finishMsg = msg.notice
+			m.openDeployStep(5)
+		}
+		m.statusToast = "部署初始化已完成"
+		return m, tea.Batch(m.loadConfigCmd(), m.pollRuntimeCmd())
+
+	case deployExportDoneMsg:
+		m.busy = false
+		if msg.err != nil {
+			if m.deploy != nil {
+				m.deploy.finishMsg = "部署已保存；导出失败：" + msg.err.Error()
+				m.openDeployStep(5)
+			}
+			m.statusToast = "导出失败：" + msg.err.Error()
+			return m, nil
+		}
+		if m.deploy != nil {
+			m.deploy.finishMsg = "用户包已成功导出至：" + msg.outDir
+			m.openDeployStep(5)
+		}
+		m.statusToast = "用户包已导出：" + msg.outDir
+		return m, nil
 
 	case themeSavedMsg:
 		if msg.err != nil {
@@ -495,7 +554,7 @@ func (m *serverModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case 0: // 概览
 		switch k {
 		case "I":
-			m.openDeployWizardModal()
+			m.beginDeployWizard()
 			return m, textinput.Blink
 		case "enter":
 			if m.runtime != nil && m.cursors[0] < len(m.runtime.Peers) {
@@ -584,9 +643,24 @@ func (m *serverModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 		}
 	case 4: // 设置
-		if k == "m" && m.cfgErr == nil {
-			m.openEditSettingsModal()
-			return m, textinput.Blink
+		switch k {
+		case "m":
+			if m.cfgErr == nil {
+				m.openEditSettingsModal()
+				return m, textinput.Blink
+			}
+		case "a":
+			if m.cfgErr == nil {
+				m.openAdvancedSettingsModal()
+				return m, textinput.Blink
+			}
+		case "L":
+			if m.cfgErr == nil {
+				m.openLogLimitModal()
+				return m, textinput.Blink
+			}
+		case "A":
+			return m, m.reloadServiceCmd()
 		}
 	case 5: // 日志
 		switch k {
@@ -594,6 +668,11 @@ func (m *serverModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.logPaused = !m.logPaused
 			if !m.logPaused {
 				return m, m.pollRuntimeCmd()
+			}
+		case "L":
+			if m.cfgErr == nil {
+				m.openLogLimitModal()
+				return m, textinput.Blink
 			}
 		case "l":
 			order := []string{"", "INFO", "WARN", "ERROR"}
@@ -693,6 +772,11 @@ func (m *serverModel) currentPageLen() int {
 		return len(m.filteredTasks())
 	case 3:
 		return len(m.certs)
+	case 4:
+		if !m.loaded || m.cfgErr != nil {
+			return 0
+		}
+		return len(m.settingsLines())
 	case 5:
 		if m.logFallback != "" {
 			return len(strings.Split(strings.TrimSpace(m.logFallback), "\n"))
@@ -714,31 +798,54 @@ func (m *serverModel) clampCursors() {
 }
 
 func (m *serverModel) initForm(labels, defaults, toggleLabels []string, toggles []bool) {
-	m.formLabels = labels
-	m.formInputs = make([]textinput.Model, len(labels))
-	for i, def := range defaults {
-		ti := textinput.New()
-		ti.CharLimit = 256
-		ti.Width = 44
-		ti.SetValue(def)
-		if i == 0 {
-			ti.Focus()
-			ti.CursorEnd()
+	m.resetForm()
+	for i, lbl := range labels {
+		def := ""
+		if i < len(defaults) {
+			def = defaults[i]
 		}
-		m.formInputs[i] = ti
+		m.addTextRow(lbl, def)
 	}
-	m.formToggleLbl = toggleLabels
-	m.formToggles = toggles
-	m.formFocus = 0
-}
-
-func (m *serverModel) totalFormItems() int {
-	return len(m.formInputs) + len(m.formToggles)
+	for i, lbl := range toggleLabels {
+		checked := false
+		if i < len(toggles) {
+			checked = toggles[i]
+		}
+		m.addToggleRow(lbl, checked, nil)
+	}
+	m.formButtons = []formButton{
+		{label: "取消", onClick: func() (tea.Model, tea.Cmd) {
+			m.modal = srvModalNone
+			m.targetUser = nil
+			return m, nil
+		}},
+		{label: "确认提交 ★", primary: true, onClick: func() (tea.Model, tea.Cmd) {
+			return m.submitModalForm()
+		}},
+	}
+	m.finalizeFormFocus(true)
 }
 
 func (m *serverModel) openNewUserModal() {
-	m.initForm([]string{"用户名", "有效期(天)"}, []string{"", "30"}, []string{"允许上传", "允许下载"}, []bool{true, true})
+	m.resetForm()
 	m.modal = srvModalNewUser
+	m.addTextRow("用户名", "")
+	m.addTextRow("有效期(天)", "30")
+	m.addToggleRow("允许上传", true, nil)
+	m.addToggleRow("允许下载", true, nil)
+	m.addToggleRow("继承默认带宽(关闭后下方自定义限速生效)", true, nil)
+	bw := config.DefaultServer().Bandwidth
+	if m.cfgErr == nil {
+		bw = m.cfg.Bandwidth
+	}
+	m.addSizeUnitRow("自定义上传速率", bw.UploadBytesPerSecond, true)
+	m.addSizeUnitRow("自定义下载速率", bw.DownloadBytesPerSecond, true)
+	m.addSizeUnitRow("自定义突发配额", bw.BurstBytes, false)
+	m.formButtons = []formButton{
+		{label: "取消", onClick: func() (tea.Model, tea.Cmd) { m.modal = srvModalNone; return m, nil }},
+		{label: "创建用户 ★", primary: true, onClick: func() (tea.Model, tea.Cmd) { return m.submitModalForm() }},
+	}
+	m.finalizeFormFocus(true)
 }
 
 func (m *serverModel) openCSRModal(user string) {
@@ -762,13 +869,21 @@ func (m *serverModel) openEditPolicyModal(u config.AuthorizedClient) {
 	}
 	uCopy := u
 	m.targetUser = &uCopy
-	m.initForm(
-		[]string{"上传速率(B/s)", "下载速率(B/s)", "突发配额(B)"},
-		[]string{strconv.FormatUint(bw.UploadBytesPerSecond, 10), strconv.FormatUint(bw.DownloadBytesPerSecond, 10), strconv.FormatUint(bw.BurstBytes, 10)},
-		[]string{"启用该用户", "允许上传", "允许下载", "继承默认带宽(忽略下方数值)"},
-		[]bool{!u.Disabled, hasUp, hasDown, inherit},
-	)
+
+	m.resetForm()
 	m.modal = srvModalEditPolicy
+	m.addToggleRow("启用该用户", !u.Disabled, nil)
+	m.addToggleRow("允许上传", hasUp, nil)
+	m.addToggleRow("允许下载", hasDown, nil)
+	m.addToggleRow("继承默认带宽(关闭后使用下方自定义速率)", inherit, nil)
+	m.addSizeUnitRow("上传速率", bw.UploadBytesPerSecond, true)
+	m.addSizeUnitRow("下载速率", bw.DownloadBytesPerSecond, true)
+	m.addSizeUnitRow("突发配额", bw.BurstBytes, false)
+	m.formButtons = []formButton{
+		{label: "取消", onClick: func() (tea.Model, tea.Cmd) { m.modal = srvModalNone; m.targetUser = nil; return m, nil }},
+		{label: "保存策略 ★", primary: true, onClick: func() (tea.Model, tea.Cmd) { return m.submitModalForm() }},
+	}
+	m.finalizeFormFocus(false)
 }
 
 func (m *serverModel) openExportUserModal(u config.AuthorizedClient) {
@@ -779,55 +894,17 @@ func (m *serverModel) openExportUserModal(u config.AuthorizedClient) {
 	m.modal = srvModalExportUser
 }
 
-func (m *serverModel) openEditSettingsModal() {
-	m.initForm(
-		[]string{"监听地址(host:port)", "最大并发连接数", "默认上传速率(B/s)", "默认下载速率(B/s)", "突发配额(B)"},
-		[]string{
-			m.cfg.Listen,
-			strconv.FormatUint(uint64(m.cfg.Resources.MaxConnections), 10),
-			strconv.FormatUint(m.cfg.Bandwidth.UploadBytesPerSecond, 10),
-			strconv.FormatUint(m.cfg.Bandwidth.DownloadBytesPerSecond, 10),
-			strconv.FormatUint(m.cfg.Bandwidth.BurstBytes, 10),
-		},
-		nil, nil,
-	)
-	m.modal = srvModalEditSettings
-}
-
 func (m *serverModel) openRotateServerModal() {
 	m.initForm([]string{"服务端 SAN(逗号分隔 DNS/IP，留空沿用)", "有效期(天)"}, []string{"", "30"}, nil, nil)
 	m.modal = srvModalRotateServer
 }
 
-func (m *serverModel) openDeployWizardModal() {
-	base := m.opts.ExecutableDir
-	if base == "" {
-		base = "."
-	}
-	d := setup.DefaultDeployment(m.opts.ConfigPath, base)
-	hosts := d.Hosts
-	if addrs := setup.LocalAddresses(); len(addrs) > 0 {
-		hosts += "," + strings.Join(addrs, ",")
-	}
-	m.initForm(
-		[]string{
-			"服务端监听地址 (host:port)",
-			"客户端连接地址 (host:port)",
-			"服务端 SAN (逗号分隔 DNS/IP)",
-			"证书目录",
-			"存储根目录",
-			"初始授权用户名",
-			"证书有效天数(用户/CA)",
-		},
-		[]string{d.Listen, d.Address, hosts, d.CertDir, d.Storage, d.User, "30/365"},
-		nil, nil,
-	)
-	m.modal = srvModalDeployWizard
-}
-
 func (m *serverModel) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
-	if msg.Action != tea.MouseActionPress || m.width <= 0 || m.height <= 0 || m.modal != srvModalNone {
+	if msg.Action != tea.MouseActionPress || m.width <= 0 || m.height <= 0 {
 		return m, nil
+	}
+	if m.modal != srvModalNone {
+		return m.handleModalMouse(msg)
 	}
 	if msg.Y == 1 && msg.Button == tea.MouseButtonLeft {
 		names := []string{"1 概览", "2 用户", "3 传输", "4 证书", "5 设置", "6 日志"}
@@ -896,9 +973,10 @@ func (m *serverModel) showUserDetailModal(u config.AuthorizedClient) {
 
 func (m *serverModel) handleModalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	k := msg.String()
-	if k == "esc" {
+	if k == "esc" && !m.dropdownOpen {
 		m.modal = srvModalNone
 		m.targetUser = nil
+		m.settingsDraft = nil
 		return m, nil
 	}
 	if m.modal == srvModalHelp || m.modal == srvModalDetail {
@@ -918,48 +996,7 @@ func (m *serverModel) handleModalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 	}
-
-	total := m.totalFormItems()
-	switch k {
-	case "tab", "down":
-		if total > 0 {
-			m.setFormFocus((m.formFocus + 1) % total)
-		}
-		return m, textinput.Blink
-	case "shift+tab", "up":
-		if total > 0 {
-			m.setFormFocus((m.formFocus + total - 1) % total)
-		}
-		return m, textinput.Blink
-	case " ":
-		if m.formFocus >= len(m.formInputs) {
-			idx := m.formFocus - len(m.formInputs)
-			if idx >= 0 && idx < len(m.formToggles) {
-				m.formToggles[idx] = !m.formToggles[idx]
-				return m, nil
-			}
-		}
-	case "enter":
-		return m.submitModalForm()
-	}
-
-	if m.formFocus >= 0 && m.formFocus < len(m.formInputs) {
-		var cmd tea.Cmd
-		m.formInputs[m.formFocus], cmd = m.formInputs[m.formFocus].Update(msg)
-		return m, cmd
-	}
-	return m, nil
-}
-
-func (m *serverModel) setFormFocus(next int) {
-	if m.formFocus >= 0 && m.formFocus < len(m.formInputs) {
-		m.formInputs[m.formFocus].Blur()
-	}
-	m.formFocus = next
-	if m.formFocus >= 0 && m.formFocus < len(m.formInputs) {
-		m.formInputs[m.formFocus].Focus()
-		m.formInputs[m.formFocus].CursorEnd()
-	}
+	return m.handleFormKey(msg)
 }
 
 func (m *serverModel) certBaseOptions(name string) certmanage.Options {
@@ -1012,9 +1049,26 @@ func (m *serverModel) submitModalForm() (tea.Model, tea.Cmd) {
 		if m.formToggles[1] {
 			perms = append(perms, "download")
 		}
+		var bw *config.Bandwidth
+		if len(m.formToggles) > 2 && !m.formToggles[2] {
+			up, e1 := m.parseSizeInput(2, "自定义上传速率")
+			dn, e2 := m.parseSizeInput(3, "自定义下载速率")
+			bu, e3 := m.parseSizeInput(4, "自定义突发配额")
+			if e1 != nil || e2 != nil || e3 != nil {
+				for _, e := range []error{e1, e2, e3} {
+					if e != nil {
+						m.statusToast = e.Error()
+						break
+					}
+				}
+				m.modal = srvModalNewUser
+				return m, nil
+			}
+			bw = &config.Bandwidth{UploadBytesPerSecond: up, DownloadBytesPerSecond: dn, BurstBytes: bu}
+		}
 		o := m.certBaseOptions(name)
 		o.Days = days
-		o.Policy = &certmanage.UserPolicy{Permissions: perms}
+		o.Policy = &certmanage.UserPolicy{Permissions: perms, Bandwidth: bw}
 		return m, m.execCertAndReload("user", o, "已新建用户 "+name)
 
 	case srvModalCSR:
@@ -1033,7 +1087,6 @@ func (m *serverModel) submitModalForm() (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		u := *m.targetUser
-		m.targetUser = nil
 		perms := []string{}
 		if m.formToggles[1] {
 			perms = append(perms, "upload")
@@ -1043,15 +1096,22 @@ func (m *serverModel) submitModalForm() (tea.Model, tea.Cmd) {
 		}
 		var bw *config.Bandwidth
 		if !m.formToggles[3] {
-			up, e1 := strconv.ParseUint(strings.TrimSpace(m.formInputs[0].Value()), 10, 64)
-			dn, e2 := strconv.ParseUint(strings.TrimSpace(m.formInputs[1].Value()), 10, 64)
-			bu, e3 := strconv.ParseUint(strings.TrimSpace(m.formInputs[2].Value()), 10, 64)
+			up, e1 := m.parseSizeInput(0, "上传速率")
+			dn, e2 := m.parseSizeInput(1, "下载速率")
+			bu, e3 := m.parseSizeInput(2, "突发配额")
 			if e1 != nil || e2 != nil || e3 != nil {
-				m.statusToast = "带宽数值必须是正整数(单位 B/s)"
+				for _, e := range []error{e1, e2, e3} {
+					if e != nil {
+						m.statusToast = e.Error()
+						break
+					}
+				}
+				m.modal = srvModalEditPolicy
 				return m, nil
 			}
 			bw = &config.Bandwidth{UploadBytesPerSecond: up, DownloadBytesPerSecond: dn, BurstBytes: bu}
 		}
+		m.targetUser = nil
 		o := m.certBaseOptions(u.UserID)
 		o.ExpectedUser = &u
 		o.Policy = &certmanage.UserPolicy{
@@ -1085,88 +1145,6 @@ func (m *serverModel) submitModalForm() (tea.Model, tea.Cmd) {
 			o.Days = d
 		}
 		return m, m.execCertAndReload("server", o, "服务端证书已轮换")
-
-	case srvModalEditSettings:
-		expected := m.cfg
-		proposed := m.cfg
-		proposed.Listen = strings.TrimSpace(m.formInputs[0].Value())
-		mc, e1 := strconv.ParseUint(strings.TrimSpace(m.formInputs[1].Value()), 10, 32)
-		up, e2 := strconv.ParseUint(strings.TrimSpace(m.formInputs[2].Value()), 10, 64)
-		dn, e3 := strconv.ParseUint(strings.TrimSpace(m.formInputs[3].Value()), 10, 64)
-		bu, e4 := strconv.ParseUint(strings.TrimSpace(m.formInputs[4].Value()), 10, 64)
-		if e1 != nil || e2 != nil || e3 != nil || e4 != nil {
-			m.statusToast = "配置输入格式错误，须为有效正整数"
-			return m, nil
-		}
-		proposed.Resources.MaxConnections = uint32(mc)
-		proposed.Bandwidth = config.Bandwidth{UploadBytesPerSecond: up, DownloadBytesPerSecond: dn, BurstBytes: bu}
-		certDir := filepath.Dir(expected.TLS.CACertificate)
-		cfgPath := m.opts.ConfigPath
-		m.busy = true
-		return m, func() tea.Msg {
-			saved, err := certmanage.SaveSettings(cfgPath, certDir, expected, proposed)
-			if err != nil {
-				return serverActionResultMsg{err: err, refresh: true}
-			}
-			notice := "配置已保存到磁盘"
-			if config.RestartRequired(expected, saved) {
-				notice += "（修改了需重启生效的字段，请择机重启服务）"
-			}
-			return serverActionResultMsg{notice: notice, refresh: true, poll: true}
-		}
-
-	case srvModalDeployWizard:
-		base := m.opts.ExecutableDir
-		if base == "" {
-			base = "."
-		}
-		d := setup.DefaultDeployment(m.opts.ConfigPath, base)
-		d.Listen = strings.TrimSpace(m.formInputs[0].Value())
-		d.Address = strings.TrimSpace(m.formInputs[1].Value())
-		d.Hosts = strings.TrimSpace(m.formInputs[2].Value())
-		d.CertDir = strings.TrimSpace(m.formInputs[3].Value())
-		d.Storage = strings.TrimSpace(m.formInputs[4].Value())
-		d.User = strings.TrimSpace(m.formInputs[5].Value())
-		for _, field := range []*string{&d.CertDir, &d.Storage} {
-			if !filepath.IsAbs(*field) {
-				*field = filepath.Join(base, *field)
-			}
-			*field, _ = filepath.Abs(*field)
-		}
-		daysSpec := strings.Split(strings.TrimSpace(m.formInputs[6].Value()), "/")
-		if len(daysSpec) >= 1 && daysSpec[0] != "" {
-			if n, err := strconv.Atoi(strings.TrimSpace(daysSpec[0])); err == nil {
-				d.Days = n
-			} else {
-				m.statusToast = "证书有效天数格式错误（例如 30/365）"
-				return m, nil
-			}
-		}
-		if len(daysSpec) >= 2 && daysSpec[1] != "" {
-			if n, err := strconv.Atoi(strings.TrimSpace(daysSpec[1])); err == nil {
-				d.CADays = n
-			} else {
-				m.statusToast = "CA 有效天数格式错误（例如 30/365）"
-				return m, nil
-			}
-		}
-		dns, ips, err := security.ParseServerNames(d.Hosts)
-		if err != nil {
-			m.statusToast = err.Error()
-			return m, nil
-		}
-		if len(dns) > 0 && !strings.Contains(dns[0], "*") {
-			d.ServerName = dns[0]
-		} else if len(ips) > 0 {
-			d.ServerName = ips[0].String()
-		}
-		m.busy = true
-		return m, func() tea.Msg {
-			if _, err := setup.InitializeDeployment(d); err != nil {
-				return serverActionResultMsg{err: err}
-			}
-			return serverActionResultMsg{notice: "已完成部署初始化：" + d.Config, refresh: true, poll: true}
-		}
 	}
 	return m, nil
 }

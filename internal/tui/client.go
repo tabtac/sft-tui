@@ -488,12 +488,18 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case identityActivatedMsg:
 		if msg.err != nil {
-			m.statusToast = msg.err.Error()
 			if m.cfg == nil {
+				firstOpen := m.modal != modalIdentity
 				m.modal = modalIdentity
 				m.connStatus = "需要选择或导入身份"
+				if firstOpen {
+					m.statusToast = "未找到已激活身份，请从列表选择或输入配置目录导入"
+				} else {
+					m.statusToast = msg.err.Error()
+				}
 				return m, m.scanIdentitiesCmd()
 			}
+			m.statusToast = msg.err.Error()
 			return m, nil
 		}
 		// 释放旧实例仅在替换时安全（通常 activateChoiceCmd 已关闭旧实例；启动期无旧实例）
@@ -708,6 +714,35 @@ func (m *model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 		case tea.MouseButtonWheelDown:
 			if m.idCursor < len(m.idChoices)-1 {
 				m.idCursor++
+			}
+		case tea.MouseButtonLeft:
+			maxShow := min(8, len(m.idChoices))
+			listLines := max(1, maxShow)
+			boxW := min(max(44, m.width-4), 86)
+			boxH := 4 + 2 + listLines + 4
+			boxY := max(0, (m.height-boxH)/2)
+			boxX := max(0, (m.width-boxW)/2)
+			if msg.X < boxX || msg.X >= boxX+boxW {
+				return m, nil
+			}
+			relY := msg.Y - (boxY + 4)
+			if relY >= 2 && relY < 2+maxShow && len(m.idChoices) > 0 {
+				start := scrollOffset(m.idCursor, len(m.idChoices), maxShow)
+				idx := start + (relY - 2)
+				if idx >= 0 && idx < len(m.idChoices) {
+					already := !m.idInputFocus && m.idCursor == idx
+					m.idInputFocus = false
+					m.idInput.Blur()
+					m.idCursor = idx
+					if already {
+						m.statusToast = "正在切换身份…"
+						return m, m.activateChoiceCmd(m.idChoices[idx], "")
+					}
+				}
+			} else if relY >= 2+listLines {
+				m.idInputFocus = true
+				m.idInput.Focus()
+				return m, textinput.Blink
 			}
 		}
 		return m, nil

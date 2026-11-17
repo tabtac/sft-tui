@@ -133,9 +133,9 @@ func (m *serverModel) renderFooter() string {
 	case m.page == 3:
 		hints = "证书：[K] 续期CA  [S] 轮换服务端证书  [C] 签发CSR  [Enter] 查看指纹详情"
 	case m.page == 4:
-		hints = "设置：[m] 编辑配置参数  [R] 热加载变更  [1-6/Tab] 切页  [q] 退出"
+		hints = "设置：[m] 编辑基础/带宽/存储  [a] 高级协议与资源限额  [L] 日志大小上限  [A] 应用热加载  [1-6/Tab] 切页"
 	default:
-		hints = "日志：[p] 暂停/跟随实时日志  [l] 最低等级(" + logLevelLabel(m.logMinLevel) + ")  [/] 关键字过滤  [Enter] 事件详情"
+		hints = "日志：[p] 暂停/跟随实时日志  [l] 最低等级(" + logLevelLabel(m.logMinLevel) + ")  [L] 日志上限  [/] 关键字过滤  [Enter] 详情"
 	}
 	return m.th.footerBar.Width(m.width).Render(hints)
 }
@@ -420,38 +420,82 @@ func (m *serverModel) renderCertsPage(bodyH int) string {
 	return renderPanelBox(m.th, m.th.hintKey.Render("证书信任链与有效期体检"), lines, true, m.width, bodyH)
 }
 
+func (m *serverModel) settingsLines() []string {
+	c := m.cfg
+	diffTag := m.th.badgeMuted.Render("（服务离线，修改配置启动后生效）")
+	if m.runtime != nil {
+		if config.RestartRequired(m.runtime.Config, c) {
+			diffTag = m.th.badgeWarn.Render("⚠ 磁盘配置与运行实例存在非热更差异（需重启生效）")
+		} else {
+			diffTag = m.th.badgeOk.Render("✔ 磁盘配置与运行实例基本设置一致")
+		}
+	}
+	gbLine := "未启用（仅受单用户策略与全局物理接口限制）"
+	if c.GlobalBandwidth != nil {
+		gbLine = fmt.Sprintf("↑ %s  ·  ↓ %s  ·  突发 %s",
+			progress.FormatRate(float64(c.GlobalBandwidth.UploadBytesPerSecond)),
+			progress.FormatRate(float64(c.GlobalBandwidth.DownloadBytesPerSecond)),
+			progress.FormatBytes(c.GlobalBandwidth.BurstBytes))
+	}
+	return []string{
+		diffTag,
+		"",
+		m.th.hintKey.Render("【基础网络、存储与日志】  按 [m] 编辑基础/带宽/配额 · [a] 编辑全部高级参数 · [L] 调整日志上限 · [A] 热重载"),
+		fmt.Sprintf("  监听地址 (listen)：          %s", c.Listen),
+		fmt.Sprintf("  存储目录 (storage_root)：    %s", c.StorageRoot),
+		fmt.Sprintf("  日志上限 (logging)：         %s（达上限清空当前文件重写）", progress.FormatBytes(c.Logging.MaxFileBytes)),
+		"",
+		m.th.hintKey.Render("【带宽限速策略】"),
+		fmt.Sprintf("  默认单用户带宽：             ↑ %s  ·  ↓ %s  ·  突发 %s",
+			progress.FormatRate(float64(c.Bandwidth.UploadBytesPerSecond)),
+			progress.FormatRate(float64(c.Bandwidth.DownloadBytesPerSecond)),
+			progress.FormatBytes(c.Bandwidth.BurstBytes)),
+		fmt.Sprintf("  全局总带宽上限：             %s", gbLine),
+		"",
+		m.th.hintKey.Render("【容量、并发与频率限制 (resources)】"),
+		fmt.Sprintf("  单文件 / 每用户存储配额：    %s  /  %s",
+			progress.FormatBytes(c.Resources.MaxFileBytes), progress.FormatBytes(c.Resources.UserStorageBytes)),
+		fmt.Sprintf("  全局连接 / 并发握手上限：    %d  /  %d",
+			c.Resources.MaxConnections, c.Resources.MaxHandshakes),
+		fmt.Sprintf("  每 IP 未认证 / 每用户连接：  %d  /  %d",
+			c.Resources.MaxUnauthenticatedPerIP, c.Resources.MaxConnectionsPerUser),
+		fmt.Sprintf("  每用户最大流 / 待处理任务：  %d  /  %d",
+			c.Resources.MaxStreamsPerUser, c.Resources.MaxPendingTransfersPerUser),
+		fmt.Sprintf("  每用户最大文件数：           %d 个", c.Resources.MaxFilesPerUser),
+		fmt.Sprintf("  新建任务速率 / 检查点频率：  %d 次/分钟  ·  %d 次/秒",
+			c.Resources.MaxNewTasksPerMinute, c.Resources.MaxUploadCheckpointsPerSecond),
+		fmt.Sprintf("  断点检查点保留时长：         %s (%d 秒)",
+			time.Duration(c.Resources.TransferRetentionSeconds)*time.Second, c.Resources.TransferRetentionSeconds),
+		"",
+		m.th.hintKey.Render("【协议流控与超时 (limits / timeouts)】"),
+		fmt.Sprintf("  流控参数：                   每连接流=%d · 分块=%s · 窗口=%s",
+			c.Limits.MaxStreams, progress.FormatBytes(uint64(c.Limits.ChunkSize)), progress.FormatBytes(uint64(c.Limits.WindowSize))),
+		fmt.Sprintf("  超时秒数：                   TLS握手=%ds · HELLO=%ds · 读帧=%ds · 写=%ds · 空闲=%ds",
+			c.Timeouts.HandshakeSeconds, c.Timeouts.HelloSeconds, c.Timeouts.FrameReadSeconds,
+			c.Timeouts.WriteSeconds, c.Timeouts.IdleSeconds),
+	}
+}
+
 func (m *serverModel) renderSettingsPage(bodyH int) string {
+	visRows := max(1, bodyH-3)
 	var lines []string
 	if m.cfgErr != nil {
 		lines = append(lines, m.th.badgeErr.Render("加载配置失败："+m.cfgErr.Error()))
+		lines = append(lines, m.th.badgeWarn.Render("可返回 [1 概览] 按 [I] 启动初始化向导"))
 	} else {
-		diffTag := m.th.badgeMuted.Render("（服务离线，修改配置启动后生效）")
-		if m.runtime != nil {
-			if config.RestartRequired(m.runtime.Config, m.cfg) {
-				diffTag = m.th.badgeWarn.Render("⚠ 磁盘配置与运行中实例存在非热更差异（需重启生效）")
+		all := m.settingsLines()
+		start := scrollOffset(m.cursors[4], len(all), visRows)
+		end := min(len(all), start+visRows)
+		for i := start; i < end; i++ {
+			ln := all[i]
+			if i == m.cursors[4] {
+				lines = append(lines, m.th.rowCursor.Render("▸ "+ln))
 			} else {
-				diffTag = m.th.badgeOk.Render("✔ 磁盘配置与运行实例基本设置一致")
+				lines = append(lines, ln)
 			}
 		}
-		lines = append(lines,
-			diffTag,
-			"",
-			fmt.Sprintf("监听地址：         %s", m.cfg.Listen),
-			fmt.Sprintf("存储根目录：       %s", m.cfg.StorageRoot),
-			fmt.Sprintf("并发限制：         最大连接=%d · 并发握手=%d · 单IP未认证=%d · 单用户连接=%d",
-				m.cfg.Resources.MaxConnections, m.cfg.Resources.MaxHandshakes,
-				m.cfg.Resources.MaxUnauthenticatedPerIP, m.cfg.Resources.MaxConnectionsPerUser),
-			fmt.Sprintf("流控参数：         每用户最大流=%d · 单连接最大流=%d · 分块=%s · 窗口=%s",
-				m.cfg.Resources.MaxStreamsPerUser, m.cfg.Limits.MaxStreams,
-				progress.FormatBytes(uint64(m.cfg.Limits.ChunkSize)), progress.FormatBytes(uint64(m.cfg.Limits.WindowSize))),
-			fmt.Sprintf("默认单用户带宽：   ↑ %s  ·  ↓ %s  ·  Burst %s",
-				progress.FormatRate(float64(m.cfg.Bandwidth.UploadBytesPerSecond)),
-				progress.FormatRate(float64(m.cfg.Bandwidth.DownloadBytesPerSecond)),
-				progress.FormatBytes(m.cfg.Bandwidth.BurstBytes)),
-			fmt.Sprintf("日志文件上限：     %s", progress.FormatBytes(m.cfg.Logging.MaxFileBytes)),
-		)
 	}
-	return renderPanelBox(m.th, m.th.hintKey.Render("服务端安全参数与策略配置"), lines, true, m.width, bodyH)
+	return renderPanelBox(m.th, m.th.hintKey.Render("服务端安全参数与全部配置项（↑↓/滚轮浏览 · [m]基础 [a]高级 [L]日志）"), lines, true, m.width, bodyH)
 }
 
 func (m *serverModel) renderLogsPage(bodyH int) string {
@@ -498,6 +542,46 @@ func (m *serverModel) renderLogsPage(bodyH int) string {
 	return renderPanelBox(m.th, title, lines, true, m.width, bodyH)
 }
 
+func (m *serverModel) modalTitle() string {
+	switch m.modal {
+	case srvModalNewUser:
+		return "新建授权用户与证书"
+	case srvModalCSR:
+		return "签发客户端 CSR 请求"
+	case srvModalEditPolicy:
+		return "编辑用户权限与带宽策略"
+	case srvModalExportUser:
+		return "导出客户端安全分发包"
+	case srvModalRotateServer:
+		return "轮换服务端证书"
+	case srvModalEditSettings:
+		return "修改服务端基础、带宽与存储设置"
+	case srvModalEditAdvancedSettings:
+		return "修改高级协议流控、超时与资源限额"
+	case srvModalEditLogLimit:
+		return "修改服务日志单文件大小上限"
+	case srvModalDeployWizard:
+		if m.deploy != nil {
+			switch m.deploy.step {
+			case 1:
+				return "部署向导（第 1 步 / 4）：场景与网络地址"
+			case 2:
+				return "部署向导（第 2 步 / 4）：存储目录配置"
+			case 3:
+				return "部署向导（第 3 步 / 4）：初始用户与限额设置"
+			case 35:
+				return "部署向导（第 3 步附加）：高级协议、总带宽与资源限制"
+			case 4:
+				return "部署向导（第 4 步 / 4）：确认初始化摘要"
+			case 5:
+				return "部署完成与用户分发包导出"
+			}
+		}
+		return "服务端首次部署与证书初始化向导"
+	}
+	return "管理操作"
+}
+
 func (m *serverModel) renderModal(base string) string {
 	switch m.modal {
 	case srvModalHelp:
@@ -509,11 +593,11 @@ func (m *serverModel) renderModal(base string) string {
 			"  q / F10        退出管理界面（后台已启动的 sftd 服务继续保持运行）",
 			"",
 			m.th.hintKey.Render("页面专属动作"),
-			"  概览页：  [I] 首次一键初始化证书与配置  [Enter] 连接详情",
+			"  概览页：  [I] 首次部署向导（缺失配置时自动弹出）  [Enter] 连接详情",
 			"  用户页：  [n] 新建  [t] 启用/吊销  [p] 编辑权限与带宽  [w] 续期  [e] 导出包",
 			"  证书页：  [K] 续期CA(365d)  [S] 轮换服务端证书  [C] 签发客户端CSR",
-			"  设置页：  [m] 编辑基础网络与默认带宽设置",
-			"  日志页：  [p] 暂停/跟随  [l] 切换日志等级过滤  [Enter] 查看完整事件",
+			"  设置页：  [m] 基础/带宽/存储  [a] 高级协议/超时/资源  [L] 日志上限  [A] 热加载",
+			"  日志页：  [p] 暂停/跟随  [l] 切换日志等级  [L] 日志上限  [Enter] 事件详情",
 		}
 		return renderModalBox(m.width, m.height, m.th, "服务端管理快捷键", lines, "按 Esc / Enter / ? 关闭")
 
@@ -530,47 +614,8 @@ func (m *serverModel) renderModal(base string) string {
 		return renderModalBox(m.width, m.height, m.th, "停止 sftd 服务", lines, "g 优雅停服 · f 强制停服 · Esc 取消")
 	}
 
-	// 动态渲染表单类弹窗
-	var title string
-	switch m.modal {
-	case srvModalNewUser:
-		title = "新建授权用户与证书"
-	case srvModalCSR:
-		title = "签发客户端 CSR 请求"
-	case srvModalEditPolicy:
-		title = "编辑用户权限与带宽策略"
-	case srvModalExportUser:
-		title = "导出客户端安全分发包"
-	case srvModalRotateServer:
-		title = "轮换服务端证书"
-	case srvModalEditSettings:
-		title = "修改服务端基础设置"
-	case srvModalDeployWizard:
-		title = "服务端首次部署与证书初始化向导"
-	}
-
-	var lines []string
-	for i, lbl := range m.formLabels {
-		prefix := "  "
-		if i == m.formFocus {
-			prefix = "▶ "
-		}
-		lines = append(lines, fmt.Sprintf("%s%s", prefix, m.th.hintKey.Render(lbl)))
-		lines = append(lines, "  "+m.formInputs[i].View())
-	}
-	for i, lbl := range m.formToggleLbl {
-		idx := len(m.formInputs) + i
-		prefix := "  "
-		st := m.th.rowNormal
-		if idx == m.formFocus {
-			prefix = "▶ "
-			st = m.th.rowCursor
-		}
-		box := "[ ]"
-		if m.formToggles[i] {
-			box = "[✓]"
-		}
-		lines = append(lines, st.Render(fmt.Sprintf("%s%s %s", prefix, box, lbl)))
-	}
-	return renderModalBox(m.width, m.height, m.th, title, lines, "Tab/↑↓ 切项 · Space 切换开关 · Enter 确认提交 · Esc 取消")
+	boxW := min(max(44, m.width-4), 86)
+	innerW := boxW - 6
+	lines, footer := m.renderFormLines(innerW)
+	return renderModalBox(m.width, m.height, m.th, m.modalTitle(), lines, footer)
 }
