@@ -249,3 +249,41 @@ func TestExportContainsOnlyClientIdentityAndRejectsReuse(t *testing.T) {
 		t.Error("BUG: failed export removed the existing bundle and unrelated files")
 	}
 }
+
+func TestRenewUserExpectedUserPreservesDisabledState(t *testing.T) {
+	o := testOptions(t)
+	if _, err := Execute("init", o); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	pol := o
+	pol.Policy = &UserPolicy{Disabled: true, Permissions: []string{"download"}}
+	res, err := Execute("policy", pol)
+	if err != nil {
+		t.Fatalf("disable user: %v", err)
+	}
+	expected := res.Server.AuthorizedClients[0]
+	if !expected.Disabled {
+		t.Fatal("expected user to be disabled before renewal")
+	}
+
+	renew := o
+	renew.Renew = true
+	renew.ExpectedUser = &expected
+	renewed, err := Execute("user", renew)
+	if err != nil {
+		t.Fatalf("renew with ExpectedUser failed: %v", err)
+	}
+	if !renewed.Server.AuthorizedClients[0].Disabled {
+		t.Fatal("renew unexpectedly cleared Disabled state")
+	}
+	if len(renewed.Server.AuthorizedClients[0].Permissions) != 1 || renewed.Server.AuthorizedClients[0].Permissions[0] != "download" {
+		t.Fatalf("renew changed user permissions: %+v", renewed.Server.AuthorizedClients[0].Permissions)
+	}
+
+	// 验证过期的 ExpectedUser 仍被拒绝
+	stale := renew
+	stale.ExpectedUser = &config.AuthorizedClient{UserID: "alice", Certificate: expected.Certificate, Disabled: false}
+	if _, err := Execute("user", stale); err == nil {
+		t.Fatal("expected stale ExpectedUser to be rejected during renewal")
+	}
+}

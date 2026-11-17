@@ -285,7 +285,7 @@ func Execute(action string, o Options) (Result, error) {
 			}
 		}
 		if o.ExpectedUser != nil {
-			if (action != "policy" && !(action == "user" && o.Renew && o.CSR != "")) || index < 0 || !reflect.DeepEqual(c.AuthorizedClients[index], *o.ExpectedUser) {
+			if (action != "policy" && !(action == "user" && o.Renew)) || index < 0 || !reflect.DeepEqual(c.AuthorizedClients[index], *o.ExpectedUser) {
 				return fmt.Errorf("此用户在编辑期间已被修改；请刷新列表后重新提交")
 			}
 		}
