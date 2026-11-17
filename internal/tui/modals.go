@@ -190,7 +190,22 @@ func (m *model) infoModalData() (title string, lines []string, footer string) {
 	return "", nil, ""
 }
 
+func appendModalNoticeLines(lines []string, th theme, notice string, innerW int) []string {
+	if strings.TrimSpace(notice) == "" {
+		return lines
+	}
+	wrapped := wrapModalLines([]string{"! " + notice}, innerW)
+	out := make([]string, 0, len(lines)+len(wrapped)+1)
+	out = append(out, lines...)
+	out = append(out, "")
+	for _, ln := range wrapped {
+		out = append(out, th.badgeErr.Render(ln))
+	}
+	return out
+}
+
 func (m *model) viewModal(base string) string {
+	_, innerW := modalBoxDimensions(m.width)
 	switch m.modal {
 	case modalHelp, modalDetail:
 		title, lines, footer := m.infoModalData()
@@ -205,7 +220,11 @@ func (m *model) viewModal(base string) string {
 		if len(m.idChoices) == 0 {
 			lines = append(lines, m.th.badgeWarn.Render("  未在当前目录及程序旁发现可用的 client*.json，请在下方输入路径导入。"))
 		} else {
-			maxShow := min(8, len(m.idChoices))
+			maxShow := 8
+			if m.height > 0 {
+				maxShow = min(8, max(2, m.height-16))
+			}
+			maxShow = min(maxShow, len(m.idChoices))
 			start := scrollOffset(m.idCursor, len(m.idChoices), maxShow)
 			for i := start; i < start+maxShow; i++ {
 				ch := m.idChoices[i]
@@ -224,11 +243,12 @@ func (m *model) viewModal(base string) string {
 				}
 				exp := ch.profile.Expires.Format("2006-01-02")
 				row := fmt.Sprintf("%s[%s] %s  (到期 %s)", mark, tag, ch.profile.Label, exp)
-				lines = append(lines, style.Render(truncCell(row, 74)))
+				lines = append(lines, style.Render(truncCell(row, innerW)))
 			}
 		}
 		lines = append(lines, "", "从指定目录或配置文件导入新身份：")
 		lines = append(lines, m.idInput.View())
+		lines = appendModalNoticeLines(lines, m.th, m.statusToast, innerW)
 		footer := "Tab 切换列表/路径框 · Enter 切换或导入 · Esc 关闭"
 		return renderModalOverlay(base, "客户端 mTLS 身份管理", lines, footer, m)
 
@@ -243,7 +263,7 @@ func (m *model) viewModal(base string) string {
 		}
 		limit := min(5, len(m.conflictNames))
 		for i := 0; i < limit; i++ {
-			lines = append(lines, "  • "+truncCell(m.conflictNames[i], 68))
+			lines = append(lines, "  • "+truncCell(m.conflictNames[i], max(12, innerW-6)))
 		}
 		if len(m.conflictNames) > limit {
 			lines = append(lines, fmt.Sprintf("  … 另有 %d 个冲突文件", len(m.conflictNames)-limit))
@@ -252,8 +272,9 @@ func (m *model) viewModal(base string) string {
 			fmt.Sprintf("共待入队 %d 个文件（冲突 %d 个）。请选择处理策略：", len(m.pendingSpecs), len(m.conflictNames)),
 			"  "+m.th.hintKey.Render("[r]")+" 自动为冲突项生成不重复新文件名（如 file (1).ext）后全部入队",
 			"  "+m.th.hintKey.Render("[s]")+" 跳过冲突文件，仅入队其余无冲突文件",
-			"  "+m.th.hintKey.Render("[Esc]")+" 取消本次批量传输",
+			"  "+m.th.hintKey.Render("[Esc]")+" 取消本次批量传输（保留已勾选状态）",
 		)
+		lines = appendModalNoticeLines(lines, m.th, m.statusToast, innerW)
 		return renderModalOverlay(base, "文件名冲突安全确认（禁止静默覆盖）", lines, "按键选择：r 自动改名 / s 跳过冲突 / Esc 取消", m)
 
 	case modalRename:
@@ -262,6 +283,7 @@ func (m *model) viewModal(base string) string {
 			"",
 			m.renameInput.View(),
 		}
+		lines = appendModalNoticeLines(lines, m.th, m.statusToast, innerW)
 		return renderModalOverlay(base, "改名另存并入队", lines, "Enter 确认入队 · Esc 取消", m)
 
 	case modalQuit:
@@ -283,15 +305,6 @@ func (m *model) viewModal(base string) string {
 	}
 	return base
 }
-
-func taskDetailLines(t, now queueTaskDetail) []string {
-	// placeholder kept clean via direct helper below
-	_ = t
-	_ = now
-	return nil
-}
-
-type queueTaskDetail struct{}
 
 func buildTaskDetailLines(dirLabel, stateText, remote, localPath string, done, size uint64, shaHex, tid, errMsg string, updated time.Time) []string {
 	lines := []string{

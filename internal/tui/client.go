@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"time"
@@ -82,6 +83,7 @@ type identityActivatedMsg struct {
 	activeID string
 	manager  *queue.Manager
 	runner   *transfer.QueueRunner
+	resetOld bool
 	err      error
 }
 type batchOpResultMsg struct {
@@ -134,7 +136,8 @@ type model struct {
 	remoteSelected map[string]bool
 	localCursor    int
 	remoteCursor   int
-	sortMode       sortKind
+	localSort      sortKind
+	remoteSort     sortKind
 	query          string
 
 	// 队列快照视图（无锁）
@@ -190,10 +193,13 @@ func newModel(opts Options) *model {
 		return in
 	}
 
+	prefs := loadUIPrefs(prefsPath)
 	m := &model{
 		opts:           opts,
 		prefsPath:      prefsPath,
-		th:             makeTheme(loadThemePref(prefsPath)),
+		th:             makeTheme(!prefs.Light),
+		localSort:      clampSortKind(prefs.LocalOrder),
+		remoteSort:     clampSortKind(prefs.RemoteOrder),
 		focus:          areaLocal,
 		localDir:       opts.Directory,
 		connStatus:     "未连接",
@@ -362,6 +368,7 @@ func (m *model) scanIdentitiesCmd() tea.Cmd {
 func (m *model) activateChoiceCmd(ch identityChoice, customPath string) tea.Cmd {
 	oldMgr := m.manager
 	oldRunner := m.runner
+	oldIDKey := m.idKey
 	exeDir := m.opts.ExecutableDir
 	return func() tea.Msg {
 		wd, _ := os.Getwd()
@@ -409,6 +416,45 @@ func (m *model) activateChoiceCmd(ch identityChoice, customPath string) tea.Cmd 
 		if _, err = security.ClientTLS(prof.Config); err != nil {
 			return identityActivatedMsg{err: err}
 		}
+
+		// 先完成身份索引与持久化校验，再暂停/关闭旧队列与连接，避免后续失败导致现有队列不可用。
+		var cfg config.Client
+		if useSel {
+			cfg, err = identity.Select(exeDir, prof.ID, prof.Label)
+		} else {
+			cfg, err = identity.SelectPrepared(exeDir, prof, prof.Label)
+		}
+		if err != nil {
+			return identityActivatedMsg{err: err}
+		}
+
+		newIDKey, idErr := security.ClientIdentityKey(cfg)
+		if idErr == nil && newIDKey != oldIDKey {
+			// 新旧身份状态库锁不同时，先打开新引擎，确认可用后再优雅关闭旧实例
+			res := openIdentityStack(cfg, prof.Label)
+			if res.err != nil {
+				return res
+			}
+			if oldMgr != nil {
+				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				err = oldMgr.Quiesce(ctx)
+				cancel()
+				if err != nil {
+					if res.runner != nil {
+						_ = res.runner.Close()
+					}
+					if res.manager != nil {
+						_ = res.manager.Close()
+					}
+					return identityActivatedMsg{err: fmt.Errorf("切换身份前暂停当前任务失败：%w", err)}
+				}
+				_ = oldRunner.Close()
+				_ = oldMgr.Close()
+			}
+			res.activeID = prof.ID
+			return res
+		}
+
 		if oldMgr != nil {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			err = oldMgr.Quiesce(ctx)
@@ -419,17 +465,11 @@ func (m *model) activateChoiceCmd(ch identityChoice, customPath string) tea.Cmd 
 			_ = oldRunner.Close()
 			_ = oldMgr.Close()
 		}
-		var cfg config.Client
-		if useSel {
-			cfg, err = identity.Select(exeDir, prof.ID, prof.Label)
-		} else {
-			cfg, err = identity.SelectPrepared(exeDir, prof, prof.Label)
-		}
-		if err != nil {
-			return identityActivatedMsg{err: err}
-		}
 		res := openIdentityStack(cfg, prof.Label)
 		res.activeID = prof.ID
+		if res.err != nil && oldMgr != nil {
+			res.resetOld = true
+		}
 		return res
 	}
 }
@@ -489,6 +529,16 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case identityActivatedMsg:
 		if msg.err != nil {
+			if msg.resetOld {
+				m.cfg = nil
+				m.manager = nil
+				m.runner = nil
+				m.idKey = ""
+				m.activeID = ""
+				m.identityLabel = "未选择"
+				m.activeTasks = nil
+				m.historyTasks = nil
+			}
 			if m.cfg == nil {
 				firstOpen := m.modal != modalIdentity
 				m.modal = modalIdentity
@@ -557,7 +607,7 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		} else {
 			m.statusToast = "已切换为浅色主题"
 		}
-		return m, saveThemePrefCmd(m.prefsPath, m.th.dark)
+		return m, saveUIPrefsCmd(m.prefsPath, m.currentPrefs())
 	}
 
 	// 1. 文本编辑态优先独占输入（避免误触单字母快捷键）
@@ -659,11 +709,17 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.pathInput.CursorEnd()
 		return m, textinput.Blink
 	case "o":
-		m.sortMode = (m.sortMode + 1) % 4
-		m.rebuildLocalVisible()
-		m.rebuildRemoteVisible()
-		m.statusToast = "排序：" + m.sortLabel()
-		return m, nil
+		switch m.focus {
+		case areaRemote:
+			m.remoteSort = (m.remoteSort + 1) % 4
+			m.rebuildRemoteVisible()
+			m.statusToast = "远端排序：" + m.sortLabel(m.remoteSort)
+		default:
+			m.localSort = (m.localSort + 1) % 4
+			m.rebuildLocalVisible()
+			m.statusToast = "本地排序：" + m.sortLabel(m.localSort)
+		}
+		return m, saveUIPrefsCmd(m.prefsPath, m.currentPrefs())
 	case "r":
 		if m.focus == areaQueue && m.historyView {
 			return m, m.retryHistoryCmd()
@@ -671,6 +727,7 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, tea.Batch(m.loadLocalCmd(m.localDir), m.loadRemoteCmd())
 	case "i", "f4":
 		m.modal = modalIdentity
+		m.statusToast = ""
 		m.idInputFocus = false
 		m.idInput.Blur()
 		return m, m.scanIdentitiesCmd()
@@ -964,18 +1021,23 @@ func (m *model) handleModalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.modal = modalNone
 			m.pendingSpecs = nil
 			m.conflictNames = nil
+			m.statusToast = ""
 			return m, nil
 		case "r", "a":
 			specs := m.resolveConflictsAutoRename()
+			m.clearSelectionForDir(m.pendingBatchDir)
 			m.modal = modalNone
 			m.pendingSpecs = nil
 			m.conflictNames = nil
+			m.statusToast = ""
 			return m, m.enqueueSpecsCmd(specs)
 		case "s":
 			specs := m.resolveConflictsSkip()
+			m.clearSelectionForDir(m.pendingBatchDir)
 			m.modal = modalNone
 			m.pendingSpecs = nil
 			m.conflictNames = nil
+			m.statusToast = ""
 			return m, m.enqueueSpecsCmd(specs)
 		}
 		return m, nil
@@ -985,6 +1047,7 @@ func (m *model) handleModalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		case "esc":
 			m.modal = modalNone
 			m.renameTask = nil
+			m.statusToast = ""
 			return m, nil
 		case "enter":
 			t := m.renameTask
@@ -1003,15 +1066,43 @@ func (m *model) handleModalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.renameInput.Focus()
 				return m, textinput.Blink
 			}
-			m.modal = modalNone
-			m.renameTask = nil
 			spec := queue.Spec{Direction: t.Direction, Remote: t.Remote, Path: t.Path, Size: t.Size}
 			if t.Direction == protocol.DirectionUpload {
 				spec.Remote = newName
+				for _, f := range m.remoteEntries {
+					if f.FileName == newName {
+						m.statusToast = "远端已存在同名文件：" + newName
+						m.renameInput.Focus()
+						return m, textinput.Blink
+					}
+				}
 			} else {
 				spec.Path = filepath.Join(filepath.Dir(t.Path), newName)
+				if _, err := os.Lstat(spec.Path); err == nil {
+					m.statusToast = "本地目录已存在同名文件：" + newName
+					m.renameInput.Focus()
+					return m, textinput.Blink
+				} else if !os.IsNotExist(err) {
+					m.statusToast = err.Error()
+					m.renameInput.Focus()
+					return m, textinput.Blink
+				}
 			}
-			return m, m.enqueueSpecsCmd([]queue.Spec{spec})
+			if m.manager == nil {
+				m.statusToast = "当前队列不可用，请先激活身份"
+				return m, nil
+			}
+			tasks, err := m.manager.Enqueue([]queue.Spec{spec})
+			if err != nil {
+				m.statusToast = err.Error()
+				m.renameInput.Focus()
+				return m, textinput.Blink
+			}
+			m.modal = modalNone
+			m.renameTask = nil
+			m.refreshQueueSnapshots()
+			m.statusToast = fmt.Sprintf("已入队 %d 个传输任务", len(tasks))
+			return m, nil
 		}
 		var cmd tea.Cmd
 		m.renameInput, cmd = m.renameInput.Update(msg)
@@ -1234,13 +1325,18 @@ func (m *model) handleQueueKey(k string) (tea.Model, tea.Cmd) {
 			m.openTaskDetail(*t)
 		}
 	case "n":
-		if t := m.selectedTask(); t != nil && !t.Terminal() {
+		if t := m.selectedTask(); t != nil {
+			if t.State != queue.Paused && t.State != queue.Pending {
+				m.statusToast = "仅已暂停或待处理任务可改名另存重传"
+				return m, nil
+			}
 			m.renameTask = t
 			if t.Direction == protocol.DirectionUpload {
 				m.renameInput.SetValue(t.Remote)
 			} else {
 				m.renameInput.SetValue(filepath.Base(t.Path))
 			}
+			m.statusToast = ""
 			m.renameInput.Focus()
 			m.renameInput.CursorEnd()
 			m.modal = modalRename
@@ -1320,8 +1416,30 @@ func (m *model) refreshQueueSnapshots() bool {
 	return refreshFiles
 }
 
-func (m *model) sortLabel() string {
-	switch m.sortMode {
+func clampSortKind(v int) sortKind {
+	if v < int(sortNameAsc) || v > int(sortSizeAsc) {
+		return sortNameAsc
+	}
+	return sortKind(v)
+}
+
+func (m *model) currentPrefs() uiPrefs {
+	return uiPrefs{
+		Light:       !m.th.dark,
+		LocalOrder:  int(m.localSort),
+		RemoteOrder: int(m.remoteSort),
+	}
+}
+
+func (m *model) activeSortLabel() string {
+	if m.focus == areaRemote {
+		return "远端:" + m.sortLabel(m.remoteSort)
+	}
+	return "本地:" + m.sortLabel(m.localSort)
+}
+
+func (m *model) sortLabel(mode sortKind) string {
+	switch mode {
 	case sortNameDesc:
 		return "名称↓"
 	case sortSizeDesc:
@@ -1350,7 +1468,7 @@ func (m *model) rebuildLocalVisible() {
 		if a.dir != b.dir {
 			return a.dir
 		}
-		switch m.sortMode {
+		switch m.localSort {
 		case sortNameDesc:
 			return strings.ToLower(a.name) > strings.ToLower(b.name)
 		case sortSizeDesc:
@@ -1381,7 +1499,7 @@ func (m *model) rebuildRemoteVisible() {
 	}
 	sort.SliceStable(out, func(i, j int) bool {
 		a, b := out[i], out[j]
-		switch m.sortMode {
+		switch m.remoteSort {
 		case sortNameDesc:
 			return strings.ToLower(a.FileName) > strings.ToLower(b.FileName)
 		case sortSizeDesc:
@@ -1398,6 +1516,14 @@ func (m *model) rebuildRemoteVisible() {
 	m.visibleRemote = out
 	if m.remoteCursor >= len(out) {
 		m.remoteCursor = max(0, len(out)-1)
+	}
+}
+
+func (m *model) clearSelectionForDir(dir protocol.Direction) {
+	if dir == protocol.DirectionUpload {
+		m.localSelected = make(map[string]bool)
+	} else {
+		m.remoteSelected = make(map[string]bool)
 	}
 }
 
@@ -1423,13 +1549,7 @@ func (m *model) prepareUpload() tea.Cmd {
 		return nil
 	}
 
-	remoteSet := make(map[string]bool, len(m.remoteEntries))
-	for _, f := range m.remoteEntries {
-		remoteSet[f.FileName] = true
-	}
-
-	var specs []queue.Spec
-	var conflicts []string
+	specs := make([]queue.Spec, 0, len(chosen))
 	for _, e := range chosen {
 		specs = append(specs, queue.Spec{
 			Direction: protocol.DirectionUpload,
@@ -1437,19 +1557,8 @@ func (m *model) prepareUpload() tea.Cmd {
 			Path:      e.path,
 			Size:      uint64(max(0, e.size)),
 		})
-		if remoteSet[filepath.Base(e.path)] {
-			conflicts = append(conflicts, filepath.Base(e.path))
-		}
 	}
-	m.localSelected = make(map[string]bool)
-	if len(conflicts) > 0 {
-		m.pendingBatchDir = protocol.DirectionUpload
-		m.pendingSpecs = specs
-		m.conflictNames = conflicts
-		m.modal = modalConflict
-		return nil
-	}
-	return m.enqueueSpecsCmd(specs)
+	return m.prepareBatch(protocol.DirectionUpload, specs, true)
 }
 
 func (m *model) prepareDownload() tea.Cmd {
@@ -1472,40 +1581,65 @@ func (m *model) prepareDownload() tea.Cmd {
 		return nil
 	}
 
-	var specs []queue.Spec
-	var conflicts []string
+	specs := make([]queue.Spec, 0, len(chosen))
 	for _, f := range chosen {
-		dst := filepath.Join(m.localDir, f.FileName)
 		specs = append(specs, queue.Spec{
 			Direction: protocol.DirectionDownload,
 			Remote:    f.FileName,
-			Path:      dst,
+			Path:      filepath.Join(m.localDir, f.FileName),
 			Size:      f.Size,
 		})
-		if _, err := os.Lstat(dst); err == nil {
-			conflicts = append(conflicts, f.FileName)
+	}
+	return m.prepareBatch(protocol.DirectionDownload, specs, true)
+}
+
+func (m *model) prepareBatch(dir protocol.Direction, specs []queue.Spec, clearSel bool) tea.Cmd {
+	var conflicts []string
+	if dir == protocol.DirectionUpload {
+		remoteSet := make(map[string]bool, len(m.remoteEntries))
+		for _, f := range m.remoteEntries {
+			remoteSet[f.FileName] = true
+		}
+		for _, s := range specs {
+			if remoteSet[s.Remote] {
+				conflicts = append(conflicts, s.Remote)
+			}
+		}
+	} else {
+		for _, s := range specs {
+			if _, err := os.Lstat(s.Path); err == nil {
+				conflicts = append(conflicts, filepath.Base(s.Path))
+			}
 		}
 	}
-	m.remoteSelected = make(map[string]bool)
 	if len(conflicts) > 0 {
-		m.pendingBatchDir = protocol.DirectionDownload
+		m.pendingBatchDir = dir
 		m.pendingSpecs = specs
 		m.conflictNames = conflicts
+		m.statusToast = ""
 		m.modal = modalConflict
 		return nil
+	}
+	if clearSel {
+		m.clearSelectionForDir(dir)
 	}
 	return m.enqueueSpecsCmd(specs)
 }
 
 func (m *model) resolveConflictsAutoRename() []queue.Spec {
 	used := make(map[string]bool)
+	ignoreCase := m.pendingBatchDir != protocol.DirectionUpload && runtime.GOOS == "windows"
 	if m.pendingBatchDir == protocol.DirectionUpload {
 		for _, f := range m.remoteEntries {
 			used[f.FileName] = true
 		}
 	} else {
 		for _, e := range m.localEntries {
-			used[e.name] = true
+			k := e.name
+			if ignoreCase {
+				k = strings.ToLower(k)
+			}
+			used[k] = true
 		}
 	}
 	out := make([]queue.Spec, 0, len(m.pendingSpecs))
@@ -1516,8 +1650,12 @@ func (m *model) resolveConflictsAutoRename() []queue.Spec {
 			s.Remote = name
 		} else {
 			base := filepath.Base(s.Path)
-			name := uniqueName(base, used)
-			used[name] = true
+			name := uniqueNameFold(base, used, ignoreCase)
+			k := name
+			if ignoreCase {
+				k = strings.ToLower(k)
+			}
+			used[k] = true
 			s.Path = filepath.Join(filepath.Dir(s.Path), name)
 		}
 		out = append(out, s)
@@ -1527,14 +1665,22 @@ func (m *model) resolveConflictsAutoRename() []queue.Spec {
 
 func (m *model) resolveConflictsSkip() []queue.Spec {
 	conflictSet := make(map[string]bool, len(m.conflictNames))
+	ignoreCase := m.pendingBatchDir != protocol.DirectionUpload && runtime.GOOS == "windows"
 	for _, c := range m.conflictNames {
-		conflictSet[c] = true
+		if ignoreCase {
+			conflictSet[strings.ToLower(c)] = true
+		} else {
+			conflictSet[c] = true
+		}
 	}
 	out := make([]queue.Spec, 0, len(m.pendingSpecs))
 	for _, s := range m.pendingSpecs {
 		key := s.Remote
 		if s.Direction == protocol.DirectionDownload {
 			key = filepath.Base(s.Path)
+			if ignoreCase {
+				key = strings.ToLower(key)
+			}
 		}
 		if conflictSet[key] {
 			s.Skip = "用户跳过重名文件"
@@ -1563,7 +1709,17 @@ func trimUTF8Bytes(s string, maxBytes int) string {
 }
 
 func uniqueName(orig string, used map[string]bool) string {
-	if !used[orig] {
+	return uniqueNameFold(orig, used, false)
+}
+
+func uniqueNameFold(orig string, used map[string]bool, ignoreCase bool) string {
+	isUsed := func(name string) bool {
+		if ignoreCase {
+			return used[strings.ToLower(name)]
+		}
+		return used[name]
+	}
+	if !isUsed(orig) {
 		return orig
 	}
 	ext := filepath.Ext(orig)
@@ -1580,7 +1736,7 @@ func uniqueName(orig string, used map[string]bool) string {
 		if trimmed == "" && budget > 0 {
 			cand = fmt.Sprintf("%s-%d%s", trimUTF8Bytes(stem, budget-2), i, ext)
 		}
-		if len(cand) <= protocol.MaxFileNameBytes && protocol.ValidateName(cand) == nil && !used[cand] {
+		if len(cand) <= protocol.MaxFileNameBytes && protocol.ValidateName(cand) == nil && !isUsed(cand) {
 			return cand
 		}
 	}
@@ -1651,7 +1807,7 @@ func (m *model) resumeOrRetrySelectedCmd() tea.Cmd {
 	task := *t
 	if m.historyView || task.Terminal() {
 		spec := queue.Spec{Direction: task.Direction, Remote: task.Remote, Path: task.Path, Size: task.Size}
-		return m.enqueueSpecsCmd([]queue.Spec{spec})
+		return m.prepareBatch(task.Direction, []queue.Spec{spec}, false)
 	}
 	if task.State == queue.Paused || task.State == queue.Pending {
 		mgr := m.manager
@@ -1731,7 +1887,7 @@ func (m *model) retryHistoryCmd() tea.Cmd {
 		return nil
 	}
 	spec := queue.Spec{Direction: t.Direction, Remote: t.Remote, Path: t.Path, Size: t.Size}
-	return m.enqueueSpecsCmd([]queue.Spec{spec})
+	return m.prepareBatch(t.Direction, []queue.Spec{spec}, false)
 }
 
 func (m *model) pauseAllAndQuitCmd() tea.Cmd {

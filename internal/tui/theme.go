@@ -13,7 +13,9 @@ import (
 )
 
 type uiPrefs struct {
-	Light bool `json:"light"`
+	Light       bool `json:"light"`
+	LocalOrder  int  `json:"local_order,omitempty"`
+	RemoteOrder int  `json:"remote_order,omitempty"`
 }
 
 type themeSavedMsg struct {
@@ -30,24 +32,28 @@ func resolvePrefsPath(override, exeDir, filename string) string {
 	return filename
 }
 
-func loadThemePref(path string) bool {
+func loadUIPrefs(path string) uiPrefs {
 	data, err := pal.ReadSmall(path, 8192)
 	if err != nil {
-		return true
+		return uiPrefs{}
 	}
 	var prefs uiPrefs
 	if err := json.Unmarshal(data, &prefs); err != nil {
-		return true
+		return uiPrefs{}
 	}
-	return !prefs.Light
+	return prefs
 }
 
-func saveThemePrefCmd(path string, dark bool) tea.Cmd {
+func loadThemePref(path string) bool {
+	return !loadUIPrefs(path).Light
+}
+
+func saveUIPrefsCmd(path string, prefs uiPrefs) tea.Cmd {
 	if path == "" {
 		return nil
 	}
 	return func() tea.Msg {
-		data, err := json.MarshalIndent(uiPrefs{Light: !dark}, "", "  ")
+		data, err := json.MarshalIndent(prefs, "", "  ")
 		if err != nil {
 			return themeSavedMsg{err: err}
 		}
@@ -56,6 +62,12 @@ func saveThemePrefCmd(path string, dark bool) tea.Cmd {
 		}
 		return themeSavedMsg{err: pal.StageAndReplaceMode(path, append(data, '\n'), 0600, false)}
 	}
+}
+
+func saveThemePrefCmd(path string, dark bool) tea.Cmd {
+	prefs := loadUIPrefs(path)
+	prefs.Light = !dark
+	return saveUIPrefsCmd(path, prefs)
 }
 
 func tabHitIndex(x, startOffset int, labels []string, th theme, activeIdx int) int {

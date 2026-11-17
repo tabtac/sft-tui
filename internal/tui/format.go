@@ -14,7 +14,18 @@ import (
 	"sft-tui/internal/queue"
 )
 
+// sanitizeInline 替换换行符与控制字符为空格，防止日志或异常名称破坏单行渲染或注入转义序列。
+func sanitizeInline(s string) string {
+	return strings.Map(func(r rune) rune {
+		if r < ' ' || r == 0x7f {
+			return ' '
+		}
+		return r
+	}, s)
+}
+
 func truncCell(s string, width int) string {
+	s = sanitizeInline(s)
 	if width <= 0 {
 		return ""
 	}

@@ -69,7 +69,8 @@ func (m *model) renderHeader() string {
 	stats := m.th.badgeMuted.Render(fmt.Sprintf("进行:%d  暂停:%d  历史:%d  %s",
 		runCount, pauseCount, len(m.historyTasks), progress.FormatRate(totalRate)))
 
-	left := lipgloss.JoinHorizontal(lipgloss.Center, brand, " ", idBadge, " ", connBadge)
+	leftBudget := max(16, m.width-2-lipgloss.Width(stats)-1)
+	left := truncCell(lipgloss.JoinHorizontal(lipgloss.Center, brand, " ", idBadge, " ", connBadge), leftBudget)
 	gap := max(1, m.width-lipgloss.Width(left)-lipgloss.Width(stats)-2)
 	line := left + strings.Repeat(" ", gap) + stats
 	return m.th.headerBar.Width(m.width).Render(truncCell(line, m.width-2))
@@ -90,7 +91,7 @@ func (m *model) renderSubHeader() string {
 		searchView += m.th.badgeMuted.Render("全部")
 	}
 
-	sortLabel := m.th.badgeMuted.Render("排序(o): " + m.sortLabel())
+	sortLabel := m.th.badgeMuted.Render("排序(o): " + m.activeSortLabel())
 	msg := ""
 	if m.statusToast != "" {
 		msg = "  " + m.th.toast.Render("· "+truncCell(m.statusToast, max(10, m.width/4)))
