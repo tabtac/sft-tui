@@ -152,6 +152,13 @@ func (m *Mux) Open(direction protocol.Direction) (*Stream, error) {
 func (s *Stream) Context() context.Context        { return s.ctx }
 func (s *Stream) PayloadContext() context.Context { return s.payloadCtx }
 func (s *Stream) ChunkSize() uint32               { return s.mux.conn.Chunk }
+func (s *Stream) WindowSize() uint32              { return s.mux.window }
+
+func (s *Stream) HasBuffered() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.inbox) > 0
+}
 
 func (s *Stream) EnableReceive(offset uint64) {
 	s.mu.Lock()

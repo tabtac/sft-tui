@@ -456,6 +456,27 @@ func (s *Server) handleUpload(user string, bw config.Bandwidth, st *session.Stre
 	}
 
 	offset := task.Offset
+	committedOffset := task.Offset
+	lastFlush := time.Now()
+	flushBatch := uint64(max(st.ChunkSize(), min(st.WindowSize()/2, 512*1024)))
+	flushUpload := func(waitCtx context.Context, throttle bool) error {
+		if offset <= committedOffset {
+			return nil
+		}
+		if throttle {
+			if err := s.waitCheckpoint(waitCtx, user, bw); err != nil {
+				return err
+			}
+		}
+		committed, err := s.store.FlushUploadCheckpoint(st.Context(), task.ID, lease)
+		if err != nil {
+			return err
+		}
+		committedOffset = committed
+		lastFlush = time.Now()
+		s.progress(monID, committedOffset, "传输")
+		return st.Send(protocol.TypeAck, protocol.Ack{NextOffset: committedOffset})
+	}
 	if offset == task.FileSize {
 		if err = st.Send(protocol.TypeAck, protocol.Ack{NextOffset: offset}); err != nil {
 			return "failed", err
@@ -463,7 +484,25 @@ func (s *Server) handleUpload(user string, bw config.Bandwidth, st *session.Stre
 	}
 
 	for {
-		frame, err := st.Receive()
+		var frame protocol.Frame
+		var err error
+		if offset > committedOffset && !st.HasBuffered() {
+			waitCtx, cancelWait := context.WithTimeout(st.Context(), 15*time.Millisecond)
+			frame, err = st.ReceiveContext(waitCtx)
+			timedOut := errors.Is(err, context.DeadlineExceeded) && waitCtx.Err() == context.DeadlineExceeded && st.Context().Err() == nil
+			cancelWait()
+			if timedOut {
+				if fErr := flushUpload(st.PayloadContext(), true); fErr != nil {
+					if st.PayloadContext().Err() != nil && st.Context().Err() == nil {
+						continue
+					}
+					return "paused", fErr
+				}
+				continue
+			}
+		} else {
+			frame, err = st.Receive()
+		}
 		if err != nil {
 			return "paused", err
 		}
@@ -485,26 +524,30 @@ func (s *Server) handleUpload(user string, bw config.Bandwidth, st *session.Stre
 				}
 				return "paused", err
 			}
-			if err = s.waitCheckpoint(st.PayloadContext(), user, bw); err != nil {
-				if st.PayloadContext().Err() != nil && st.Context().Err() == nil {
-					continue
-				}
-				return "paused", err
-			}
 			if _, err = s.authorize(user, "upload"); err != nil {
 				return "failed", err
 			}
-			newOffset, err := s.store.WriteUploadChunk(st.Context(), task.ID, lease, d.FileOffset, d.Bytes)
+			newOffset, err := s.store.StageUploadChunk(st.Context(), task.ID, lease, d.FileOffset, d.Bytes)
 			if err != nil {
 				return "failed", err
 			}
 			offset = newOffset
 			s.progress(monID, offset, "传输")
-			if err = st.Send(protocol.TypeAck, protocol.Ack{NextOffset: offset}); err != nil {
-				return "paused", err
+			if offset == task.FileSize || offset-committedOffset >= flushBatch || time.Since(lastFlush) >= 50*time.Millisecond {
+				if err = flushUpload(st.PayloadContext(), true); err != nil {
+					if st.PayloadContext().Err() != nil && st.Context().Err() == nil {
+						continue
+					}
+					return "paused", err
+				}
 			}
 
 		case protocol.TypeCommit:
+			if offset > committedOffset {
+				if err = flushUpload(st.Context(), true); err != nil {
+					return "failed", err
+				}
+			}
 			s.progress(monID, offset, "校验提交")
 			var c protocol.Commit
 			if err = protocol.Unmarshal(frame.Payload, &c); err != nil {
@@ -532,6 +575,11 @@ func (s *Server) handleUpload(user string, bw config.Bandwidth, st *session.Stre
 			if !c.Mode.Valid() {
 				return "failed", &protocol.RemoteError{Code: protocol.CodeBadFrame, Message: "非法取消模式"}
 			}
+			if c.Mode == protocol.CancelPause && offset > committedOffset {
+				if committed, fErr := s.store.FlushUploadCheckpoint(st.Context(), task.ID, lease); fErr == nil {
+					committedOffset = committed
+				}
+			}
 			targetStatus := storage.TaskPaused
 			outcome = "paused"
 			if c.Mode == protocol.CancelAbort {
@@ -545,7 +593,7 @@ func (s *Server) handleUpload(user string, bw config.Bandwidth, st *session.Stre
 			release()
 			return outcome, st.Send(protocol.TypeCancelAck, protocol.CancelAck{
 				Mode:           c.Mode,
-				AcceptedOffset: offset,
+				AcceptedOffset: committedOffset,
 			})
 
 		default:
@@ -582,14 +630,16 @@ func (s *Server) handleDownload(user string, bw config.Bandwidth, st *session.St
 
 	s.describe(monID, task.FileName, task.FileSize, task.Offset)
 
-	ackedOffset := task.Offset
+	var ackAtomic atomic.Uint64
+	ackAtomic.Store(task.Offset)
 	settled := false
 	defer func() {
 		if settled || lease == 0 {
 			return
 		}
-		if ackedOffset > task.Offset {
-			_ = s.store.CheckpointDownloadSession(context.Background(), task.ID, lease, ackedOffset)
+		curAck := ackAtomic.Load()
+		if curAck > task.Offset {
+			_ = s.store.CheckpointDownloadSession(context.Background(), task.ID, lease, curAck)
 		}
 		finalStatus := storage.TaskPaused
 		if isHardServerFailure(resultErr) || isHardServerFailure(st.Cause()) {
@@ -640,8 +690,9 @@ func (s *Server) handleDownload(user string, bw config.Bandwidth, st *session.St
 		if !c.Mode.Valid() {
 			return "failed", &protocol.RemoteError{Code: protocol.CodeBadFrame, Message: "非法取消模式"}
 		}
-		if ackedOffset > task.Offset {
-			if err := s.store.CheckpointDownloadSession(st.Context(), task.ID, lease, ackedOffset); err != nil {
+		curAck := ackAtomic.Load()
+		if curAck > task.Offset {
+			if err := s.store.CheckpointDownloadSession(st.Context(), task.ID, lease, curAck); err != nil {
 				return "failed", err
 			}
 		}
@@ -658,92 +709,186 @@ func (s *Server) handleDownload(user string, bw config.Bandwidth, st *session.St
 		release()
 		return out, st.Send(protocol.TypeCancelAck, protocol.CancelAck{
 			Mode:           c.Mode,
-			AcceptedOffset: ackedOffset,
+			AcceptedOffset: curAck,
 		})
 	}
 
-	receiveAck := func(expected uint64) (cancelled bool, out string, err error) {
+	if startOffset == task.FileSize {
 		for {
 			frame, err := st.Receive()
 			if err != nil {
-				return false, "paused", err
+				return "paused", err
 			}
 			if frame.Header.Type == protocol.TypeCancel {
-				out, err = cancelDownload(frame.Payload)
-				return true, out, err
+				return cancelDownload(frame.Payload)
 			}
 			if frame.Header.Type != protocol.TypeAck {
-				return false, "failed", &protocol.RemoteError{Code: protocol.CodeBadState, Message: "下载等待 ACK"}
+				return "failed", &protocol.RemoteError{Code: protocol.CodeBadState, Message: "下载等待 ACK"}
 			}
 			var ack protocol.Ack
 			if err = protocol.Unmarshal(frame.Payload, &ack); err != nil {
-				return false, "failed", err
+				return "failed", err
 			}
-			if ack.NextOffset == ackedOffset && ackedOffset < expected {
+			if ack.NextOffset != startOffset {
+				return "failed", &protocol.RemoteError{Code: protocol.CodeOffsetMismatch, Message: "下载 ACK 偏移非法"}
+			}
+			break
+		}
+	} else {
+		win := uint64(max(st.WindowSize(), st.ChunkSize()))
+		ckptBatch := uint64(max(st.ChunkSize(), min(st.WindowSize()/2, 512*1024)))
+		dlCtx, stopDL := context.WithCancel(st.Context())
+		defer stopDL()
+
+		var sentAtomic atomic.Uint64
+		sentAtomic.Store(startOffset)
+		ackSignal := make(chan struct{}, 1)
+
+		type dlAckOutcome struct {
+			cancelled bool
+			out       string
+			err       error
+		}
+		ackDone := make(chan dlAckOutcome, 1)
+		go func() {
+			curAck := startOffset
+			persisted := startOffset
+			for curAck < task.FileSize {
+				frame, rErr := st.Receive()
+				if rErr != nil {
+					stopDL()
+					ackDone <- dlAckOutcome{out: "paused", err: rErr}
+					return
+				}
+				if frame.Header.Type == protocol.TypeCancel {
+					stopDL()
+					out, cErr := cancelDownload(frame.Payload)
+					ackDone <- dlAckOutcome{cancelled: true, out: out, err: cErr}
+					return
+				}
+				if frame.Header.Type != protocol.TypeAck {
+					stopDL()
+					ackDone <- dlAckOutcome{out: "failed", err: &protocol.RemoteError{Code: protocol.CodeBadState, Message: "下载等待 ACK"}}
+					return
+				}
+				var ack protocol.Ack
+				if uErr := protocol.Unmarshal(frame.Payload, &ack); uErr != nil {
+					stopDL()
+					ackDone <- dlAckOutcome{out: "failed", err: uErr}
+					return
+				}
+				maxSent := sentAtomic.Load()
+				if ack.NextOffset < curAck || ack.NextOffset > maxSent {
+					stopDL()
+					ackDone <- dlAckOutcome{out: "failed", err: &protocol.RemoteError{Code: protocol.CodeOffsetMismatch, Message: "下载 ACK 偏移非法"}}
+					return
+				}
+				if ack.NextOffset == curAck {
+					continue
+				}
+				curAck = ack.NextOffset
+				ackAtomic.Store(curAck)
+				select {
+				case ackSignal <- struct{}{}:
+				default:
+				}
+				if curAck == task.FileSize || curAck-persisted >= ckptBatch {
+					if cErr := s.store.CheckpointDownloadSession(st.Context(), task.ID, lease, curAck); cErr != nil {
+						stopDL()
+						ackDone <- dlAckOutcome{out: "failed", err: cErr}
+						return
+					}
+					persisted = curAck
+				}
+				s.progress(monID, curAck, "传输")
+			}
+			if curAck > persisted {
+				if cErr := s.store.CheckpointDownloadSession(st.Context(), task.ID, lease, curAck); cErr != nil {
+					ackDone <- dlAckOutcome{out: "failed", err: cErr}
+					return
+				}
+			}
+			ackDone <- dlAckOutcome{}
+		}()
+
+		buf := make([]byte, st.ChunkSize())
+		sendAborted := false
+		var sendOut string
+		var sendErr error
+	sendLoop:
+		for offset < task.FileSize {
+			for offset-ackAtomic.Load() >= win {
+				select {
+				case <-dlCtx.Done():
+					sendAborted = true
+					break sendLoop
+				case <-st.PayloadContext().Done():
+					sendAborted = true
+					break sendLoop
+				case <-ackSignal:
+				}
+			}
+			if dlCtx.Err() != nil || st.PayloadContext().Err() != nil {
+				sendAborted = true
+				break
+			}
+			n := int(min(uint64(len(buf)), task.FileSize-offset))
+			if winAvail := win - (offset - ackAtomic.Load()); uint64(n) > winAvail {
+				n = int(winAvail)
+			}
+			if n <= 0 {
 				continue
 			}
-			if ack.NextOffset < ackedOffset || ack.NextOffset > expected {
-				return false, "failed", &protocol.RemoteError{Code: protocol.CodeOffsetMismatch, Message: "下载 ACK 偏移非法"}
+			if _, err = io.ReadFull(file, buf[:n]); err != nil {
+				sendAborted, sendOut, sendErr = true, "failed", err
+				break
 			}
-			ackedOffset = ack.NextOffset
-			if ackedOffset == expected {
-				if err := s.store.CheckpointDownloadSession(st.Context(), task.ID, lease, ackedOffset); err != nil {
-					return false, "failed", err
+			if _, err = s.authorize(user, "download"); err != nil {
+				sendAborted, sendOut, sendErr = true, "failed", err
+				break
+			}
+			if err = s.waitBandwidth(st.PayloadContext(), user, bw, protocol.DirectionDownload, n); err != nil {
+				sendAborted = true
+				if st.PayloadContext().Err() == nil || st.Context().Err() != nil {
+					sendOut, sendErr = "paused", err
 				}
-				s.progress(monID, ackedOffset, "传输")
-				return false, "", nil
+				break
 			}
-		}
-	}
-
-	buf := make([]byte, st.ChunkSize())
-	for offset < task.FileSize {
-		n := int(min(uint64(len(buf)), task.FileSize-offset))
-		if _, err = io.ReadFull(file, buf[:n]); err != nil {
-			return "failed", err
-		}
-		if _, err = s.authorize(user, "download"); err != nil {
-			return "failed", err
-		}
-		if err = s.waitBandwidth(st.PayloadContext(), user, bw, protocol.DirectionDownload, n); err != nil {
-			if st.PayloadContext().Err() != nil && st.Context().Err() == nil {
-				if _, out, e := receiveAck(offset); e != nil || out != "" {
-					return out, e
+			if st.PayloadContext().Err() != nil || dlCtx.Err() != nil {
+				sendAborted = true
+				break
+			}
+			sentAtomic.Store(offset + uint64(n))
+			if err = st.SendContext(st.PayloadContext(), protocol.TypeData, protocol.Data{FileOffset: offset, Bytes: buf[:n]}); err != nil {
+				sendAborted = true
+				if st.PayloadContext().Err() == nil || st.Context().Err() != nil {
+					sendOut, sendErr = "paused", err
 				}
-				return "paused", err
+				break
 			}
-			return "paused", err
+			offset += uint64(n)
 		}
-		if st.PayloadContext().Err() != nil && st.Context().Err() == nil {
-			if _, out, e := receiveAck(offset); e != nil || out != "" {
-				return out, e
-			}
-			return "paused", st.PayloadContext().Err()
+
+		if sendErr != nil {
+			stopDL()
+			st.Report(sendErr)
 		}
-		if err = st.Send(protocol.TypeData, protocol.Data{FileOffset: offset, Bytes: buf[:n]}); err != nil {
-			return "paused", err
+		res := <-ackDone
+		if res.cancelled {
+			return res.out, res.err
 		}
-		offset += uint64(n)
-		cancelled, out, err := receiveAck(offset)
-		if err != nil {
-			return out, err
+		if sendErr != nil {
+			return sendOut, sendErr
 		}
-		if cancelled {
-			return out, nil
+		if res.err != nil {
+			return res.out, res.err
+		}
+		if sendAborted && st.Context().Err() != nil {
+			return "paused", st.Context().Err()
 		}
 	}
 
-	if startOffset == task.FileSize {
-		cancelled, out, err := receiveAck(offset)
-		if err != nil {
-			return out, err
-		}
-		if cancelled {
-			return out, nil
-		}
-	}
-
-	s.progress(monID, ackedOffset, "等待客户端校验")
+	s.progress(monID, ackAtomic.Load(), "等待客户端校验")
 	for {
 		frame, err := st.Receive()
 		if err != nil {
@@ -757,7 +902,7 @@ func (s *Server) handleDownload(user string, bw config.Bandwidth, st *session.St
 			if err = protocol.Unmarshal(frame.Payload, &ack); err != nil {
 				return "failed", err
 			}
-			if ack.NextOffset != ackedOffset {
+			if ack.NextOffset != ackAtomic.Load() {
 				return "failed", &protocol.RemoteError{Code: protocol.CodeOffsetMismatch, Message: "最终 ACK 偏移非法"}
 			}
 		case protocol.TypeCommit:

@@ -4,12 +4,25 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
+	"io"
 	"math"
 	"os"
+	"sync"
 	"time"
 
 	"sft-tui/internal/protocol"
 )
+
+type stageWriter struct {
+	mu        sync.Mutex
+	file      *os.File
+	fileSize  uint64
+	offset    uint64
+	committed uint64
+	dirty     bool
+	closed    bool
+}
 
 // Configure 设置用户配额、文件大小上限与断点保留期。
 func (s *Store) Configure(limits Limits) {
@@ -262,10 +275,182 @@ func (s *Store) WriteUploadChunk(ctx context.Context, taskID protocol.TransferID
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if err := s.checkLeaseLocked(IDToHex(taskID), lease); err != nil {
+	idHex := IDToHex(taskID)
+	if err := s.checkLeaseLocked(idHex, lease); err != nil {
+		return 0, err
+	}
+	if err := s.closeStageHandleLocked(idHex); err != nil {
 		return 0, err
 	}
 	return s.writeChunkLocked(ctx, taskID, offset, data)
+}
+
+func (s *Store) closeStageHandleLocked(idHex string) error {
+	sw := s.stageHandles[idHex]
+	if sw == nil {
+		return nil
+	}
+	delete(s.stageHandles, idHex)
+	sw.mu.Lock()
+	defer sw.mu.Unlock()
+	sw.closed = true
+	if sw.file != nil {
+		err := sw.file.Close()
+		sw.file = nil
+		return err
+	}
+	return nil
+}
+
+// StageUploadChunk 使用会话级持久化文件句柄追加上传分片，不立即调用 Sync/提交 SQLite。
+func (s *Store) StageUploadChunk(ctx context.Context, taskID protocol.TransferID, lease uint64, offset uint64, data []byte) (uint64, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	if len(data) == 0 {
+		return 0, errors.New("empty chunk is not permitted")
+	}
+
+	s.mu.Lock()
+	idHex := IDToHex(taskID)
+	if err := s.checkLeaseLocked(idHex, lease); err != nil {
+		s.mu.Unlock()
+		return 0, err
+	}
+	sw := s.stageHandles[idHex]
+	if sw == nil {
+		task, err := s.getTaskLocked(ctx, taskID)
+		if err != nil {
+			s.mu.Unlock()
+			return 0, err
+		}
+		if task.Direction != protocol.DirectionUpload || task.Status != TaskActive {
+			s.mu.Unlock()
+			return 0, ErrTaskNotActive
+		}
+		partRel := stagingRelPath(taskID)
+		info, err := s.root.Lstat(partRel)
+		if err != nil {
+			s.mu.Unlock()
+			return 0, err
+		}
+		if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+			s.mu.Unlock()
+			return 0, fmt.Errorf("security violation: staging part file %q is a symlink or irregular", partRel)
+		}
+		f, err := s.root.OpenFile(partRel, os.O_WRONLY, 0600)
+		if err != nil {
+			s.mu.Unlock()
+			return 0, err
+		}
+		if _, err := f.Seek(int64(task.Offset), io.SeekStart); err != nil {
+			_ = f.Close()
+			s.mu.Unlock()
+			return 0, err
+		}
+		sw = &stageWriter{
+			file:      f,
+			fileSize:  task.FileSize,
+			offset:    task.Offset,
+			committed: task.Offset,
+		}
+		if s.stageHandles == nil {
+			s.stageHandles = make(map[string]*stageWriter)
+		}
+		s.stageHandles[idHex] = sw
+	}
+	sw.mu.Lock()
+	s.mu.Unlock()
+	defer sw.mu.Unlock()
+
+	if sw.closed || sw.file == nil {
+		return 0, ErrTaskNotActive
+	}
+	if offset != sw.offset {
+		return 0, fmt.Errorf("offset mismatch: expected %d, got %d: %w", sw.offset, offset, ErrOffsetMismatch)
+	}
+	if offset > math.MaxInt64 || uint64(len(data)) > math.MaxInt64 || offset+uint64(len(data)) > sw.fileSize {
+		return 0, fmt.Errorf("chunk exceeds file size limit: offset=%d len=%d size=%d", offset, len(data), sw.fileSize)
+	}
+	for rem := data; len(rem) > 0; {
+		n, err := sw.file.Write(rem)
+		if err != nil {
+			return 0, err
+		}
+		rem = rem[n:]
+	}
+	sw.offset += uint64(len(data))
+	sw.dirty = true
+	return sw.offset, nil
+}
+
+// FlushUploadCheckpoint 将已写入的暂存数据刷盘并推进 SQLite 持久化检查点。
+func (s *Store) FlushUploadCheckpoint(ctx context.Context, taskID protocol.TransferID, lease uint64) (uint64, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	idHex := IDToHex(taskID)
+
+	s.mu.Lock()
+	if err := s.checkLeaseLocked(idHex, lease); err != nil {
+		s.mu.Unlock()
+		return 0, err
+	}
+	sw := s.stageHandles[idHex]
+	if sw == nil {
+		task, err := s.getTaskLocked(ctx, taskID)
+		s.mu.Unlock()
+		if err != nil {
+			return 0, err
+		}
+		return task.Offset, nil
+	}
+	sw.mu.Lock()
+	s.mu.Unlock()
+
+	if sw.closed || sw.file == nil {
+		sw.mu.Unlock()
+		return 0, ErrTaskNotActive
+	}
+	if sw.dirty {
+		if err := sw.file.Sync(); err != nil {
+			sw.mu.Unlock()
+			return 0, err
+		}
+		sw.dirty = false
+	}
+	targetOffset := sw.offset
+	alreadyCommitted := sw.committed == targetOffset
+	sw.mu.Unlock()
+	if alreadyCommitted {
+		return targetOffset, nil
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.checkLeaseLocked(idHex, lease); err != nil {
+		return 0, err
+	}
+	now := time.Now().Unix()
+	expires := now + int64(s.retention.Seconds())
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE tasks SET offset=?, updated_at=?, expires_at=? WHERE id=? AND status=? AND offset<=?
+	`, targetOffset, now, expires, idHex, string(TaskActive), targetOffset)
+	if err != nil {
+		return 0, err
+	}
+	rows, _ := res.RowsAffected()
+	if rows == 0 {
+		return 0, ErrTaskNotActive
+	}
+	if sw == s.stageHandles[idHex] {
+		sw.mu.Lock()
+		if targetOffset > sw.committed {
+			sw.committed = targetOffset
+		}
+		sw.mu.Unlock()
+	}
+	return targetOffset, nil
 }
 
 // CommitUploadSession 校验租约并完成最终 SHA-256 校验与原子发布，发布成功后释放租约。
@@ -275,6 +460,9 @@ func (s *Store) CommitUploadSession(ctx context.Context, taskID protocol.Transfe
 
 	idHex := IDToHex(taskID)
 	if err := s.checkLeaseLocked(idHex, lease); err != nil {
+		return err
+	}
+	if err := s.closeStageHandleLocked(idHex); err != nil {
 		return err
 	}
 	if err := s.commitUploadLocked(ctx, taskID, fileSize, declaredSHA); err != nil {
@@ -455,6 +643,7 @@ func (s *Store) ReleaseTask(ctx context.Context, taskID protocol.TransferID, lea
 	if lease == 0 || s.leases[idHex] != lease {
 		return nil
 	}
+	_ = s.closeStageHandleLocked(idHex)
 	delete(s.leases, idHex)
 
 	task, err := s.getTaskLocked(ctx, taskID)

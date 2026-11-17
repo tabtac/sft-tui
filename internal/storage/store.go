@@ -21,14 +21,15 @@ import (
 
 // Store 服务端存储引擎，管理文件系统与 SQLite 状态库
 type Store struct {
-	root      *pal.Root
-	db        *sql.DB
-	lockFile  *os.File
-	mu        sync.RWMutex
-	retention time.Duration
-	limits    Limits
-	leases    map[string]uint64
-	nextLease uint64
+	root         *pal.Root
+	db           *sql.DB
+	lockFile     *os.File
+	mu           sync.RWMutex
+	retention    time.Duration
+	limits       Limits
+	leases       map[string]uint64
+	nextLease    uint64
+	stageHandles map[string]*stageWriter
 }
 
 // OpenStore 打开并初始化存储引擎，强制执行目录句柄锚定与子目录排他权限收紧。
@@ -114,11 +115,12 @@ func OpenStore(rootDir string) (*Store, error) {
 
 	ok = true
 	return &Store{
-		root:      root,
-		db:        db,
-		lockFile:  lFile,
-		retention: 24 * time.Hour,
-		leases:    make(map[string]uint64),
+		root:         root,
+		db:           db,
+		lockFile:     lFile,
+		retention:    24 * time.Hour,
+		leases:       make(map[string]uint64),
+		stageHandles: make(map[string]*stageWriter),
 	}, nil
 }
 
@@ -227,6 +229,11 @@ func (s *Store) Close() error {
 	defer s.mu.Unlock()
 
 	var errs []error
+	for idHex := range s.stageHandles {
+		if err := s.closeStageHandleLocked(idHex); err != nil {
+			errs = append(errs, err)
+		}
+	}
 	if s.db != nil {
 		errs = append(errs, s.db.Close())
 		s.db = nil

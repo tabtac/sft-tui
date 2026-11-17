@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"sft-tui/internal/config"
@@ -570,32 +571,7 @@ func (c *Client) executeUpload(ctx context.Context, task *queue.Task, op *queue.
 	}
 
 	buf := make([]byte, st.ChunkSize())
-	acked := offset
 	start := offset
-	for offset < size {
-		n := int(min(uint64(len(buf)), size-offset))
-		if _, err = io.ReadFull(file, buf[:n]); err != nil {
-			return result, err
-		}
-		if err = st.SendContext(runCtx, protocol.TypeData, protocol.Data{FileOffset: offset, Bytes: buf[:n]}); err != nil {
-			return result, err
-		}
-		offset += uint64(n)
-		for acked < offset {
-			var ack protocol.Ack
-			if err = st.ExpectContext(runCtx, protocol.TypeAck, &ack); err != nil {
-				return result, err
-			}
-			if ack.NextOffset < acked || ack.NextOffset > offset {
-				return result, &protocol.RemoteError{Code: protocol.CodeOffsetMismatch, Message: "上传 ACK 偏移不符"}
-			}
-			if ack.NextOffset == acked {
-				continue
-			}
-			acked = ack.NextOffset
-			reportProgress(progress, acked, size, queue.Transferring)
-		}
-	}
 	if start == size {
 		var ack protocol.Ack
 		if err = st.ExpectContext(runCtx, protocol.TypeAck, &ack); err != nil {
@@ -604,6 +580,80 @@ func (c *Client) executeUpload(ctx context.Context, task *queue.Task, op *queue.
 		if ack.NextOffset != offset {
 			return result, &protocol.RemoteError{Code: protocol.CodeOffsetMismatch, Message: "最终 ACK 偏移不符"}
 		}
+	} else {
+		win := uint64(max(st.WindowSize(), st.ChunkSize()))
+		uploadCtx, cancelUpload := context.WithCancel(runCtx)
+		var sentAtomic, ackAtomic atomic.Uint64
+		sentAtomic.Store(start)
+		ackAtomic.Store(start)
+		ackSignal := make(chan struct{}, 1)
+		ackDone := make(chan error, 1)
+
+		go func() {
+			curAck := start
+			for curAck < size {
+				var ack protocol.Ack
+				if aErr := st.ExpectContext(uploadCtx, protocol.TypeAck, &ack); aErr != nil {
+					cancelUpload()
+					ackDone <- aErr
+					return
+				}
+				maxSent := sentAtomic.Load()
+				if ack.NextOffset < curAck || ack.NextOffset > maxSent {
+					cancelUpload()
+					ackDone <- &protocol.RemoteError{Code: protocol.CodeOffsetMismatch, Message: "上传 ACK 偏移不符"}
+					return
+				}
+				if ack.NextOffset == curAck {
+					continue
+				}
+				curAck = ack.NextOffset
+				ackAtomic.Store(curAck)
+				reportProgress(progress, curAck, size, queue.Transferring)
+				select {
+				case ackSignal <- struct{}{}:
+				default:
+				}
+			}
+			ackDone <- nil
+		}()
+
+		for offset < size {
+			for offset-ackAtomic.Load() >= win {
+				select {
+				case <-uploadCtx.Done():
+					cancelUpload()
+					if aErr := <-ackDone; aErr != nil {
+						return result, aErr
+					}
+					return result, uploadCtx.Err()
+				case <-ackSignal:
+				}
+			}
+			n := int(min(uint64(len(buf)), size-offset))
+			if winAvail := win - (offset - ackAtomic.Load()); uint64(n) > winAvail {
+				n = int(winAvail)
+			}
+			if _, err = io.ReadFull(file, buf[:n]); err != nil {
+				cancelUpload()
+				<-ackDone
+				return result, err
+			}
+			sentAtomic.Store(offset + uint64(n))
+			if err = st.SendContext(uploadCtx, protocol.TypeData, protocol.Data{FileOffset: offset, Bytes: buf[:n]}); err != nil {
+				cancelUpload()
+				if aErr := <-ackDone; aErr != nil && !errors.Is(aErr, context.Canceled) {
+					return result, aErr
+				}
+				return result, err
+			}
+			offset += uint64(n)
+		}
+		if err = <-ackDone; err != nil {
+			cancelUpload()
+			return result, err
+		}
+		cancelUpload()
 	}
 
 	nowInfo, err = file.Stat()
@@ -890,9 +940,49 @@ func (c *Client) executeDownload(ctx context.Context, task *queue.Task, op *queu
 		if _, err = partFile.Seek(int64(offset), io.SeekStart); err != nil {
 			return result, err
 		}
+		persistedOffset := offset
+		lastFlush := time.Now()
+		flushBatch := uint64(max(st.ChunkSize(), min(st.WindowSize()/2, 512*1024)))
+		flushDownload := func(sendAck bool) error {
+			if offset > persistedOffset {
+				if fErr := partFile.Sync(); fErr != nil {
+					return fErr
+				}
+				if uErr := update(func(cur *queue.Task) {
+					cur.Done = offset
+				}); uErr != nil {
+					return uErr
+				}
+				persistedOffset = offset
+				task.Done = offset
+				lastFlush = time.Now()
+			}
+			if sendAck {
+				return st.SendContext(runCtx, protocol.TypeAck, protocol.Ack{NextOffset: offset})
+			}
+			return nil
+		}
+
 		for offset < size {
 			var data protocol.Data
-			if err = st.ExpectContext(runCtx, protocol.TypeData, &data); err != nil {
+			if offset > persistedOffset && !st.HasBuffered() {
+				readCtx, cancelRead := context.WithTimeout(runCtx, 15*time.Millisecond)
+				err = st.ExpectContext(readCtx, protocol.TypeData, &data)
+				timedOut := errors.Is(err, context.DeadlineExceeded) && readCtx.Err() == context.DeadlineExceeded && runCtx.Err() == nil
+				cancelRead()
+				if timedOut {
+					if err = flushDownload(offset < size); err != nil {
+						return result, err
+					}
+					continue
+				}
+			} else {
+				err = st.ExpectContext(runCtx, protocol.TypeData, &data)
+			}
+			if err != nil {
+				if offset > persistedOffset && (op == nil || op.Mode() != protocol.CancelAbort) {
+					_ = flushDownload(false)
+				}
 				return result, err
 			}
 			if data.FileOffset != offset || uint64(len(data.Bytes)) > size-offset {
@@ -905,19 +995,10 @@ func (c *Client) executeDownload(ctx context.Context, task *queue.Task, op *queu
 			if n != len(data.Bytes) {
 				return result, io.ErrShortWrite
 			}
-			if err = partFile.Sync(); err != nil {
-				return result, err
-			}
 			offset += uint64(n)
-			if err = update(func(cur *queue.Task) {
-				cur.Done = offset
-			}); err != nil {
-				return result, err
-			}
-			task.Done = offset
 			reportProgress(progress, offset, size, queue.Transferring)
-			if offset < size {
-				if err = st.SendContext(runCtx, protocol.TypeAck, protocol.Ack{NextOffset: offset}); err != nil {
+			if offset == size || offset-persistedOffset >= flushBatch || time.Since(lastFlush) >= 50*time.Millisecond {
+				if err = flushDownload(offset < size); err != nil {
 					return result, err
 				}
 			}

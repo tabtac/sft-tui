@@ -123,3 +123,43 @@ func TestSessionLeasesQuotaAndResume(t *testing.T) {
 		t.Fatalf("unexpected PublishedUsage: files=%d bytes=%d err=%v", files, totalBytes, err)
 	}
 }
+
+func TestStageAndFlushUploadCheckpointClosesHandleBeforeCommit(t *testing.T) {
+	ctx := context.Background()
+	s := reviewOpenStore(t, t.TempDir())
+	data := []byte("0123456789abcdef")
+	req := protocol.PutRequest{
+		RequestID:  protocol.RequestID{9},
+		FileName:   "staged.bin",
+		FileSize:   uint64(len(data)),
+		FileSHA256: sha256.Sum256(data),
+	}
+	task, lease, err := s.BeginUploadSession(ctx, "alice", req)
+	if err != nil {
+		t.Fatalf("BeginUploadSession: %v", err)
+	}
+	if next, err := s.StageUploadChunk(ctx, task.ID, lease, 0, data[:8]); err != nil || next != 8 {
+		t.Fatalf("StageUploadChunk #1: next=%d err=%v", next, err)
+	}
+	// Stage 未 Flush 时 SQLite offset 仍为 0
+	if cur, err := s.GetTask(ctx, task.ID); err != nil || cur.Offset != 0 {
+		t.Fatalf("expected uncommitted offset 0 before flush, got %+v err=%v", cur, err)
+	}
+	if next, err := s.StageUploadChunk(ctx, task.ID, lease, 8, data[8:]); err != nil || next != 16 {
+		t.Fatalf("StageUploadChunk #2: next=%d err=%v", next, err)
+	}
+	// Flush 后同步落盘并推进 SQLite offset
+	if flushed, err := s.FlushUploadCheckpoint(ctx, task.ID, lease); err != nil || flushed != 16 {
+		t.Fatalf("FlushUploadCheckpoint: flushed=%d err=%v", flushed, err)
+	}
+	if cur, err := s.GetTask(ctx, task.ID); err != nil || cur.Offset != 16 {
+		t.Fatalf("expected offset 16 after flush, got %+v err=%v", cur, err)
+	}
+	// Commit 前句柄自动关闭并原子发布
+	if err := s.CommitUploadSession(ctx, task.ID, lease, uint64(len(data)), req.FileSHA256); err != nil {
+		t.Fatalf("CommitUploadSession: %v", err)
+	}
+	if len(s.stageHandles) != 0 {
+		t.Fatalf("expected stageHandles to be cleaned up, got %d", len(s.stageHandles))
+	}
+}
