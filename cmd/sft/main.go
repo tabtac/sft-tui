@@ -391,12 +391,6 @@ func runTransfers(mgr *queue.Manager, cfg config.Client, jobs []cliJob, outDir, 
 		}
 	}
 
-	type trackedJob struct {
-		idx   int
-		id    string
-		dir   string
-		label string
-	}
 	var tracked []trackedJob
 	var toEnqueue []queue.Spec
 	var enqueueJobIdx []int
@@ -427,6 +421,10 @@ func runTransfers(mgr *queue.Manager, cfg config.Client, jobs []cliJob, outDir, 
 		}
 		key := queue.TargetKey(dir, remote, localPath)
 		if old, ok := existingByKey[key]; ok {
+			if old.WantCancel {
+				fmt.Fprintf(errOut, "sft：任务 %s 正在等待取消确认，请先完成取消或执行 status 查看状态\n", remote)
+				return 1
+			}
 			if err := mgr.Resume(old.ID); err != nil {
 				fmt.Fprintf(errOut, "sft：恢复任务 %s 失败：%v\n", remote, err)
 				return 1
@@ -458,7 +456,17 @@ func runTransfers(mgr *queue.Manager, cfg config.Client, jobs []cliJob, outDir, 
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	return waitTrackedTransfers(ctx, mgr, tracked, display)
+}
 
+type trackedJob struct {
+	idx   int
+	id    string
+	dir   string
+	label string
+}
+
+func waitTrackedTransfers(ctx context.Context, mgr *queue.Manager, tracked []trackedJob, display *progress.Display) int {
 	finished := make(map[string]bool, len(tracked))
 	failed := false
 	ticker := time.NewTicker(40 * time.Millisecond)
@@ -485,10 +493,14 @@ func runTransfers(mgr *queue.Manager, cfg config.Client, jobs []cliJob, outDir, 
 				case queue.Completed:
 					finished[tr.id] = true
 					display.Finish(tr.idx, fmt.Sprintf("%s 完成：%s (%s, SHA-256 %s)", tr.dir, cur.Remote, progress.FormatBytes(cur.Size), cur.SHA256), false)
-				case queue.Pending, queue.Cancelled, queue.Skipped:
+				case queue.Paused, queue.Pending, queue.Cancelled, queue.Skipped:
 					finished[tr.id] = true
 					failed = true
-					display.Finish(tr.idx, fmt.Sprintf("%s 失败：%s (%s)", tr.dir, cur.Remote, cur.Error), true)
+					reason := cur.Error
+					if reason == "" {
+						reason = string(cur.State)
+					}
+					display.Finish(tr.idx, fmt.Sprintf("%s 未完成 (%s)：%s (%s)", tr.dir, cur.State, cur.Remote, reason), true)
 				}
 			}
 		}
@@ -521,7 +533,7 @@ func parseJobs(action string, args []string) ([]cliJob, error) {
 		if j.target == "" {
 			return nil, errors.New("文件参数不能为空")
 		}
-		if err := protocol.ValidateName(filepath.Base(j.target)); !j.upload && err != nil {
+		if err := protocol.ValidateName(j.target); !j.upload && err != nil {
 			return nil, err
 		}
 		jobs = append(jobs, j)

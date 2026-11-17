@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 
 	"sft-tui/internal/config"
@@ -208,29 +209,70 @@ func Server(in io.Reader, out io.Writer, path, scanDir string) error {
 		value     *uint64
 		low, high uint64
 	}{
-		{"默认上传带宽（字节/秒）", &c.Bandwidth.UploadBytesPerSecond, 1, 1 << 53},
-		{"默认下载带宽（字节/秒）", &c.Bandwidth.DownloadBytesPerSecond, 1, 1 << 53},
-		{"突发字节数", &c.Bandwidth.BurstBytes, uint64(c.Limits.ChunkSize), 1 << 30},
-		{"单文件最大字节数", &c.Resources.MaxFileBytes, 1, 1<<63 - 1},
-		{"每用户存储字节数", &c.Resources.UserStorageBytes, c.Resources.MaxFileBytes, 1<<63 - 1},
+		{"默认上传带宽（支持单位如 10 MiB/s）", &c.Bandwidth.UploadBytesPerSecond, 1, 1 << 53},
+		{"默认下载带宽（支持单位如 10 MiB/s）", &c.Bandwidth.DownloadBytesPerSecond, 1, 1 << 53},
+		{"突发字节数（支持单位如 1 MiB）", &c.Bandwidth.BurstBytes, uint64(c.Limits.ChunkSize), 1 << 30},
+		{"单文件最大字节数（支持单位如 10 GiB）", &c.Resources.MaxFileBytes, 1, 1<<63 - 1},
+		{"每用户存储字节数（支持单位如 20 GiB）", &c.Resources.UserStorageBytes, c.Resources.MaxFileBytes, 1<<63 - 1},
 	} {
-		*field.value, err = d.Uint(field.label, *field.value, field.low, field.high)
+		*field.value, err = promptBytes(d, field.label, *field.value, field.low, field.high)
 		if err != nil {
 			return err
 		}
 	}
-	advanced, err := d.Bool("设置全部高级参数（流、块、窗口、超时、资源限额）", false)
+	advanced, err := d.Bool("设置全部高级参数（全局总带宽、流、块、窗口、超时、资源限额）", false)
 	if err != nil {
 		return err
 	}
 	if advanced {
-		for _, field := range config.ServerNumericFields(&c) {
-			n, err := d.Uint(field.Path, field.Uint(), 1, field.Max())
-			if err != nil {
+		useGlobal, err := d.Bool("启用全局总带宽限速 (global_bandwidth)", c.GlobalBandwidth != nil)
+		if err != nil {
+			return err
+		}
+		if useGlobal {
+			gb := config.Bandwidth{
+				UploadBytesPerSecond:   c.Bandwidth.UploadBytesPerSecond * 2,
+				DownloadBytesPerSecond: c.Bandwidth.DownloadBytesPerSecond * 2,
+				BurstBytes:             c.Bandwidth.BurstBytes * 2,
+			}
+			if c.GlobalBandwidth != nil {
+				gb = *c.GlobalBandwidth
+			}
+			if gb.UploadBytesPerSecond, err = promptBytes(d, "全局总上传带宽（支持单位如 50 MiB/s）", gb.UploadBytesPerSecond, 1, 1<<53); err != nil {
 				return err
 			}
-			if err := field.Set(fmt.Sprint(n)); err != nil {
+			if gb.DownloadBytesPerSecond, err = promptBytes(d, "全局总下载带宽（支持单位如 50 MiB/s）", gb.DownloadBytesPerSecond, 1, 1<<53); err != nil {
 				return err
+			}
+			if gb.BurstBytes, err = promptBytes(d, "全局总带宽突发字节数（支持单位如 2 MiB）", gb.BurstBytes, uint64(c.Limits.ChunkSize), 1<<30); err != nil {
+				return err
+			}
+			c.GlobalBandwidth = &gb
+		} else {
+			c.GlobalBandwidth = nil
+		}
+
+		for _, field := range config.ServerNumericFields(&c) {
+			switch field.Path {
+			case "bandwidth.upload_bytes_per_second", "bandwidth.download_bytes_per_second", "bandwidth.burst_bytes",
+				"resources.max_file_bytes", "resources.user_storage_bytes":
+				continue
+			case "limits.chunk_size", "limits.window_size", "logging.max_file_bytes":
+				n, err := promptBytes(d, field.Path+"（支持单位）", field.Uint(), 1, field.Max())
+				if err != nil {
+					return err
+				}
+				if err := field.Set(strconv.FormatUint(n, 10)); err != nil {
+					return err
+				}
+			default:
+				n, err := d.Uint(field.Path, field.Uint(), 1, field.Max())
+				if err != nil {
+					return err
+				}
+				if err := field.Set(fmt.Sprint(n)); err != nil {
+					return err
+				}
 			}
 		}
 	}
@@ -284,4 +326,21 @@ func Server(in io.Reader, out io.Writer, path, scanDir string) error {
 		fmt.Fprintln(out, "尚未授权用户；可运行 sftd cert users -server-config "+path+" 新建用户，再启动 sftd")
 	}
 	return nil
+}
+
+func promptBytes(d *prompt.Dialog, label string, fallback, low, high uint64) (uint64, error) {
+	raw, err := d.Text(label, strconv.FormatUint(fallback, 10), func(s string) error {
+		v, err := ParseBytes(s)
+		if err != nil {
+			return err
+		}
+		if v < low || v > high {
+			return fmt.Errorf("须在 %d–%d 字节范围内", low, high)
+		}
+		return nil
+	})
+	if err != nil {
+		return 0, err
+	}
+	return ParseBytes(raw)
 }

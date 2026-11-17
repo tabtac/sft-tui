@@ -8,9 +8,13 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"sft-tui/internal/certmanage"
 	"sft-tui/internal/config"
+	"sft-tui/internal/progress"
+	"sft-tui/internal/protocol"
+	"sft-tui/internal/queue"
 	"sft-tui/internal/testcert"
 	"sft-tui/internal/transfer"
 )
@@ -189,5 +193,78 @@ func TestInteractiveInitSelectsAmongMultipleBundles(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), "发现多个客户端身份") || !strings.Contains(out.String(), "bob") {
 		t.Fatalf("unexpected interactive output: %q", out.String())
+	}
+}
+
+func TestParseJobsValidatesFullRemoteDownloadName(t *testing.T) {
+	for _, bad := range []string{"sub/file.txt", "../escape", `a\b`} {
+		if _, err := parseJobs("download", []string{bad}); err == nil {
+			t.Errorf("parseJobs accepted invalid remote name %q", bad)
+		}
+		if _, err := parseJobs("transfer", []string{"get:" + bad}); err == nil {
+			t.Errorf("parseJobs transfer get: accepted invalid remote name %q", bad)
+		}
+	}
+}
+
+func TestRunTransfersRejectsWantCancelAndExitsOnPaused(t *testing.T) {
+	dir := t.TempDir()
+	mgr, err := queue.Open(queue.Config{
+		StateDir:     dir,
+		Identity:     "alice-test",
+		MaxFileBytes: 1 << 30,
+		MaxStreams:   1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mgr.Close()
+
+	// 1. 构造 paused 任务且运行时立刻再次返回 ErrPaused，验证 runTransfers 不会死循环等待
+	src := filepath.Join(dir, "sample.bin")
+	if err := os.WriteFile(src, []byte("abc"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	pausedRunner := func(_ context.Context, _ queue.Task, _ *queue.Operation, _ func(uint64, uint64, queue.State)) error {
+		return transfer.ErrPaused
+	}
+	mgr.SetRunner(pausedRunner)
+	tasks, err := mgr.Enqueue([]queue.Spec{{Direction: protocol.DirectionUpload, Remote: "sample.bin", Path: src, Size: 3}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if tk := mgr.Task(tasks[0].ID); tk != nil && tk.State == queue.Paused {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// 验证 Pending/Paused 的 WantCancel 任务会直接被 runTransfers 拒绝而不是 Resume
+	_ = mgr.UpdateTask(tasks[0].ID, func(t *queue.Task) {
+		t.State = queue.Paused
+		t.WantCancel = true
+	})
+	var out, errOut bytes.Buffer
+	code := runTransfers(mgr, config.DefaultClient(), []cliJob{{upload: true, target: src}}, dir, "never", &out, &errOut)
+	if code != 1 || !strings.Contains(errOut.String(), "取消确认") {
+		t.Fatalf("expected runTransfers to reject WantCancel task, got code=%d err=%q", code, errOut.String())
+	}
+
+	// 验证 Paused 状态会让 waitTrackedTransfers 及时结束并返回非零码而非死等
+	_ = mgr.UpdateTask(tasks[0].ID, func(t *queue.Task) {
+		t.WantCancel = false
+		t.State = queue.Paused
+	})
+	disp, err := progress.New("never", &errOut, &out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer disp.Close()
+	waitCtx, waitCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer waitCancel()
+	if code := waitTrackedTransfers(waitCtx, mgr, []trackedJob{{idx: 0, id: tasks[0].ID, dir: "upload", label: "sample.bin"}}, disp); code != 1 {
+		t.Fatalf("expected non-zero exit when tracked task is Paused, got %d", code)
 	}
 }
