@@ -55,7 +55,8 @@ func (m *serverModel) renderHeader() string {
 	if listenStr == "" {
 		listenStr = "—"
 	}
-	rightInfo := "等待连接本机服务"
+	rightFull := "等待连接本机服务"
+	rightShort := "待连接"
 	if m.runtime != nil {
 		listenStr = m.runtime.Listen
 		switch m.runtime.State {
@@ -67,17 +68,34 @@ func (m *serverModel) renderHeader() string {
 			stBadge = m.th.badgeErr.Render("✕ " + m.runtime.State)
 		}
 		uptime := time.Since(m.runtime.Started).Round(time.Second)
-		rightInfo = fmt.Sprintf("在线:%d  连接:%d  活动:%d  ↑%s ↓%s  运行 %s",
+		rightFull = fmt.Sprintf("在线:%d  连接:%d  活动:%d  ↑%s ↓%s  运行 %s",
 			m.runtime.OnlineUsers, m.runtime.Connections, m.runtime.ActiveTasks,
 			progress.FormatRate(m.runtime.ReceiveRate), progress.FormatRate(m.runtime.SendRate), uptime)
+		rightShort = fmt.Sprintf("在线:%d ↑%s ↓%s",
+			m.runtime.OnlineUsers,
+			progress.FormatRate(m.runtime.ReceiveRate), progress.FormatRate(m.runtime.SendRate))
 	} else if strings.Contains(m.runtimeState, "异常") {
 		stBadge = m.th.badgeErr.Render("✕ " + truncCell(m.runtimeState, 24))
 	}
 
 	addrBadge := m.th.badgeID.Render(" " + listenStr + " ")
 	left := lipgloss.JoinHorizontal(lipgloss.Center, brand, " ", stBadge, " ", addrBadge)
+	avail := max(0, m.width-2-lipgloss.Width(left)-1)
+	rightInfo := rightFull
+	if lipgloss.Width(rightInfo) > avail {
+		if lipgloss.Width(rightShort) <= avail {
+			rightInfo = rightShort
+		} else if avail >= 6 {
+			rightInfo = truncCell(rightShort, avail)
+		} else {
+			rightInfo = ""
+		}
+	}
 	stats := m.th.badgeMuted.Render(rightInfo)
-	gap := max(1, m.width-lipgloss.Width(left)-lipgloss.Width(stats)-2)
+	gap := max(1, m.width-2-lipgloss.Width(left)-lipgloss.Width(stats))
+	if rightInfo == "" {
+		return m.th.headerBar.Width(m.width).Render(truncCell(left, m.width-2))
+	}
 	return m.th.headerBar.Width(m.width).Render(truncCell(left+strings.Repeat(" ", gap)+stats, m.width-2))
 }
 
@@ -92,10 +110,11 @@ func (m *serverModel) renderTabBar() string {
 		}
 	}
 	row := lipgloss.JoinHorizontal(lipgloss.Center, tabs...)
-	if m.editingQuery {
+	avail := m.width - 2 - lipgloss.Width(row) - 3
+	if m.editingQuery && avail > 8 {
 		row += "   " + m.th.hintKey.Render("筛选: ") + m.queryInput.View()
-	} else if m.statusToast != "" {
-		row += "   " + m.th.toast.Render("· "+truncCell(m.statusToast, max(10, m.width/3)))
+	} else if m.statusToast != "" && avail >= 6 {
+		row += "   " + m.th.toast.Render("· "+truncCell(m.statusToast, avail-2))
 	}
 	return lipgloss.NewStyle().Padding(0, 1).Width(m.width).Render(truncCell(row, m.width-2))
 }
@@ -106,19 +125,19 @@ func (m *serverModel) renderFooter() string {
 	case m.editingQuery:
 		hints = "筛选过滤：输入关键字 · Enter 应用 · Esc 清空"
 	case m.page == 0:
-		hints = "概览：[s] 启动服务  [x] 停止服务  [R] 热加载  [I] 快速初始化  [1-6/Tab] 切页  [F6] 主题  [?] 帮助  [q] 退出面板"
+		hints = "概览：[s] 启动服务  [x] 停止服务  [R] 热加载  [I] 部署向导  [1-6/Tab] 切页  [F6] 主题  [?] 帮助  [q] 退出"
 	case m.page == 1:
-		hints = "用户：[/] 搜索  [n] 新建  [t] 启用/吊销  [p] 改权限与带宽  [w] 续期证书  [C] 签发CSR  [e] 导出包  [Enter] 详情"
+		hints = "用户：[/] 搜索  [n] 新建  [t] 启用/吊销  [p] 改权限与带宽  [w] 续期证书  [C] CSR  [e] 导出  [Enter] 详情"
 	case m.page == 2:
 		hints = "传输：[/] 筛选用户或文件名  [↑↓] 选择  [Enter] 查看详情  [r] 刷新"
 	case m.page == 3:
-		hints = "证书：[K] 续期CA  [S] 轮换服务端证书  [C] 签发CSR  [Enter] 查看指纹细节"
+		hints = "证书：[K] 续期CA  [S] 轮换服务端证书  [C] 签发CSR  [Enter] 查看指纹详情"
 	case m.page == 4:
 		hints = "设置：[m] 编辑配置参数  [R] 热加载变更  [1-6/Tab] 切页  [q] 退出"
 	default:
-		hints = "日志：[p] 暂停/跟随实时日志  [l] 切换最低等级(" + logLevelLabel(m.logMinLevel) + ")  [/] 关键字过滤  [Enter] 事件详情"
+		hints = "日志：[p] 暂停/跟随实时日志  [l] 最低等级(" + logLevelLabel(m.logMinLevel) + ")  [/] 关键字过滤  [Enter] 事件详情"
 	}
-	return m.th.footerBar.Width(m.width).Render(truncCell(hints, m.width-2))
+	return m.th.footerBar.Width(m.width).Render(hints)
 }
 
 func logLevelLabel(l string) string {
@@ -128,11 +147,26 @@ func logLevelLabel(l string) string {
 	return l
 }
 
+func overviewLayout(width, bodyH int) (stacked bool, topCardH, topTotalH, botH int) {
+	if width < 92 && bodyH >= 17 {
+		topCardH = min(max(6, (bodyH-5)/2), 8)
+		topTotalH = topCardH * 2
+		botH = max(5, bodyH-topTotalH)
+		return true, topCardH, topTotalH, botH
+	}
+	topCardH = min(max(6, bodyH/2), 11)
+	botH = max(5, bodyH-topCardH)
+	return false, topCardH, topCardH, botH
+}
+
 func (m *serverModel) renderOverviewPage(bodyH int) string {
-	topH := min(max(6, bodyH/2), 11)
-	botH := max(5, bodyH-topH)
-	leftW := m.width / 2
-	rightW := m.width - leftW
+	stacked, topH, _, botH := overviewLayout(m.width, bodyH)
+	leftW, rightW := m.width, m.width
+	if !stacked {
+		leftW = m.width / 2
+		rightW = m.width - leftW
+	}
+	leftInner := max(16, leftW-4)
 
 	// 左侧：部署配置卡片
 	var cfgLines []string
@@ -140,7 +174,7 @@ func (m *serverModel) renderOverviewPage(bodyH int) string {
 		cfgLines = append(cfgLines, m.th.badgeMuted.Render("正在读取服务端配置…"))
 	} else if m.cfgErr != nil {
 		cfgLines = append(cfgLines, m.th.badgeErr.Render("配置读取失败："+m.cfgErr.Error()))
-		cfgLines = append(cfgLines, m.th.badgeWarn.Render("可按 [I] 键直接按默认安全模板初始化整套证书与配置"))
+		cfgLines = append(cfgLines, m.th.badgeWarn.Render("可按 [I] 键启动首次部署与证书初始化向导"))
 	} else {
 		warnCount := 0
 		for _, c := range m.certs {
@@ -149,20 +183,20 @@ func (m *serverModel) renderOverviewPage(bodyH int) string {
 			}
 		}
 		cfgLines = append(cfgLines,
-			"配置文件： "+truncCell(m.opts.ConfigPath, leftW-16),
-			"存储目录： "+truncCell(m.cfg.StorageRoot, leftW-16),
-			fmt.Sprintf("授权用户： %d 个   ·   默认限额：每用户 ↑%s ↓%s",
+			"配置："+truncCell(m.opts.ConfigPath, max(8, leftInner-6)),
+			"存储："+truncCell(m.cfg.StorageRoot, max(8, leftInner-6)),
+			fmt.Sprintf("用户：%d 个 · 限额 ↑%s ↓%s",
 				len(m.cfg.AuthorizedClients),
 				progress.FormatRate(float64(m.cfg.Bandwidth.UploadBytesPerSecond)),
 				progress.FormatRate(float64(m.cfg.Bandwidth.DownloadBytesPerSecond))),
 		)
 		if m.cfg.GlobalBandwidth != nil {
-			cfgLines = append(cfgLines, fmt.Sprintf("全局总上限：↑%s  ↓%s",
+			cfgLines = append(cfgLines, fmt.Sprintf("全局：↑%s  ↓%s",
 				progress.FormatRate(float64(m.cfg.GlobalBandwidth.UploadBytesPerSecond)),
 				progress.FormatRate(float64(m.cfg.GlobalBandwidth.DownloadBytesPerSecond))))
 		}
 		if warnCount > 0 {
-			cfgLines = append(cfgLines, m.th.badgeWarn.Render(fmt.Sprintf("⚠ 注意：%d 张证书待处理，请按 [4] 查看详情", warnCount)))
+			cfgLines = append(cfgLines, m.th.badgeWarn.Render(fmt.Sprintf("⚠ %d 张证书待处理，按 [4] 查看", warnCount)))
 		}
 	}
 	leftCard := renderPanelBox(m.th, m.th.hintKey.Render("部署环境"), cfgLines, true, leftW, topH)
@@ -173,23 +207,26 @@ func (m *serverModel) renderOverviewPage(bodyH int) string {
 		statLines = append(statLines,
 			m.th.badgeMuted.Render(m.runtimeState),
 			"",
-			"按 [s] 后台启动 sftd 守护进程后可实时监控流量趋势与连接。",
+			"按 [s] 后台启动 sftd 后可实时监控连接与流量。",
 		)
 	} else {
 		r := m.runtime
 		statLines = append(statLines,
-			fmt.Sprintf("已发布对象：%d 个 (%s)", r.PublishedFiles, progress.FormatBytes(r.PublishedBytes)),
-			fmt.Sprintf("实时吞吐：入站(上传) %s   出站(下载) %s",
+			fmt.Sprintf("已发布：%d 个 (%s)", r.PublishedFiles, progress.FormatBytes(r.PublishedBytes)),
+			fmt.Sprintf("吞吐：入 %s  出 %s",
 				m.th.badgeOk.Render(progress.FormatRate(r.ReceiveRate)),
 				m.th.hintKey.Render(progress.FormatRate(r.SendRate))),
-			fmt.Sprintf("累计流量：入 %s  出 %s   任务：成功 %d / 失败 %d",
+			fmt.Sprintf("累计：入 %s 出 %s · 成功%d/失败%d",
 				progress.FormatBytes(r.Received), progress.FormatBytes(r.Sent), r.Completed, r.Failed),
 			"上传趋势："+m.th.badgeOk.Render(sparklineString(m.trend, 0)),
 			"下载趋势："+m.th.hintKey.Render(sparklineString(m.trend, 1)),
 		)
 	}
 	rightCard := renderPanelBox(m.th, m.th.hintKey.Render("实时运行监控"), statLines, true, rightW, topH)
-	topRow := lipgloss.JoinHorizontal(lipgloss.Top, leftCard, rightCard)
+	topArea := lipgloss.JoinHorizontal(lipgloss.Top, leftCard, rightCard)
+	if stacked {
+		topArea = lipgloss.JoinVertical(lipgloss.Left, leftCard, rightCard)
+	}
 
 	// 底部：活跃连接列表
 	innerW := max(16, m.width-4)
@@ -206,8 +243,8 @@ func (m *serverModel) renderOverviewPage(bodyH int) string {
 			if i == m.cursors[0] {
 				mark = "▶ "
 			}
-			line := fmt.Sprintf("%s#%-4d  %-16s  %-24s  在线 %s",
-				mark, p.ID, padRightCell(p.User, 16), padRightCell(p.Remote, 24),
+			line := fmt.Sprintf("%s#%-4d  %s  %s  在线 %s",
+				mark, p.ID, padRightCell(p.User, min(16, max(8, innerW/5))), padRightCell(p.Remote, min(24, max(12, innerW/3))),
 				time.Since(p.Since).Round(time.Second))
 			if i == m.cursors[0] {
 				peerLines = append(peerLines, m.th.rowCursor.Render(padRightCell(line, innerW)))
@@ -217,7 +254,7 @@ func (m *serverModel) renderOverviewPage(bodyH int) string {
 		}
 	}
 	botCard := renderPanelBox(m.th, m.th.hintKey.Render("活跃 mTLS 会话"), peerLines, true, m.width, botH)
-	return lipgloss.JoinVertical(lipgloss.Left, topRow, botCard)
+	return lipgloss.JoinVertical(lipgloss.Left, topArea, botCard)
 }
 
 func sparklineString(samples [][2]float64, dir int) string {
@@ -264,11 +301,16 @@ func (m *serverModel) renderUsersPage(bodyH int) string {
 			if u.Disabled {
 				st = m.th.badgeErr.Render("⊘ 吊销")
 			}
-			perms := strings.Join(u.Permissions, ",")
-			if perms == "" {
+			var perms string
+			switch {
+			case u.Permissions == nil:
 				perms = "upload,download"
+			case len(u.Permissions) == 0:
+				perms = "无权限"
+			default:
+				perms = strings.Join(u.Permissions, ",")
 			}
-			bwStr := "默认策略"
+			bwStr := "默认"
 			if u.Bandwidth != nil {
 				bwStr = fmt.Sprintf("↑%s/↓%s", progress.FormatRate(float64(u.Bandwidth.UploadBytesPerSecond)), progress.FormatRate(float64(u.Bandwidth.DownloadBytesPerSecond)))
 			}
@@ -276,8 +318,16 @@ func (m *serverModel) renderUsersPage(bodyH int) string {
 			if certSt == "" {
 				certSt = "未知"
 			}
-			row := fmt.Sprintf("%s%-14s  %s  %-16s  %-22s  证书:%s",
-				mark, padRightCell(u.UserID, 14), st, padRightCell(perms, 16), padRightCell(bwStr, 22), certSt)
+			userW := 14
+			permW := 16
+			bwW := 20
+			if innerW < 78 {
+				userW = 10
+				permW = 10
+				bwW = max(10, innerW-userW-permW-26)
+			}
+			row := fmt.Sprintf("%s%s  %s  %s  %s  证书:%s",
+				mark, padRightCell(u.UserID, userW), st, padRightCell(perms, permW), padRightCell(bwStr, bwW), certSt)
 			if i == m.cursors[1] {
 				lines = append(lines, m.th.rowCursor.Render(padRightCell(row, innerW)))
 			} else {
@@ -301,14 +351,16 @@ func (m *serverModel) renderTransfersPage(bodyH int) string {
 		lines = append(lines, m.th.badgeMuted.Render("（当前无活动或最近传输记录）"))
 	} else {
 		start := scrollOffset(m.cursors[2], len(tasks), visRows)
+		userW := min(12, max(8, innerW/7))
+		fileW := min(24, max(10, innerW-userW-46))
 		for i := start; i < min(len(tasks), start+visRows); i++ {
 			t := tasks[i]
 			mark := "  "
 			if i == m.cursors[2] {
 				mark = "▶ "
 			}
-			row := fmt.Sprintf("%s%-12s  %-8s  %-22s  %-10s  %s/%s  %s",
-				mark, padRightCell(t.User, 12), padRightCell(t.Direction, 8), padRightCell(t.File, 22),
+			row := fmt.Sprintf("%s%s  %s  %s  %s  %s/%s  %s",
+				mark, padRightCell(t.User, userW), padRightCell(t.Direction, 8), padRightCell(t.File, fileW),
 				padRightCell(t.State, 10), progress.FormatBytes(t.Offset), progress.FormatBytes(t.Size),
 				progress.FormatRate(t.Rate))
 			if i == m.cursors[2] {
@@ -331,6 +383,13 @@ func (m *serverModel) renderCertsPage(bodyH int) string {
 		lines = append(lines, m.th.badgeMuted.Render("（暂无可检查的证书配置）"))
 	} else {
 		start := scrollOffset(m.cursors[3], len(m.certs), visRows)
+		nameW := 12
+		roleW := 12
+		if innerW < 76 {
+			nameW = 10
+			roleW = 10
+		}
+		fpBudget := innerW - (2 + nameW + 2 + roleW + 2 + 8 + 2 + 21 + 5)
 		for i := start; i < min(len(m.certs), start+visRows); i++ {
 			c := m.certs[i]
 			mark := "  "
@@ -341,12 +400,16 @@ func (m *serverModel) renderCertsPage(bodyH int) string {
 			if c.State != "有效" {
 				st = m.th.badgeWarn.Render("⚠ " + c.State)
 			}
-			fp := c.Fingerprint
-			if len(fp) > 16 {
-				fp = fp[:16] + "…"
+			fpPart := ""
+			if fpBudget >= 8 {
+				fp := c.Fingerprint
+				if len(fp) > fpBudget {
+					fp = fp[:fpBudget] + "…"
+				}
+				fpPart = "  FP:" + fp
 			}
-			row := fmt.Sprintf("%s%-12s  %-14s  %s  到期:%-16s  FP:%s",
-				mark, padRightCell(c.Name, 12), padRightCell(c.Role, 14), st, padRightCell(c.Expiry, 16), fp)
+			row := fmt.Sprintf("%s%s  %s  %s  到期:%s%s",
+				mark, padRightCell(c.Name, nameW), padRightCell(c.Role, roleW), st, padRightCell(c.Expiry, 16), fpPart)
 			if i == m.cursors[3] {
 				lines = append(lines, m.th.rowCursor.Render(padRightCell(row, innerW)))
 			} else {

@@ -7,7 +7,7 @@ import (
 	"time"
 
 	"github.com/charmbracelet/lipgloss"
-	"github.com/mattn/go-runewidth"
+	"github.com/charmbracelet/x/ansi"
 
 	"sft-tui/internal/progress"
 	"sft-tui/internal/protocol"
@@ -18,7 +18,10 @@ func truncCell(s string, width int) string {
 	if width <= 0 {
 		return ""
 	}
-	return runewidth.Truncate(s, width, "…")
+	if lipgloss.Width(s) <= width {
+		return s
+	}
+	return ansi.Truncate(s, width, "…")
 }
 
 func padRightCell(s string, width int) string {
@@ -26,7 +29,7 @@ func padRightCell(s string, width int) string {
 		return ""
 	}
 	s = truncCell(s, width)
-	w := runewidth.StringWidth(s)
+	w := lipgloss.Width(s)
 	if w < width {
 		return s + strings.Repeat(" ", width-w)
 	}
@@ -38,7 +41,7 @@ func padLeftCell(s string, width int) string {
 		return ""
 	}
 	s = truncCell(s, width)
-	w := runewidth.StringWidth(s)
+	w := lipgloss.Width(s)
 	if w < width {
 		return strings.Repeat(" ", width-w) + s
 	}

@@ -242,3 +242,33 @@ func TestServerDeployWizardInitializesValidConfiguration(t *testing.T) {
 		t.Fatalf("wizard produced invalid server config: %+v %v", loaded, err)
 	}
 }
+
+func TestServerNarrowWidthPreservesTabsStatusAndRowsWithoutSpuriousEllipsis(t *testing.T) {
+	m := newServerModel(ServerOptions{ExecutableDir: t.TempDir(), ConfigPath: "configs/server.local.json"})
+	m.loaded = true
+	m.cfg = config.DefaultServer()
+	m.cfg.AuthorizedClients = []config.AuthorizedClient{
+		{UserID: "alice", Permissions: []string{"upload", "download"}},
+		{UserID: "bob", Permissions: []string{}},
+	}
+	m.certs = []certRow{{Name: "alice", Role: "用户", State: "有效", Expiry: "2027-01-01 00:00", Fingerprint: strings.Repeat("a", 64)}}
+
+	for _, w := range []int{64, 76, 80, 96} {
+		m.Update(tea.WindowSizeMsg{Width: w, Height: 26})
+		for _, page := range []int{0, 1, 3} {
+			m.page = page
+			view := m.View()
+			for _, label := range []string{"1 概览", "2 用户", "3 传输", "4 证书", "5 设置", "6 日志"} {
+				if !strings.Contains(view, label) {
+					t.Fatalf("width=%d page=%d truncated tab %q:\n%s", w, page, label, view)
+				}
+			}
+			if !strings.Contains(view, "SFTD-UI") {
+				t.Fatalf("width=%d page=%d truncated brand badge", w, page)
+			}
+			if page == 1 && (!strings.Contains(view, "alice") || !strings.Contains(view, "证书:有效")) {
+				t.Fatalf("width=%d users page truncated essential status:\n%s", w, view)
+			}
+		}
+	}
+}

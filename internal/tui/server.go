@@ -858,9 +858,8 @@ func (m *serverModel) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 		rowStartY := bodyY + 2
 		visRows := max(1, bodyH-3)
 		if m.page == 0 {
-			topH := min(max(6, bodyH/2), 11)
-			botH := max(5, bodyH-topH)
-			rowStartY = bodyY + topH + 2
+			_, _, topTotalH, botH := overviewLayout(m.width, bodyH)
+			rowStartY = bodyY + topTotalH + 2
 			visRows = max(1, botH-3)
 		}
 		relY := msg.Y - rowStartY

@@ -25,7 +25,7 @@ const (
 )
 
 func renderModalBox(width, height int, th theme, title string, lines []string, footer string) string {
-	boxW := min(max(48, width-10), 86)
+	boxW := min(max(44, width-4), 86)
 	innerW := boxW - 6 // 2 border + 4 horizontal padding
 	var body []string
 	body = append(body, th.modalTitle.Render(truncCell(title, innerW)))
