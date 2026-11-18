@@ -892,3 +892,58 @@ func TestServerSettingsPerFieldRuntimeDiffAndReloadLabels(t *testing.T) {
 		t.Fatalf("expected per-field restart-required diff on Limits.MaxStreams:\n%s", view)
 	}
 }
+
+func TestServerAdvancedLogFiltersAndJumpFromUsersAndTransfers(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "configs", "server.local.json")
+	if _, err := certmanage.Execute("init", certmanage.Options{
+		ServerConfig:    cfgPath,
+		Dir:             filepath.Join(dir, "certs"),
+		ClientConfigDir: filepath.Dir(cfgPath),
+		Name:            "alice",
+		Hosts:           "localhost,127.0.0.1",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	m := newServerModel(ServerOptions{ExecutableDir: dir, ConfigPath: cfgPath, Page: 1})
+	m.Update(tea.WindowSizeMsg{Width: 110, Height: 30})
+	m.Update(m.loadConfigCmd()())
+
+	// 1. 用户页按 g 跳转到日志页，应自动预设 User 过滤条件
+	m.Update(keyRune('g'))
+	if m.page != 5 || m.logQuery.User != "alice" {
+		t.Fatalf("expected jump to page 5 with User=alice, got page=%d query=%+v", m.page, m.logQuery)
+	}
+	v := ansi.Strip(m.View())
+	if !strings.Contains(v, "用户:alice") {
+		t.Fatalf("expected active log filter chip for user alice:\n%s", v)
+	}
+
+	// 2. 传输页按 g 跳转到日志页，应同时设置 User 与 File 过滤，并在离线 logFallback 生效
+	m.logFallback = "2026 INFO user=alice file=report.bin ok\n2026 WARN user=bob file=other.bin slow\n2026 ERROR user=alice file=secret.bin denied\n"
+	m.runtime = &monitor.Snapshot{
+		State:  "running",
+		Listen: "127.0.0.1:7443",
+		Tasks:  []monitor.Task{{ID: 1, User: "alice", Direction: "upload", File: "report.bin", State: "transferring"}},
+	}
+	m.Update(keyRune('3'))
+	m.Update(keyRune('g'))
+	if m.page != 5 || m.logQuery.User != "alice" || m.logQuery.File != "report.bin" {
+		t.Fatalf("expected jump from transfer to set User+File filter, got page=%d query=%+v", m.page, m.logQuery)
+	}
+	vTx := ansi.Strip(m.View())
+	if !strings.Contains(vTx, "report.bin") || strings.Contains(vTx, "secret.bin") || strings.Contains(vTx, "other.bin") {
+		t.Fatalf("expected offline log fallback filtered to alice + report.bin:\n%s", vTx)
+	}
+
+	// 3. 在日志页用 T 切换时间段，C 清空全部筛选
+	m.Update(keyRune('T'))
+	if m.logSinceIdx != 1 || m.effectiveLogQuery().Since.IsZero() {
+		t.Fatalf("expected T to enable 5m time window filter: sinceIdx=%d", m.logSinceIdx)
+	}
+	m.Update(keyRune('C'))
+	if m.hasLogFilters() {
+		t.Fatalf("expected C to clear all log filters, got query=%+v level=%q sinceIdx=%d", m.logQuery, m.logMinLevel, m.logSinceIdx)
+	}
+}

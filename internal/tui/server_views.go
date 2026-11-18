@@ -114,7 +114,14 @@ func (m *serverModel) renderTabBar() string {
 	row := lipgloss.JoinHorizontal(lipgloss.Center, tabs...)
 	avail := m.width - 2 - lipgloss.Width(row) - 3
 	if m.editingQuery && avail > 8 {
-		row += "   " + m.th.hintKey.Render("筛选: ") + m.queryInput.View()
+		promptLbl := "筛选: "
+		switch m.queryMode {
+		case "log-user":
+			promptLbl = "按用户筛选: "
+		case "log-file":
+			promptLbl = "按文件筛选: "
+		}
+		row += "   " + m.th.hintKey.Render(promptLbl) + m.queryInput.View()
 	} else if m.busy && avail >= 6 {
 		op := m.busyOp
 		if op == "" {
@@ -129,7 +136,13 @@ func (m *serverModel) renderTabBar() string {
 
 func (m *serverModel) renderFooter() string {
 	if m.editingQuery {
-		return m.th.footerBar.Width(m.width).Render(truncCell("筛选过滤：输入关键字 · Enter 应用 · Esc 清空", max(1, m.width-2)))
+		hint := "筛选过滤：输入关键字 · Enter 应用 · Esc 清空"
+		if m.queryMode == "log-user" {
+			hint = "日志用户过滤：输入完整用户名 · Enter 应用 · Esc 清空"
+		} else if m.queryMode == "log-file" {
+			hint = "日志文件名过滤：输入文件名片段 · Enter 应用 · Esc 清空"
+		}
+		return m.th.footerBar.Width(m.width).Render(truncCell(hint, max(1, m.width-2)))
 	}
 	busyReason := ""
 	if m.busy {
@@ -212,6 +225,7 @@ func (m *serverModel) renderFooter() string {
 			{key: "p", label: "策略", reason: userActReason, essential: true},
 			{key: "w", label: renewLabel, reason: userActReason, essential: true},
 			{key: "e", label: "导出", reason: noUser, essential: true},
+			{key: "g", label: "查日志", reason: noUser, essential: true},
 			{key: "C", label: "CSR", reason: actReason},
 			{key: "/", label: "搜索"},
 			{key: "Enter", label: "详情", reason: noUser},
@@ -228,6 +242,7 @@ func (m *serverModel) renderFooter() string {
 		}
 		return renderActionFooter(m.th, m.width, "传输:", []footerChip{
 			{key: "Enter", label: "详情", reason: detailReason, essential: true},
+			{key: "g", label: "相关日志", reason: detailReason, essential: true},
 			{key: "/", label: "筛选", essential: true},
 			{key: "r", label: "刷新", essential: true},
 			{key: "Tab", label: "切页"},
@@ -283,16 +298,86 @@ func (m *serverModel) renderFooter() string {
 		} else if len(m.logEvents) == 0 {
 			detailReason = "无事件"
 		}
+		clearReason := ""
+		if !m.hasLogFilters() {
+			clearReason = "未筛选"
+		}
 		return renderActionFooter(m.th, m.width, "日志:", []footerChip{
 			{key: "p", label: pauseLabel, essential: true},
 			{key: "l", label: "等级(" + logLevelLabel(m.logMinLevel) + ")", essential: true},
-			{key: "L", label: "上限", reason: cfgReason, essential: true},
-			{key: "/", label: "过滤", essential: true},
-			{key: "Enter", label: "详情", reason: detailReason, essential: true},
+			{key: "U", label: "用户", essential: true},
+			{key: "F", label: "文件", essential: true},
+			{key: "T", label: "时间(" + logSinceLabel(m.logSinceIdx) + ")", essential: true},
+			{key: "/", label: "文本", essential: true},
+			{key: "C", label: "清空", reason: clearReason},
+			{key: "L", label: "上限", reason: cfgReason},
+			{key: "Enter", label: "详情", reason: detailReason},
 			{key: "?", label: "帮助"},
-			{key: "q", label: "退出", reason: quitReason},
 		})
 	}
+}
+
+func logSinceLabel(idx int) string {
+	switch idx {
+	case 1:
+		return "5m"
+	case 2:
+		return "1h"
+	case 3:
+		return "24h"
+	default:
+		return "全"
+	}
+}
+
+func (m *serverModel) hasLogFilters() bool {
+	return m.logMinLevel != "" || m.logQuery.User != "" || m.logQuery.File != "" || m.logQuery.Text != "" || m.logSinceIdx != 0
+}
+
+func (m *serverModel) filteredLogFallbackLines() []string {
+	trimmed := strings.TrimRight(m.logFallback, "\n")
+	if trimmed == "" {
+		return nil
+	}
+	raw := strings.Split(trimmed, "\n")
+	if m.logMinLevel == "" && m.logQuery.User == "" && m.logQuery.File == "" && m.logQuery.Text == "" {
+		return raw
+	}
+	var out []string
+	minLvl := strings.ToUpper(strings.TrimSpace(m.logMinLevel))
+	u := strings.ToLower(strings.TrimSpace(m.logQuery.User))
+	f := strings.ToLower(strings.TrimSpace(m.logQuery.File))
+	txt := strings.ToLower(strings.TrimSpace(m.logQuery.Text))
+	for _, ln := range raw {
+		low := strings.ToLower(ln)
+		if minLvl != "" {
+			switch minLvl {
+			case "WARN":
+				if !strings.Contains(low, "warn") && !strings.Contains(low, "error") {
+					continue
+				}
+			case "ERROR":
+				if !strings.Contains(low, "error") {
+					continue
+				}
+			case "INFO":
+				if strings.Contains(low, "level=debug") || strings.Contains(low, "[debug]") {
+					continue
+				}
+			}
+		}
+		if u != "" && !strings.Contains(low, u) {
+			continue
+		}
+		if f != "" && !strings.Contains(low, f) {
+			continue
+		}
+		if txt != "" && !strings.Contains(low, txt) {
+			continue
+		}
+		out = append(out, ln)
+	}
+	return out
 }
 
 func logLevelLabel(l string) string {
@@ -719,7 +804,28 @@ func (m *serverModel) renderSettingsPage(bodyH int) string {
 
 func (m *serverModel) renderLogsPage(bodyH int) string {
 	innerW := max(20, m.width-4)
-	visRows := max(1, bodyH-3)
+	var filterChips []string
+	if m.logMinLevel != "" {
+		filterChips = append(filterChips, "等级>="+m.logMinLevel)
+	}
+	if m.logQuery.User != "" {
+		filterChips = append(filterChips, "用户:"+m.logQuery.User)
+	}
+	if m.logQuery.File != "" {
+		filterChips = append(filterChips, "文件:"+m.logQuery.File)
+	}
+	if m.logQuery.Text != "" {
+		filterChips = append(filterChips, "文本:"+m.logQuery.Text)
+	}
+	if m.logSinceIdx != 0 {
+		filterChips = append(filterChips, "时段:"+logSinceLabel(m.logSinceIdx))
+	}
+
+	bannerH := 0
+	if len(filterChips) > 0 {
+		bannerH = 1
+	}
+	visRows := max(1, bodyH-3-bannerH)
 
 	status := m.th.badgeOk.Render("[实时跟随]")
 	if m.logPaused {
@@ -731,14 +837,22 @@ func (m *serverModel) renderLogsPage(bodyH int) string {
 	title := m.th.hintKey.Render("结构化运行日志") + "  " + status
 
 	var lines []string
+	if len(filterChips) > 0 {
+		bar := m.th.badgeID.Render(truncCell("筛选: "+strings.Join(filterChips, " · ")+"  ([C] 清空)", innerW))
+		lines = append(lines, bar)
+	}
 	switch {
 	case m.logErr != "":
 		lines = append(lines, m.th.badgeErr.Render("日志拉取错误："+m.logErr))
 	case m.logFallback != "":
-		raw := strings.Split(strings.TrimRight(m.logFallback, "\n"), "\n")
-		start := scrollOffset(m.cursors[5], len(raw), visRows)
-		for i := start; i < min(len(raw), start+visRows); i++ {
-			lines = append(lines, truncCell(sanitizeInline(raw[i]), innerW))
+		raw := m.filteredLogFallbackLines()
+		if len(raw) == 0 {
+			lines = append(lines, m.th.badgeMuted.Render("（当前筛选条件下无匹配文件日志）"))
+		} else {
+			start := scrollOffset(m.cursors[5], len(raw), visRows)
+			for i := start; i < min(len(raw), start+visRows); i++ {
+				lines = append(lines, truncCell(sanitizeInline(raw[i]), innerW))
+			}
 		}
 	case len(m.logEvents) == 0:
 		lines = append(lines, m.th.badgeMuted.Render("（暂无匹配日志事件）"))
@@ -813,10 +927,11 @@ func (m *serverModel) infoModalData() (title string, lines []string, footer stri
 			"",
 			m.th.hintKey.Render("页面专属动作"),
 			"  概览页：  [I] 首次部署向导（缺失配置时自动弹出）  [Enter] 连接详情",
-			"  用户页：  [n] 新建  [t] 启用/吊销  [p] 编辑权限与带宽  [w] 续期  [e] 导出包",
+			"  用户页：  [n] 新建  [t] 启用/吊销  [p] 编辑权限与带宽  [w] 续期  [e] 导出包  [g] 相关日志",
+			"  传输页：  [Enter] 任务详情  [g] 相关日志  [/] 筛选",
 			"  证书页：  [K] 续期CA(365d)  [S] 轮换服务端证书  [C] 签发客户端CSR",
 			"  设置页：  [m] 基础/带宽/存储  [a] 高级协议/超时/资源  [L] 日志上限  [A] 热加载",
-			"  日志页：  [p] 暂停/跟随  [l] 切换日志等级  [L] 日志上限  [Enter] 事件详情",
+			"  日志页：  [p] 暂停/跟随  [l] 等级  [U] 用户  [F] 文件  [T] 时间窗  [C] 清空筛选  [Enter] 详情",
 		}, "↑↓/滚轮 滚动 · Esc / Enter / ? 关闭"
 
 	case srvModalDetail:

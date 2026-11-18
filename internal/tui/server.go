@@ -114,8 +114,10 @@ type serverModel struct {
 	logFallback  string
 	logErr       string
 	logMinLevel  string
+	logSinceIdx  int
 	userFilter   string
 	txFilter     string
+	queryMode    string // "", "log-user", "log-file"
 	editingQuery bool
 	queryInput   textinput.Model
 
@@ -256,6 +258,29 @@ func (m *serverModel) loadConfigCmd() tea.Cmd {
 	}
 }
 
+func (m *serverModel) effectiveLogQuery() monitor.LogQuery {
+	q := m.logQuery
+	q.Level = m.logMinLevel
+	switch m.logSinceIdx {
+	case 1:
+		q.Since = time.Now().Add(-5 * time.Minute)
+	case 2:
+		q.Since = time.Now().Add(-1 * time.Hour)
+	case 3:
+		q.Since = time.Now().Add(-24 * time.Hour)
+	default:
+		q.Since = time.Time{}
+	}
+	return q
+}
+
+func (m *serverModel) resetLogsAndPollCmd() tea.Cmd {
+	m.logCursor = 0
+	m.logEvents = nil
+	m.logPaused = false
+	return m.pollRuntimeCmd()
+}
+
 func (m *serverModel) pollRuntimeCmd() tea.Cmd {
 	cfgPath := m.opts.ConfigPath
 	root := m.endpointRoot
@@ -264,9 +289,7 @@ func (m *serverModel) pollRuntimeCmd() tea.Cmd {
 		diskRoot = m.cfg.StorageRoot
 	}
 	wantLogs := m.page == 5 && !m.logPaused
-	q := m.logQuery
-	q.Level = m.logMinLevel
-	q.Text = m.queryInput.Value()
+	q := m.effectiveLogQuery()
 	if !wantLogs {
 		q = monitor.LogQuery{}
 	}
@@ -543,24 +566,51 @@ func (m *serverModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if m.editingQuery {
 		switch k {
 		case "esc":
+			mode := m.queryMode
 			m.editingQuery = false
+			m.queryMode = ""
 			m.queryInput.Blur()
 			m.queryInput.SetValue("")
-			m.updatePageFilter("")
+			switch mode {
+			case "log-user":
+				m.logQuery.User = ""
+				return m, m.resetLogsAndPollCmd()
+			case "log-file":
+				m.logQuery.File = ""
+				return m, m.resetLogsAndPollCmd()
+			default:
+				m.updatePageFilter("")
+				if m.page == 5 {
+					return m, m.resetLogsAndPollCmd()
+				}
+			}
 			return m, nil
 		case "enter":
+			mode := m.queryMode
+			val := strings.TrimSpace(m.queryInput.Value())
 			m.editingQuery = false
+			m.queryMode = ""
 			m.queryInput.Blur()
-			if m.page == 5 {
-				m.logCursor = 0
-				m.logEvents = nil
-				return m, m.pollRuntimeCmd()
+			switch mode {
+			case "log-user":
+				m.logQuery.User = val
+				return m, m.resetLogsAndPollCmd()
+			case "log-file":
+				m.logQuery.File = val
+				return m, m.resetLogsAndPollCmd()
+			default:
+				if m.page == 5 {
+					m.logQuery.Text = val
+					return m, m.resetLogsAndPollCmd()
+				}
 			}
 			return m, nil
 		}
 		var cmd tea.Cmd
 		m.queryInput, cmd = m.queryInput.Update(msg)
-		m.updatePageFilter(m.queryInput.Value())
+		if m.queryMode == "" {
+			m.updatePageFilter(m.queryInput.Value())
+		}
 		return m, cmd
 	}
 
@@ -587,7 +637,19 @@ func (m *serverModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.switchPage((m.page + 5) % 6)
 	case "/":
 		m.editingQuery = true
+		m.queryMode = ""
+		switch m.page {
+		case 1:
+			m.queryInput.SetValue(m.userFilter)
+		case 2:
+			m.queryInput.SetValue(m.txFilter)
+		case 5:
+			m.queryInput.SetValue(m.logQuery.Text)
+		default:
+			m.queryInput.SetValue("")
+		}
 		m.queryInput.Focus()
+		m.queryInput.CursorEnd()
 		return m, textinput.Blink
 	case "r":
 		m.statusToast = "正在刷新配置与运行状态…"
@@ -685,6 +747,18 @@ func (m *serverModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.openExportUserModal(users[m.cursors[1]])
 				return m, textinput.Blink
 			}
+		case "g":
+			if len(users) > 0 && m.cursors[1] < len(users) {
+				u := users[m.cursors[1]]
+				m.logQuery = monitor.LogQuery{User: u.UserID}
+				m.logMinLevel = ""
+				m.logSinceIdx = 0
+				m.logCursor = 0
+				m.logEvents = nil
+				m.logPaused = false
+				m.statusToast = "已按用户过滤并跳转至相关日志：" + u.UserID
+				return m.switchPage(5)
+			}
 		case "enter":
 			if len(users) > 0 && m.cursors[1] < len(users) {
 				m.showUserDetailModal(users[m.cursors[1]])
@@ -692,21 +766,36 @@ func (m *serverModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 	case 2: // 实时传输
 		tasks := m.filteredTasks()
-		if k == "enter" && m.cursors[2] < len(tasks) {
-			t := tasks[m.cursors[2]]
-			m.detailTitle = "服务端传输任务详情"
-			m.detailLines = []string{
-				fmt.Sprintf("任务 / 连接：%d  (连接 #%d · 流 #%d)", t.ID, t.Connection, t.Stream),
-				fmt.Sprintf("用户与方向：%s · %s", t.User, t.Direction),
-				fmt.Sprintf("文件名：    %s", t.File),
-				fmt.Sprintf("进度与速率：%d / %d B · %.1f B/s", t.Offset, t.Size, t.Rate),
-				fmt.Sprintf("当前状态：  %s", t.State),
+		switch k {
+		case "g":
+			if len(tasks) > 0 && m.cursors[2] < len(tasks) {
+				t := tasks[m.cursors[2]]
+				m.logQuery = monitor.LogQuery{User: t.User, File: t.File}
+				m.logMinLevel = ""
+				m.logSinceIdx = 0
+				m.logCursor = 0
+				m.logEvents = nil
+				m.logPaused = false
+				m.statusToast = fmt.Sprintf("已跳转至 %s / %s 的相关日志", t.User, t.File)
+				return m.switchPage(5)
 			}
-			if t.Error != "" {
-				m.detailLines = append(m.detailLines, "", "错误信息：", "  "+t.Error)
+		case "enter":
+			if m.cursors[2] < len(tasks) {
+				t := tasks[m.cursors[2]]
+				m.detailTitle = "服务端传输任务详情"
+				m.detailLines = []string{
+					fmt.Sprintf("任务 / 连接：%d  (连接 #%d · 流 #%d)", t.ID, t.Connection, t.Stream),
+					fmt.Sprintf("用户与方向：%s · %s", t.User, t.Direction),
+					fmt.Sprintf("文件名：    %s", t.File),
+					fmt.Sprintf("进度与速率：%d / %d B · %.1f B/s", t.Offset, t.Size, t.Rate),
+					fmt.Sprintf("当前状态：  %s", t.State),
+				}
+				if t.Error != "" {
+					m.detailLines = append(m.detailLines, "", "错误信息：", "  "+t.Error)
+				}
+				m.infoScroll = 0
+				m.modal = srvModalDetail
 			}
-			m.infoScroll = 0
-			m.modal = srvModalDetail
 		}
 	case 3: // 证书状态
 		switch k {
@@ -775,9 +864,30 @@ func (m *serverModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				}
 			}
 			m.logMinLevel = order[(cur+1)%len(order)]
-			m.logCursor = 0
-			m.logEvents = nil
-			return m, m.pollRuntimeCmd()
+			return m, m.resetLogsAndPollCmd()
+		case "U":
+			m.editingQuery = true
+			m.queryMode = "log-user"
+			m.queryInput.SetValue(m.logQuery.User)
+			m.queryInput.Focus()
+			m.queryInput.CursorEnd()
+			return m, textinput.Blink
+		case "F":
+			m.editingQuery = true
+			m.queryMode = "log-file"
+			m.queryInput.SetValue(m.logQuery.File)
+			m.queryInput.Focus()
+			m.queryInput.CursorEnd()
+			return m, textinput.Blink
+		case "T":
+			m.logSinceIdx = (m.logSinceIdx + 1) % 4
+			return m, m.resetLogsAndPollCmd()
+		case "C":
+			m.logQuery = monitor.LogQuery{}
+			m.logMinLevel = ""
+			m.logSinceIdx = 0
+			m.statusToast = "已清空全部日志筛选条件"
+			return m, m.resetLogsAndPollCmd()
 		case "enter":
 			if m.logFallback == "" && m.cursors[5] < len(m.logEvents) {
 				e := m.logEvents[m.cursors[5]]
@@ -871,7 +981,7 @@ func (m *serverModel) currentPageLen() int {
 		return len(m.settingsLines())
 	case 5:
 		if m.logFallback != "" {
-			return len(strings.Split(strings.TrimSpace(m.logFallback), "\n"))
+			return len(m.filteredLogFallbackLines())
 		}
 		return len(m.logEvents)
 	}
