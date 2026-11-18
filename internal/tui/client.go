@@ -122,23 +122,33 @@ type model struct {
 	connStatus    string
 
 	// 文件列表
-	localDir       string
-	localEpoch     int
-	remoteEpoch    int
-	loadingLocal   bool
-	loadingRemote  bool
-	remoteErr      string
-	localEntries   []localEntry
-	visibleLocal   []localEntry
-	remoteEntries  []protocol.FileEntry
-	visibleRemote  []protocol.FileEntry
-	localSelected  map[string]bool
-	remoteSelected map[string]bool
-	localCursor    int
-	remoteCursor   int
-	localSort      sortKind
-	remoteSort     sortKind
-	query          string
+	localDir              string
+	localEpoch            int
+	remoteEpoch           int
+	loadingLocal          bool
+	loadingRemote         bool
+	localLoadStarted      time.Time
+	remoteLoadStarted     time.Time
+	pendingLocalFocusPath string
+	remoteErr             string
+	localEntries          []localEntry
+	visibleLocal          []localEntry
+	remoteEntries         []protocol.FileEntry
+	visibleRemote         []protocol.FileEntry
+	localSelected         map[string]bool
+	remoteSelected        map[string]bool
+	localCursor           int
+	remoteCursor          int
+	localSort             sortKind
+	remoteSort            sortKind
+	query                 string
+
+	// 异步操作进度与防重入状态
+	activatingID bool
+	opBusy       bool
+	opLabel      string
+	opStart      time.Time
+	spinIdx      int
 
 	// 队列快照视图（无锁）
 	activeTasks   []queue.Task
@@ -237,8 +247,11 @@ func (m *model) Init() tea.Cmd {
 
 func (m *model) tickCmd() tea.Cmd {
 	interval := 200 * time.Millisecond
-	if m.manager != nil && m.manager.HasRunning() {
+	switch {
+	case m.manager != nil && m.manager.HasRunning():
 		interval = 50 * time.Millisecond
+	case m.activatingID || m.opBusy || m.loadingLocal || m.loadingRemote:
+		interval = 100 * time.Millisecond
 	}
 	return tea.Tick(interval, func(t time.Time) tea.Msg {
 		return tickMsg(t)
@@ -249,6 +262,7 @@ func (m *model) loadLocalCmd(dir string) tea.Cmd {
 	m.localEpoch++
 	epoch := m.localEpoch
 	m.loadingLocal = true
+	m.localLoadStarted = time.Now()
 	return func() tea.Msg {
 		abs, err := filepath.Abs(dir)
 		if err != nil {
@@ -286,6 +300,7 @@ func (m *model) loadRemoteCmd() tea.Cmd {
 	m.remoteEpoch++
 	epoch := m.remoteEpoch
 	m.loadingRemote = true
+	m.remoteLoadStarted = time.Now()
 	runner := m.runner
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -481,6 +496,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case tickMsg:
+		m.spinIdx = (m.spinIdx + 1) % len(spinnerFrames)
 		if m.refreshQueueSnapshots() {
 			return m, tea.Batch(m.tickCmd(), m.loadLocalCmd(m.localDir), m.loadRemoteCmd())
 		}
@@ -492,12 +508,18 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.loadingLocal = false
 		if msg.err != nil {
+			m.pendingLocalFocusPath = ""
 			m.statusToast = "无法读取目录：" + msg.err.Error()
 			return m, nil
 		}
+		prevDir := m.localDir
 		m.localDir = msg.dir
 		if !m.editingPath {
 			m.pathInput.SetValue(msg.dir)
+		}
+		if msg.dir != prevDir && m.pendingLocalFocusPath == "" {
+			m.visibleLocal = nil
+			m.localCursor = 0
 		}
 		m.localEntries = msg.entries
 		m.rebuildLocalVisible()
@@ -528,6 +550,11 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case identityActivatedMsg:
+		m.activatingID = false
+		if m.opLabel == "正在切换身份" {
+			m.opLabel = ""
+			m.opStart = time.Time{}
+		}
 		if msg.err != nil {
 			if msg.resetOld {
 				m.cfg = nil
@@ -567,6 +594,9 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, m.loadRemoteCmd()
 
 	case batchOpResultMsg:
+		m.opBusy = false
+		m.opLabel = ""
+		m.opStart = time.Time{}
 		if msg.err != nil {
 			m.statusToast = msg.err.Error()
 			return m, nil
@@ -819,6 +849,13 @@ func (m *model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 					m.idInput.Blur()
 					m.idCursor = idx
 					if already {
+						if m.activatingID {
+							m.statusToast = "正在切换或导入身份，请稍候…"
+							return m, nil
+						}
+						m.activatingID = true
+						m.opLabel = "正在切换身份"
+						m.opStart = time.Now()
 						m.statusToast = "正在切换身份…"
 						return m, m.activateChoiceCmd(m.idChoices[idx], "")
 					}
@@ -985,12 +1022,19 @@ func (m *model) handleModalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		if m.idInputFocus {
 			if k == "enter" {
+				if m.activatingID {
+					m.statusToast = "正在校验或切换身份，请稍候…"
+					return m, nil
+				}
 				path := strings.TrimSpace(m.idInput.Value())
 				if path == "" {
 					m.statusToast = "请输入要导入的配置文件或目录路径"
 					return m, nil
 				}
 				m.idInput.SetValue("")
+				m.activatingID = true
+				m.opLabel = "正在导入身份"
+				m.opStart = time.Now()
 				m.statusToast = "正在校验并导入身份…"
 				return m, m.activateChoiceCmd(identityChoice{}, path)
 			}
@@ -1008,7 +1052,14 @@ func (m *model) handleModalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.idCursor++
 			}
 		case "enter":
+			if m.activatingID {
+				m.statusToast = "正在切换身份，请稍候…"
+				return m, nil
+			}
 			if len(m.idChoices) > 0 && m.idCursor < len(m.idChoices) {
+				m.activatingID = true
+				m.opLabel = "正在切换身份"
+				m.opStart = time.Now()
 				m.statusToast = "正在切换身份…"
 				return m, m.activateChoiceCmd(m.idChoices[m.idCursor], "")
 			}
@@ -1114,7 +1165,14 @@ func (m *model) handleModalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.modal = modalNone
 			return m, nil
 		case "p":
+			if m.opBusy {
+				m.statusToast = "已有退出或批量操作正在执行，请稍候…"
+				return m, nil
+			}
 			m.modal = modalNone
+			m.opBusy = true
+			m.opLabel = "正在暂停并等待检查点确认"
+			m.opStart = time.Now()
 			m.statusToast = "正在等待服务端确认暂停检查点后退出…"
 			return m, m.pauseAllAndQuitCmd()
 		case "f", "q":
@@ -1209,6 +1267,7 @@ func (m *model) handleLocalKey(k string) (tea.Model, tea.Cmd) {
 	case "backspace":
 		parent := filepath.Dir(m.localDir)
 		if parent != m.localDir {
+			m.pendingLocalFocusPath = m.localDir
 			return m, m.loadLocalCmd(parent)
 		}
 	case " ":
@@ -1229,6 +1288,11 @@ func (m *model) handleLocalKey(k string) (tea.Model, tea.Cmd) {
 		if m.localCursor >= 0 && m.localCursor < n {
 			e := m.visibleLocal[m.localCursor]
 			if e.dir {
+				if e.name == "../" {
+					m.pendingLocalFocusPath = m.localDir
+				} else {
+					m.pendingLocalFocusPath = ""
+				}
 				return m, m.loadLocalCmd(e.path)
 			}
 			m.detailTitle = "本地文件信息"
@@ -1452,6 +1516,12 @@ func (m *model) sortLabel(mode sortKind) string {
 }
 
 func (m *model) rebuildLocalVisible() {
+	focusPath := m.pendingLocalFocusPath
+	m.pendingLocalFocusPath = ""
+	if focusPath == "" && m.localCursor >= 0 && m.localCursor < len(m.visibleLocal) {
+		focusPath = m.visibleLocal[m.localCursor].path
+	}
+
 	q := strings.ToLower(strings.TrimSpace(m.query))
 	var out []localEntry
 	for _, e := range m.localEntries {
@@ -1483,12 +1553,25 @@ func (m *model) rebuildLocalVisible() {
 		return strings.ToLower(a.name) < strings.ToLower(b.name)
 	})
 	m.visibleLocal = out
+	if focusPath != "" {
+		for i, e := range out {
+			if e.path == focusPath {
+				m.localCursor = i
+				return
+			}
+		}
+	}
 	if m.localCursor >= len(out) {
 		m.localCursor = max(0, len(out)-1)
 	}
 }
 
 func (m *model) rebuildRemoteVisible() {
+	focusName := ""
+	if m.remoteCursor >= 0 && m.remoteCursor < len(m.visibleRemote) {
+		focusName = m.visibleRemote[m.remoteCursor].FileName
+	}
+
 	q := strings.ToLower(strings.TrimSpace(m.query))
 	var out []protocol.FileEntry
 	for _, f := range m.remoteEntries {
@@ -1514,6 +1597,14 @@ func (m *model) rebuildRemoteVisible() {
 		return strings.ToLower(a.FileName) < strings.ToLower(b.FileName)
 	})
 	m.visibleRemote = out
+	if focusName != "" {
+		for i, f := range out {
+			if f.FileName == focusName {
+				m.remoteCursor = i
+				return
+			}
+		}
+	}
 	if m.remoteCursor >= len(out) {
 		m.remoteCursor = max(0, len(out)-1)
 	}
@@ -1855,6 +1946,10 @@ func (m *model) toggleAllCmd() tea.Cmd {
 	if m.manager == nil {
 		return nil
 	}
+	if m.opBusy {
+		m.statusToast = "已有队列控制操作正在执行，请稍候…"
+		return nil
+	}
 	hasActive := false
 	for _, t := range m.activeTasks {
 		if t.State.Active() {
@@ -1863,7 +1958,10 @@ func (m *model) toggleAllCmd() tea.Cmd {
 		}
 	}
 	mgr := m.manager
+	m.opBusy = true
+	m.opStart = time.Now()
 	if hasActive {
+		m.opLabel = "正在全部暂停"
 		return func() tea.Msg {
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 			defer cancel()
@@ -1873,6 +1971,7 @@ func (m *model) toggleAllCmd() tea.Cmd {
 			return batchOpResultMsg{notice: "已全部暂停"}
 		}
 	}
+	m.opLabel = "正在全部恢复"
 	return func() tea.Msg {
 		if err := mgr.ResumeAll(); err != nil {
 			return batchOpResultMsg{err: err}

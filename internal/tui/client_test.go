@@ -8,7 +8,11 @@ import (
 	"testing"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 
+	"sft-tui/internal/config"
+	"sft-tui/internal/identity"
 	"sft-tui/internal/protocol"
 	"sft-tui/internal/queue"
 )
@@ -210,5 +214,119 @@ func TestClientPerPaneSortPersistenceAndFoldCollision(t *testing.T) {
 	}
 	if got := uniqueNameFold("Report.TXT", used, false); got != "Report.TXT" {
 		t.Fatalf("expected case-sensitive mode to keep Report.TXT, got %q", got)
+	}
+}
+
+func TestClientPreservesFileFocusOnSortRefreshFilterAndDirExit(t *testing.T) {
+	dir := t.TempDir()
+	sub := filepath.Join(dir, "sub")
+	if err := os.MkdirAll(sub, 0755); err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range []struct {
+		name string
+		size int
+	}{{"alpha.bin", 300}, {"beta.bin", 100}, {"gamma.bin", 200}} {
+		if err := os.WriteFile(filepath.Join(dir, f.name), bytes.Repeat([]byte("x"), f.size), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	m := newModel(Options{ExecutableDir: dir, Directory: dir})
+	m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+	m.Update(m.loadLocalCmd(dir)())
+
+	// 选中 beta.bin 后按 o 切换排序、按刷新重新加载，焦点必须始终跟随 beta.bin
+	betaPath := filepath.Join(dir, "beta.bin")
+	for i, e := range m.visibleLocal {
+		if e.path == betaPath {
+			m.localCursor = i
+			break
+		}
+	}
+	m.focus = areaLocal
+	m.Update(keyRune('o')) // NameDesc
+	if got := m.visibleLocal[m.localCursor].path; got != betaPath {
+		t.Fatalf("expected cursor to stay on beta.bin after sort, got %q", got)
+	}
+	m.Update(m.loadLocalCmd(dir)())
+	if got := m.visibleLocal[m.localCursor].path; got != betaPath {
+		t.Fatalf("expected cursor to stay on beta.bin after refresh, got %q", got)
+	}
+
+	// 进入 sub 再按 Backspace 返回上级目录时，光标应回到 sub 目录项
+	for i, e := range m.visibleLocal {
+		if e.path == sub {
+			m.localCursor = i
+			break
+		}
+	}
+	_, enterCmd := m.Update(keyType(tea.KeyEnter))
+	m.Update(enterCmd())
+	if m.localDir != sub {
+		t.Fatalf("expected dir to change to sub, got %q", m.localDir)
+	}
+	_, backCmd := m.Update(keyType(tea.KeyBackspace))
+	m.Update(backCmd())
+	if m.localDir != dir || m.visibleLocal[m.localCursor].path != sub {
+		t.Fatalf("expected Backspace to return to parent and focus sub, dir=%q focused=%q", m.localDir, m.visibleLocal[m.localCursor].path)
+	}
+
+	// 远端列表排序与刷新后也保持当前选中文件名
+	m.focus = areaRemote
+	m.remoteEntries = []protocol.FileEntry{
+		{FileName: "a.dat", Size: 50},
+		{FileName: "b.dat", Size: 500},
+		{FileName: "c.dat", Size: 10},
+	}
+	m.rebuildRemoteVisible()
+	m.remoteCursor = 1 // b.dat
+	m.Update(keyRune('o'))
+	if got := m.visibleRemote[m.remoteCursor].FileName; got != "b.dat" {
+		t.Fatalf("expected remote cursor to stay on b.dat after sort, got %q", got)
+	}
+	m.Update(remoteLoadedMsg{epoch: m.remoteEpoch, entries: []protocol.FileEntry{
+		{FileName: "z.dat", Size: 1000},
+		{FileName: "a.dat", Size: 50},
+		{FileName: "b.dat", Size: 500},
+	}})
+	if got := m.visibleRemote[m.remoteCursor].FileName; got != "b.dat" {
+		t.Fatalf("expected remote cursor to stay on b.dat after refresh, got %q", got)
+	}
+}
+
+func TestClientContextualFooterAndAsyncDoubleSubmitGuard(t *testing.T) {
+	dir := t.TempDir()
+	m := newModel(Options{ExecutableDir: dir, Directory: dir})
+	m.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
+	m.focus = areaLocal
+
+	// 80x24 下未选文件且无身份时，Footer 单行渲染并明示不可用原因
+	footer := ansi.Strip(m.renderFooter())
+	if lipgloss.Height(footer) != 1 || !strings.Contains(footer, "需先选身份") || !strings.Contains(footer, "仅队列区") {
+		t.Fatalf("unexpected client contextual footer at 80x24:\n%s", footer)
+	}
+
+	// 验证身份切换/批量操作执行期间防重入保护
+	m.modal = modalIdentity
+	m.idChoices = []identityChoice{{profile: identity.Profile{Label: "alice@127.0.0.1:7443", Config: config.DefaultClient()}, imported: false}}
+	m.activatingID = true
+	_, dupCmd := m.Update(keyType(tea.KeyEnter))
+	if dupCmd != nil {
+		t.Fatal("expected duplicate identity activation submit to be blocked while activatingID=true")
+	}
+	m.activatingID = false
+
+	m.modal = modalNone
+	mgr, err := queue.Open(queue.Config{StateDir: filepath.Join(dir, "st"), Identity: "id1", MaxFileBytes: 1 << 20, MaxStreams: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.manager = mgr
+	defer m.cleanup()
+	m.opBusy = true
+	m.focus = areaQueue
+	if cmd := m.toggleAllCmd(); cmd != nil {
+		t.Fatal("expected toggleAllCmd to block concurrent submission when opBusy=true")
 	}
 }

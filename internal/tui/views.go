@@ -2,6 +2,7 @@ package tui
 
 import (
 	"fmt"
+	"path/filepath"
 	"strings"
 
 	"github.com/charmbracelet/lipgloss"
@@ -42,18 +43,23 @@ func (m *model) renderHeader() string {
 
 	connStyle := m.th.badgeMuted
 	connIcon := "○ "
+	connText := m.connStatus
 	switch {
+	case m.activatingID:
+		connStyle = m.th.badgeWarn
+		connIcon = spinnerChar(m.spinIdx) + " "
+		connText = "正在切换身份"
 	case strings.Contains(m.connStatus, "已连接"):
 		connStyle = m.th.badgeOk
 		connIcon = "● "
 	case strings.Contains(m.connStatus, "重连") || strings.Contains(m.connStatus, "正在连接"):
 		connStyle = m.th.badgeWarn
-		connIcon = "◐ "
+		connIcon = spinnerChar(m.spinIdx) + " "
 	case strings.Contains(m.connStatus, "失败") || strings.Contains(m.connStatus, "断开"):
 		connStyle = m.th.badgeErr
 		connIcon = "✕ "
 	}
-	connBadge := connStyle.Render(connIcon + truncCell(m.connStatus, 26))
+	connBadge := connStyle.Render(connIcon + truncCell(connText, 26))
 
 	var runCount, pauseCount int
 	var totalRate float64
@@ -93,7 +99,12 @@ func (m *model) renderSubHeader() string {
 
 	sortLabel := m.th.badgeMuted.Render("排序(o): " + m.activeSortLabel())
 	msg := ""
-	if m.statusToast != "" {
+	switch {
+	case m.opBusy && m.opLabel != "":
+		msg = "  " + formatBusyBadge(m.th, m.spinIdx, m.opLabel, m.opStart)
+	case m.activatingID:
+		msg = "  " + formatBusyBadge(m.th, m.spinIdx, "身份切换中", m.opStart)
+	case m.statusToast != "":
 		msg = "  " + m.th.toast.Render("· "+truncCell(m.statusToast, max(10, m.width/4)))
 	}
 	line := pathView + "   " + searchView + "   " + sortLabel + msg
@@ -101,26 +112,137 @@ func (m *model) renderSubHeader() string {
 }
 
 func (m *model) renderFooter() string {
-	var hints string
 	switch {
 	case m.editingPath:
-		hints = "路径跳转：Enter 打开目录 · Esc 取消"
+		return m.th.footerBar.Width(m.width).Render(truncCell("路径跳转：Enter 打开目录 · Esc 取消", m.width-2))
 	case m.editingSearch:
-		hints = "实时筛选：输入关键字 · Enter 确定 · Esc 清空"
+		return m.th.footerBar.Width(m.width).Render(truncCell("实时筛选：输入关键字 · Enter 确定 · Esc 清空", m.width-2))
 	case m.focus == areaLocal:
-		hints = "本地：↑↓ 移动  Space 多选  Enter 进目录/详情  u/F5 上传选中  Backspace 上级  p 路径  / 筛选  o 排序  r 刷新  i 身份  Tab 切区  ? 帮助  q 退出"
-	case m.focus == areaRemote:
-		hints = "远端：↑↓ 移动  Space 多选  Enter 详情  d/F5 下载到当前目录  r 刷新  / 筛选  o 排序  i 身份  Tab 切区  ? 帮助  q 退出"
-	case m.focus == areaQueue:
-		fallthrough
-	default:
-		if m.historyView {
-			hints = "历史归档：↑↓ 移动  Enter 详情  r/F5 重传  X 清空历史  Tab/v 切回活动队列  F6 主题  ? 帮助  q 退出"
-		} else {
-			hints = "活动队列：↑↓ 移动  Space 暂停/恢复  F5 恢复/重试  c 取消  a 全部暂停/恢复  n 改名  Tab/v 切历史  ? 帮助  q 退出"
+		upReason := ""
+		upLabel := "上传"
+		var curLocal *localEntry
+		if m.localCursor >= 0 && m.localCursor < len(m.visibleLocal) {
+			e := m.visibleLocal[m.localCursor]
+			curLocal = &e
 		}
+		switch {
+		case m.manager == nil:
+			upReason = "需先选身份"
+		case len(m.localSelected) > 0:
+			upLabel = fmt.Sprintf("上传(%d)", len(m.localSelected))
+		case curLocal == nil || !curLocal.regular:
+			upReason = "需选文件"
+		default:
+			upLabel = "上传当前"
+		}
+		parentReason := ""
+		if filepath.Dir(m.localDir) == m.localDir {
+			parentReason = "根目录"
+		}
+		refreshReason := ""
+		if m.loadingLocal || m.loadingRemote {
+			refreshReason = "加载中"
+		}
+		return renderActionFooter(m.th, m.width, "本地:", []footerChip{
+			{key: "u/F5", label: upLabel, reason: upReason, essential: true},
+			{key: "a", label: "全暂停", reason: "仅队列区", essential: true},
+			{key: "Spc", label: "多选", essential: true},
+			{key: "Enter", label: "开/详"},
+			{key: "Bksp", label: "上级", reason: parentReason},
+			{key: "r", label: "刷新", reason: refreshReason},
+			{key: "/", label: "筛选"},
+			{key: "o", label: "排序"},
+			{key: "p", label: "路径"},
+			{key: "i", label: "身份", essential: true},
+			{key: "?", label: "帮助"},
+			{key: "q", label: "退出"},
+		})
+	case m.focus == areaRemote:
+		dnReason := ""
+		dnLabel := "下载"
+		switch {
+		case m.cfg == nil:
+			dnReason = "需先选身份"
+		case m.remoteErr != "":
+			dnReason = "远端离线"
+		case len(m.remoteSelected) > 0:
+			dnLabel = fmt.Sprintf("下载(%d)", len(m.remoteSelected))
+		case m.remoteCursor < 0 || m.remoteCursor >= len(m.visibleRemote):
+			dnReason = "无文件"
+		default:
+			dnLabel = "下载当前"
+		}
+		refreshReason := ""
+		switch {
+		case m.cfg == nil:
+			refreshReason = "需先选身份"
+		case m.loadingRemote:
+			refreshReason = "同步中"
+		}
+		return renderActionFooter(m.th, m.width, "远端:", []footerChip{
+			{key: "d/F5", label: dnLabel, reason: dnReason, essential: true},
+			{key: "a", label: "全暂停", reason: "仅队列区", essential: true},
+			{key: "Spc", label: "多选", essential: true},
+			{key: "Enter", label: "详情"},
+			{key: "r", label: "刷新", reason: refreshReason, essential: true},
+			{key: "/", label: "筛选"},
+			{key: "o", label: "排序"},
+			{key: "i", label: "身份", essential: true},
+			{key: "?", label: "帮助"},
+			{key: "q", label: "退出"},
+		})
+	default:
+		t := m.selectedTask()
+		if m.historyView {
+			emptyReason := ""
+			if len(m.historyTasks) == 0 {
+				emptyReason = "无历史"
+			}
+			return renderActionFooter(m.th, m.width, "历史:", []footerChip{
+				{key: "r/F5", label: "重传", reason: emptyReason, essential: true},
+				{key: "Enter", label: "详情", reason: emptyReason, essential: true},
+				{key: "X", label: "清空", reason: emptyReason, essential: true},
+				{key: "v", label: "活动队列", essential: true},
+				{key: "F6", label: "主题"},
+				{key: "?", label: "帮助"},
+				{key: "q", label: "退出"},
+			})
+		}
+		spaceLabel, spaceReason := "暂停/恢复", ""
+		f5Reason := ""
+		renameReason := ""
+		cancelReason := ""
+		switch {
+		case t == nil:
+			spaceReason, f5Reason, renameReason, cancelReason = "无任务", "无任务", "无任务", "无任务"
+		case t.State.Active():
+			spaceLabel = "暂停"
+			f5Reason = "进行中"
+			renameReason = "需先暂停"
+		case t.State == "paused" || t.State == "pending":
+			spaceLabel = "恢复"
+		default:
+			spaceReason = "控制中"
+			f5Reason = "不可重试"
+			renameReason = "不可改名"
+		}
+		allReason := ""
+		if len(m.activeTasks) == 0 {
+			allReason = "队列空"
+		} else if m.opBusy {
+			allReason = "执行中"
+		}
+		return renderActionFooter(m.th, m.width, "队列:", []footerChip{
+			{key: "Space", label: spaceLabel, reason: spaceReason, essential: true},
+			{key: "F5", label: "恢复/重试", reason: f5Reason, essential: true},
+			{key: "n", label: "改名", reason: renameReason, essential: true},
+			{key: "c", label: "取消", reason: cancelReason, essential: true},
+			{key: "a", label: "全暂停/恢", reason: allReason, essential: true},
+			{key: "v", label: "历史"},
+			{key: "?", label: "帮助"},
+			{key: "q", label: "退出"},
+		})
 	}
-	return m.th.footerBar.Width(m.width).Render(truncCell(hints, m.width-2))
 }
 
 func (m *model) renderWideBody(bodyH int) string {
@@ -206,7 +328,7 @@ func (m *model) renderLocalPanel(outerW, outerH int) string {
 	selCount := len(m.localSelected)
 	title := m.th.hintKey.Render(fmt.Sprintf("本地文件 (%d 项 · 已选 %d)", len(m.visibleLocal), selCount))
 	if m.loadingLocal {
-		title += m.th.badgeWarn.Render(" [读取中…]")
+		title += " " + formatBusyBadge(m.th, m.spinIdx, "读取中", m.localLoadStarted)
 	}
 	title = truncCell(title, innerW)
 
@@ -252,7 +374,7 @@ func (m *model) renderRemotePanel(outerW, outerH int) string {
 
 	title := m.th.hintKey.Render(fmt.Sprintf("远端存储 (%d 项 · 已选 %d)", len(m.visibleRemote), len(m.remoteSelected)))
 	if m.loadingRemote {
-		title += m.th.badgeWarn.Render(" [同步中…]")
+		title += " " + formatBusyBadge(m.th, m.spinIdx, "同步中", m.remoteLoadStarted)
 	}
 	title = truncCell(title, innerW)
 

@@ -154,3 +154,99 @@ func formatTaskMetrics(t queue.Task) string {
 	}
 	return sizeStr
 }
+
+var spinnerFrames = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
+
+func spinnerChar(tick int) string {
+	return spinnerFrames[max(0, tick)%len(spinnerFrames)]
+}
+
+func formatBusyBadge(th theme, tick int, label string, started time.Time) string {
+	txt := spinnerChar(tick) + " " + label
+	if !started.IsZero() {
+		if sec := int(time.Since(started).Seconds()); sec >= 1 {
+			txt += fmt.Sprintf(" (%ds)", sec)
+		}
+	}
+	return th.badgeWarn.Render(txt)
+}
+
+type footerChip struct {
+	key       string
+	label     string
+	reason    string // 非空表示当前不可用及原因
+	essential bool
+}
+
+func renderActionFooter(th theme, width int, areaPrefix string, chips []footerChip) string {
+	budget := max(1, width-2)
+	type renderedChip struct {
+		text      string
+		width     int
+		essential bool
+	}
+	items := make([]renderedChip, 0, len(chips))
+	for _, c := range chips {
+		var txt string
+		if c.reason != "" {
+			txt = th.badgeMuted.Render(fmt.Sprintf("[%s]%s(%s)", c.key, c.label, c.reason))
+		} else {
+			txt = th.hintKey.Render("["+c.key+"]") + th.rowNormal.Render(c.label)
+		}
+		items = append(items, renderedChip{text: txt, width: lipgloss.Width(txt), essential: c.essential})
+	}
+
+	sep := "  "
+	sepW := 2
+	if width <= 96 {
+		sep = " "
+		sepW = 1
+	}
+
+	var prefixRendered string
+	prefixW := 0
+	if areaPrefix != "" {
+		prefixRendered = th.hintKey.Render(areaPrefix)
+		prefixW = lipgloss.Width(prefixRendered)
+	}
+
+	// 第一遍优先纳入 essential 操作（含不可用原因），第二遍按剩余宽度顺序填充辅助提示
+	included := make([]bool, len(items))
+	used := prefixW
+	hasAny := prefixW > 0
+	tryAdd := func(idx int, forceFirst bool) bool {
+		addW := items[idx].width
+		if hasAny {
+			addW += sepW
+		}
+		if used+addW > budget && !forceFirst {
+			return false
+		}
+		included[idx] = true
+		used += addW
+		hasAny = true
+		return true
+	}
+
+	for i, it := range items {
+		if it.essential {
+			tryAdd(i, !hasAny || i == 0)
+		}
+	}
+	for i, it := range items {
+		if !it.essential && !included[i] {
+			tryAdd(i, false)
+		}
+	}
+
+	var parts []string
+	if prefixRendered != "" {
+		parts = append(parts, prefixRendered)
+	}
+	for i, it := range items {
+		if included[i] {
+			parts = append(parts, it.text)
+		}
+	}
+	return th.footerBar.Width(width).Render(truncCell(strings.Join(parts, sep), budget))
+}
