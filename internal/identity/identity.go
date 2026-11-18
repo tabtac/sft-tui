@@ -307,9 +307,50 @@ func Active(executableDir string) (config.Client, error) {
 	return loadActive(filepath.Join(executableDir, ".sft"))
 }
 
+func normalizeLabel(label string) (string, error) {
+	trimmed := strings.TrimSpace(label)
+	if trimmed == "" || len([]rune(trimmed)) > 80 || strings.IndexFunc(trimmed, unicode.IsControl) >= 0 {
+		return "", fmt.Errorf("身份标签须为 1–80 个字符且不能包含控制字符")
+	}
+	return trimmed, nil
+}
+
+func writeProfileLabelLocked(home, id, cleanLabel string) error {
+	names, err := readLabels(home)
+	if err != nil {
+		return err
+	}
+	names[id] = cleanLabel
+	labelData, err := json.MarshalIndent(names, "", "  ")
+	if err != nil {
+		return err
+	}
+	return pal.StageAndReplaceMode(filepath.Join(home, "profile-labels.json"), append(labelData, '\n'), 0600, false)
+}
+
+// UpdateLabel 修改已导入身份的自定义显示标签。
+func UpdateLabel(executableDir, id, label string) error {
+	cleanLabel, err := normalizeLabel(label)
+	if err != nil {
+		return err
+	}
+	home := filepath.Join(executableDir, ".sft")
+	pPath, err := profilePath(home, id)
+	if err != nil {
+		return err
+	}
+	return withIdentityLock(home, func() error {
+		if _, err := loadProfile(pPath); err != nil {
+			return err
+		}
+		return writeProfileLabelLocked(home, id, cleanLabel)
+	})
+}
+
 func selectExpected(executableDir, id, label string, expected *config.Client) (config.Client, error) {
-	if strings.TrimSpace(label) == "" || len([]rune(label)) > 80 || strings.IndexFunc(label, unicode.IsControl) >= 0 {
-		return config.Client{}, fmt.Errorf("身份标签须为 1–80 个字符且不能包含控制字符")
+	cleanLabel, err := normalizeLabel(label)
+	if err != nil {
+		return config.Client{}, err
 	}
 	home := filepath.Join(executableDir, ".sft")
 	pPath, err := profilePath(home, id)
@@ -332,16 +373,7 @@ func selectExpected(executableDir, id, label string, expected *config.Client) (c
 		if expected != nil && c != *expected {
 			return fmt.Errorf("身份配置在预览后发生变化，请重新选择")
 		}
-		names, err := readLabels(home)
-		if err != nil {
-			return err
-		}
-		names[id] = strings.TrimSpace(label)
-		labelData, err := json.MarshalIndent(names, "", "  ")
-		if err != nil {
-			return err
-		}
-		if err := pal.StageAndReplaceMode(filepath.Join(home, "profile-labels.json"), append(labelData, '\n'), 0600, false); err != nil {
+		if err := writeProfileLabelLocked(home, id, cleanLabel); err != nil {
 			return err
 		}
 		if err := pal.StageAndReplaceMode(filepath.Join(home, "active"), []byte(id+"\n"), 0600, false); err != nil {

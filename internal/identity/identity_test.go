@@ -249,3 +249,24 @@ func TestDiscoverDeduplicatesAndSkipsHiddenBundles(t *testing.T) {
 		t.Errorf("discovery duplicates or includes hidden/example profiles: %q", paths)
 	}
 }
+
+func TestUpdateLabelPersistsAndValidates(t *testing.T) {
+	exe, path, _ := makeIdentityFixture(t)
+	profile, err := PrepareImport(exe, filepath.Dir(path), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := UpdateLabel(exe, profile.ID, "  生产主站  "); err != nil {
+		t.Fatalf("UpdateLabel failed: %v", err)
+	}
+	profs, err := Profiles(exe)
+	if err != nil || len(profs) != 1 || profs[0].Label != "生产主站" {
+		t.Fatalf("expected persisted updated label 生产主站, got %+v %v", profs, err)
+	}
+	if err := UpdateLabel(exe, profile.ID, ""); err == nil {
+		t.Fatal("expected empty label to fail")
+	}
+	if err := UpdateLabel(exe, profile.ID, strings.Repeat("a", 81)); err == nil {
+		t.Fatal("expected >80 rune label to fail")
+	}
+}
