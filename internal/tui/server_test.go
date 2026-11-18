@@ -818,3 +818,54 @@ func TestServerExternalKeyCSRRenewAndModalGuards(t *testing.T) {
 		t.Fatalf("expected carol Disabled state preserved after CSR renewal: %+v", m.cfg.AuthorizedClients)
 	}
 }
+
+func TestServerBusyProgressDoubleSubmitGuardAndContextualFooter(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "configs", "server.local.json")
+	if _, err := certmanage.Execute("init", certmanage.Options{
+		ServerConfig:    cfgPath,
+		Dir:             filepath.Join(dir, "certs"),
+		ClientConfigDir: filepath.Dir(cfgPath),
+		Name:            "alice",
+		Hosts:           "localhost,127.0.0.1",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	m := newServerModel(ServerOptions{ExecutableDir: dir, ConfigPath: cfgPath, Page: 0})
+	m.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
+	m.Update(m.loadConfigCmd()())
+
+	// 1. 离线状态下，概览页应展示不可用操作及原因，且保持单行 80x24
+	f0 := ansi.Strip(m.renderFooter())
+	if lipgloss.Height(f0) != 1 || !strings.Contains(f0, "未运行") || !strings.Contains(f0, "已初始化") {
+		t.Fatalf("unexpected server overview footer:\n%s", f0)
+	}
+
+	// 2. 设置页：离线时热加载不可用并显示原因
+	m.Update(keyRune('5'))
+	f4 := ansi.Strip(m.renderFooter())
+	if lipgloss.Height(f4) != 1 || !strings.Contains(f4, "服务离线") {
+		t.Fatalf("unexpected server settings footer:\n%s", f4)
+	}
+
+	// 3. 后台任务执行时：Tab bar 呈现带旋转指示器的进度标签，且阻止 s/R/x/K 重复提交
+	m.Update(keyRune('1'))
+	m.startBusy("后台启动 sftd 服务")
+	if !strings.Contains(ansi.Strip(m.renderTabBar()), "后台启动 sftd 服务") {
+		t.Fatalf("expected busy progress indicator in tab bar:\n%s", ansi.Strip(m.renderTabBar()))
+	}
+	for _, k := range []rune{'s', 'x', 'R'} {
+		if _, cmd := m.Update(keyRune(k)); cmd != nil || m.modal != srvModalNone {
+			t.Fatalf("expected %q to be blocked while server busy", string(k))
+		}
+	}
+	m.Update(keyRune('4'))
+	if _, cmd := m.Update(keyRune('K')); cmd != nil {
+		t.Fatal("expected K CA renew to be blocked while server busy")
+	}
+	m.Update(serverActionResultMsg{notice: "完成"})
+	if m.busy {
+		t.Fatal("expected busy flag cleared after serverActionResultMsg")
+	}
+}

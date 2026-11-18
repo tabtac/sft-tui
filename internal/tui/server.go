@@ -127,6 +127,10 @@ type serverModel struct {
 	detailLines []string
 	statusToast string
 	busy        bool
+	busyOp      string
+	busyStart   time.Time
+	busySpin    int
+	lastPoll    time.Time
 
 	// 多字段表单输入与向导状态
 	formState
@@ -175,6 +179,7 @@ func newServerModel(opts ServerOptions) *serverModel {
 }
 
 func (m *serverModel) Init() tea.Cmd {
+	m.lastPoll = time.Now()
 	return tea.Batch(
 		m.loadConfigCmd(),
 		m.pollRuntimeCmd(),
@@ -183,9 +188,41 @@ func (m *serverModel) Init() tea.Cmd {
 }
 
 func (m *serverModel) tickCmd() tea.Cmd {
-	return tea.Tick(time.Second, func(t time.Time) tea.Msg {
+	interval := time.Second
+	if m.busy {
+		interval = 150 * time.Millisecond
+	}
+	return tea.Tick(interval, func(t time.Time) tea.Msg {
 		return serverTickMsg(t)
 	})
+}
+
+func (m *serverModel) startBusy(op string) {
+	m.busy = true
+	m.busyOp = op
+	m.busyStart = time.Now()
+}
+
+func (m *serverModel) stopBusy() {
+	m.busy = false
+	m.busyOp = ""
+	m.busyStart = time.Time{}
+}
+
+func (m *serverModel) rejectIfBusy() bool {
+	if !m.busy {
+		return false
+	}
+	op := m.busyOp
+	if op == "" {
+		op = "后台操作"
+	}
+	if sec := int(time.Since(m.busyStart).Seconds()); sec >= 1 {
+		m.statusToast = fmt.Sprintf("正在执行%s（已耗时 %ds），请稍候完成…", op, sec)
+	} else {
+		m.statusToast = fmt.Sprintf("正在执行%s，请稍候完成…", op)
+	}
+	return true
 }
 
 func (m *serverModel) loadConfigCmd() tea.Cmd {
@@ -368,7 +405,12 @@ func (m *serverModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case serverTickMsg:
-		return m, tea.Batch(m.tickCmd(), m.pollRuntimeCmd())
+		m.busySpin = (m.busySpin + 1) % len(spinnerFrames)
+		if !m.busy || time.Since(m.lastPoll) >= time.Second {
+			m.lastPoll = time.Now()
+			return m, tea.Batch(m.tickCmd(), m.pollRuntimeCmd())
+		}
+		return m, m.tickCmd()
 
 	case serverConfigLoadedMsg:
 		m.loaded = true
@@ -412,7 +454,7 @@ func (m *serverModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case serverActionResultMsg:
-		m.busy = false
+		m.stopBusy()
 		if msg.err != nil {
 			m.statusToast = "操作失败：" + msg.err.Error()
 		} else if msg.notice != "" {
@@ -428,7 +470,7 @@ func (m *serverModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, tea.Batch(cmds...)
 
 	case deployInitDoneMsg:
-		m.busy = false
+		m.stopBusy()
 		if msg.err != nil {
 			if m.deploy != nil {
 				m.deploy.summaryErr = msg.err.Error()
@@ -452,7 +494,7 @@ func (m *serverModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, tea.Batch(m.loadConfigCmd(), m.pollRuntimeCmd())
 
 	case deployExportDoneMsg:
-		m.busy = false
+		m.stopBusy()
 		if msg.err != nil {
 			if m.deploy != nil {
 				m.deploy.finishMsg = "部署已保存；导出失败：" + msg.err.Error()
@@ -528,8 +570,7 @@ func (m *serverModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	switch k {
 	case "q", "f10":
-		if m.busy {
-			m.statusToast = "后台操作正在执行，请稍候完成后退出"
+		if m.rejectIfBusy() {
 			return m, nil
 		}
 		return m, tea.Quit
@@ -556,6 +597,9 @@ func (m *serverModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "s":
 		return m, m.startServiceCmd()
 	case "x":
+		if m.rejectIfBusy() {
+			return m, nil
+		}
 		if m.runtime != nil {
 			m.modal = srvModalStop
 		} else {
@@ -1092,7 +1136,25 @@ func (m *serverModel) certBaseOptions(name string) certmanage.Options {
 }
 
 func (m *serverModel) execCertAndReload(action string, o certmanage.Options, notice string) tea.Cmd {
-	m.busy = true
+	if m.rejectIfBusy() {
+		return nil
+	}
+	opLabel := "执行证书与权限变更"
+	switch action {
+	case "user":
+		if o.Renew {
+			opLabel = "续期用户证书"
+		} else {
+			opLabel = "签发用户证书"
+		}
+	case "policy":
+		opLabel = "保存用户策略"
+	case "ca":
+		opLabel = "续期 CA 证书"
+	case "server":
+		opLabel = "轮换服务端证书"
+	}
+	m.startBusy(opLabel)
 	cfgPath := m.opts.ConfigPath
 	return func() tea.Msg {
 		res, err := certmanage.Execute(action, o)
@@ -1307,6 +1369,9 @@ func (m *serverModel) submitModalForm() (tea.Model, tea.Cmd) {
 			m.modal = srvModalNone
 			return m, nil
 		}
+		if m.rejectIfBusy() {
+			return m, nil
+		}
 		out := strings.TrimSpace(m.formInputs[0].Value())
 		if out == "" {
 			m.statusToast = "导出目标目录不能为空"
@@ -1319,7 +1384,7 @@ func (m *serverModel) submitModalForm() (tea.Model, tea.Cmd) {
 		o := m.certBaseOptions(u.UserID)
 		o.Out = out
 		o.CertificateOnly = m.formToggles[0]
-		m.busy = true
+		m.startBusy("导出用户分发包")
 		return m, func() tea.Msg {
 			if _, err := certmanage.Execute("export", o); err != nil {
 				return serverActionResultMsg{err: err}
@@ -1387,9 +1452,12 @@ func (m *serverModel) renewCACmd() tea.Cmd {
 }
 
 func (m *serverModel) reloadServiceCmd() tea.Cmd {
+	if m.rejectIfBusy() {
+		return nil
+	}
 	cfgPath := m.opts.ConfigPath
 	root := m.endpointRoot
-	m.busy = true
+	m.startBusy("热加载服务配置")
 	return func() tea.Msg {
 		ok, err := control.Reload(cfgPath, root)
 		if err != nil {
@@ -1403,13 +1471,16 @@ func (m *serverModel) reloadServiceCmd() tea.Cmd {
 }
 
 func (m *serverModel) startServiceCmd() tea.Cmd {
+	if m.rejectIfBusy() {
+		return nil
+	}
 	if m.runtime != nil && m.runtime.State == "running" {
 		m.statusToast = "服务已在运行中"
 		return nil
 	}
 	cfgPath := m.opts.ConfigPath
 	exeDir := m.opts.ExecutableDir
-	m.busy = true
+	m.startBusy("后台启动 sftd 服务")
 	m.statusToast = "正在后台启动 sftd 服务…"
 	return func() tea.Msg {
 		exe, err := os.Executable()
@@ -1430,9 +1501,12 @@ func (m *serverModel) startServiceCmd() tea.Cmd {
 }
 
 func (m *serverModel) stopServiceCmd(immediate bool) tea.Cmd {
+	if m.rejectIfBusy() {
+		return nil
+	}
 	cfgPath := m.opts.ConfigPath
 	root := m.endpointRoot
-	m.busy = true
+	m.startBusy("停止 sftd 服务")
 	return func() tea.Msg {
 		ok, err := control.Stop(cfgPath, root, immediate)
 		if err != nil {

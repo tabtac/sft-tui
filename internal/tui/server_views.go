@@ -114,6 +114,12 @@ func (m *serverModel) renderTabBar() string {
 	avail := m.width - 2 - lipgloss.Width(row) - 3
 	if m.editingQuery && avail > 8 {
 		row += "   " + m.th.hintKey.Render("筛选: ") + m.queryInput.View()
+	} else if m.busy && avail >= 6 {
+		op := m.busyOp
+		if op == "" {
+			op = "操作执行中"
+		}
+		row += "   " + formatBusyBadge(m.th, m.busySpin, op, m.busyStart)
 	} else if m.statusToast != "" && avail >= 6 {
 		row += "   " + m.th.toast.Render("· "+truncCell(m.statusToast, avail-2))
 	}
@@ -121,24 +127,171 @@ func (m *serverModel) renderTabBar() string {
 }
 
 func (m *serverModel) renderFooter() string {
-	var hints string
-	switch {
-	case m.editingQuery:
-		hints = "筛选过滤：输入关键字 · Enter 应用 · Esc 清空"
-	case m.page == 0:
-		hints = "概览：[s] 启动服务  [x] 停止服务  [R] 热加载  [I] 部署向导  [1-6/Tab] 切页  [F6] 主题  [?] 帮助  [q] 退出"
-	case m.page == 1:
-		hints = "用户：[/] 搜索  [n] 新建  [t] 启用/吊销  [p] 改权限与带宽  [w] 续期证书  [C] CSR  [e] 导出  [Enter] 详情"
-	case m.page == 2:
-		hints = "传输：[/] 筛选用户或文件名  [↑↓] 选择  [Enter] 查看详情  [r] 刷新"
-	case m.page == 3:
-		hints = "证书：[K] 续期CA  [S] 轮换服务端证书  [C] 签发CSR  [Enter] 查看指纹详情"
-	case m.page == 4:
-		hints = "设置：[m] 编辑基础/带宽/存储  [a] 高级协议与资源限额  [L] 日志大小上限  [A] 应用热加载  [1-6/Tab] 切页"
-	default:
-		hints = "日志：[p] 暂停/跟随实时日志  [l] 最低等级(" + logLevelLabel(m.logMinLevel) + ")  [L] 日志上限  [/] 关键字过滤  [Enter] 详情"
+	if m.editingQuery {
+		return m.th.footerBar.Width(m.width).Render(truncCell("筛选过滤：输入关键字 · Enter 应用 · Esc 清空", max(1, m.width-2)))
 	}
-	return m.th.footerBar.Width(m.width).Render(truncCell(hints, max(1, m.width-2)))
+	busyReason := ""
+	if m.busy {
+		busyReason = "忙"
+	}
+	cfgReason := ""
+	if m.cfgErr != nil {
+		cfgReason = "缺配置"
+	}
+	quitReason := ""
+	if m.busy {
+		quitReason = "执行中"
+	}
+	switch m.page {
+	case 0:
+		startReason := busyReason
+		if startReason == "" {
+			if m.runtime != nil && m.runtime.State == "running" {
+				startReason = "运行中"
+			} else if m.cfgErr != nil {
+				startReason = "缺配置"
+			}
+		}
+		stopReason := busyReason
+		if stopReason == "" && m.runtime == nil {
+			stopReason = "未运行"
+		}
+		reloadReason := busyReason
+		if reloadReason == "" && m.runtime == nil {
+			reloadReason = "未运行"
+		}
+		wizReason := ""
+		if m.loaded && m.cfgErr == nil {
+			wizReason = "已初始化"
+		}
+		detailReason := ""
+		if m.runtime == nil || len(m.runtime.Peers) == 0 {
+			detailReason = "无会话"
+		}
+		return renderActionFooter(m.th, m.width, "概览:", []footerChip{
+			{key: "s", label: "启动", reason: startReason, essential: true},
+			{key: "x", label: "停止", reason: stopReason, essential: true},
+			{key: "R", label: "热加载", reason: reloadReason, essential: true},
+			{key: "I", label: "向导", reason: wizReason, essential: true},
+			{key: "Enter", label: "详情", reason: detailReason},
+			{key: "Tab", label: "切页"},
+			{key: "F6", label: "主题"},
+			{key: "?", label: "帮助"},
+			{key: "q", label: "退出", reason: quitReason, essential: true},
+		})
+	case 1:
+		users := m.filteredUsers()
+		noUser := ""
+		toggleLabel := "禁用/启"
+		renewLabel := "续期"
+		if len(users) == 0 || m.cursors[1] >= len(users) {
+			noUser = "无用户"
+		} else {
+			u := users[m.cursors[1]]
+			if u.Disabled {
+				toggleLabel = "重启用"
+			} else {
+				toggleLabel = "吊销"
+			}
+			if u.ExternalKey {
+				renewLabel = "CSR续期"
+			}
+		}
+		actReason := busyReason
+		if actReason == "" && cfgReason != "" {
+			actReason = cfgReason
+		}
+		userActReason := actReason
+		if userActReason == "" {
+			userActReason = noUser
+		}
+		return renderActionFooter(m.th, m.width, "用户:", []footerChip{
+			{key: "n", label: "新建", reason: actReason, essential: true},
+			{key: "t", label: toggleLabel, reason: userActReason, essential: true},
+			{key: "p", label: "策略", reason: userActReason, essential: true},
+			{key: "w", label: renewLabel, reason: userActReason, essential: true},
+			{key: "e", label: "导出", reason: noUser, essential: true},
+			{key: "C", label: "CSR", reason: actReason},
+			{key: "/", label: "搜索"},
+			{key: "Enter", label: "详情", reason: noUser},
+			{key: "?", label: "帮助"},
+			{key: "q", label: "退出", reason: quitReason},
+		})
+	case 2:
+		tasks := m.filteredTasks()
+		detailReason := ""
+		if m.runtime == nil {
+			detailReason = "服务离线"
+		} else if len(tasks) == 0 {
+			detailReason = "无记录"
+		}
+		return renderActionFooter(m.th, m.width, "传输:", []footerChip{
+			{key: "Enter", label: "详情", reason: detailReason, essential: true},
+			{key: "/", label: "筛选", essential: true},
+			{key: "r", label: "刷新", essential: true},
+			{key: "Tab", label: "切页"},
+			{key: "?", label: "帮助"},
+			{key: "q", label: "退出", reason: quitReason, essential: true},
+		})
+	case 3:
+		certReason := busyReason
+		if certReason == "" && cfgReason != "" {
+			certReason = cfgReason
+		}
+		noCert := ""
+		if len(m.certs) == 0 {
+			noCert = "无证书"
+		}
+		return renderActionFooter(m.th, m.width, "证书:", []footerChip{
+			{key: "K", label: "续CA", reason: certReason, essential: true},
+			{key: "S", label: "轮换服务", reason: certReason, essential: true},
+			{key: "C", label: "签CSR", reason: certReason, essential: true},
+			{key: "Enter", label: "指纹", reason: noCert, essential: true},
+			{key: "Tab", label: "切页"},
+			{key: "?", label: "帮助"},
+			{key: "q", label: "退出", reason: quitReason, essential: true},
+		})
+	case 4:
+		hotReason := busyReason
+		switch {
+		case hotReason != "":
+		case m.runtime == nil:
+			hotReason = "服务离线"
+		case m.cfgErr != nil:
+			hotReason = "缺配置"
+		case config.HotEqual(m.runtime.Config, m.cfg):
+			hotReason = "热配置一致"
+		}
+		return renderActionFooter(m.th, m.width, "设置:", []footerChip{
+			{key: "m", label: "基础", reason: cfgReason, essential: true},
+			{key: "a", label: "高级", reason: cfgReason, essential: true},
+			{key: "L", label: "日志限", reason: cfgReason, essential: true},
+			{key: "A", label: "热加载", reason: hotReason, essential: true},
+			{key: "Tab", label: "切页"},
+			{key: "?", label: "帮助"},
+			{key: "q", label: "退出", reason: quitReason, essential: true},
+		})
+	default:
+		pauseLabel := "暂停"
+		if m.logPaused {
+			pauseLabel = "跟随"
+		}
+		detailReason := ""
+		if m.logFallback != "" {
+			detailReason = "离线原文"
+		} else if len(m.logEvents) == 0 {
+			detailReason = "无事件"
+		}
+		return renderActionFooter(m.th, m.width, "日志:", []footerChip{
+			{key: "p", label: pauseLabel, essential: true},
+			{key: "l", label: "等级(" + logLevelLabel(m.logMinLevel) + ")", essential: true},
+			{key: "L", label: "上限", reason: cfgReason, essential: true},
+			{key: "/", label: "过滤", essential: true},
+			{key: "Enter", label: "详情", reason: detailReason, essential: true},
+			{key: "?", label: "帮助"},
+			{key: "q", label: "退出", reason: quitReason},
+		})
+	}
 }
 
 func logLevelLabel(l string) string {

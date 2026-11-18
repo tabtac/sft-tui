@@ -529,12 +529,15 @@ func (m *serverModel) openDeployStep(step int) {
 		}
 		m.addNoteRow(summary, false)
 		runSave := func(start bool) (tea.Model, tea.Cmd) {
+			if m.rejectIfBusy() {
+				return m, nil
+			}
 			if err := d.Validate(); err != nil {
 				w.summaryErr = err.Error()
 				m.openDeployStep(4)
 				return m, nil
 			}
-			m.busy = true
+			m.startBusy("初始化部署与证书")
 			m.modal = srvModalNone
 			m.statusToast = "正在生成证书与初始化部署…"
 			cfgPath := d.Config
@@ -593,6 +596,9 @@ func (m *serverModel) openDeployStep(step int) {
 				return m, m.startServiceCmd()
 			}},
 			{label: "立即导出用户包", onClick: func() (tea.Model, tea.Cmd) {
+				if m.rejectIfBusy() {
+					return m, nil
+				}
 				out := strings.TrimSpace(m.formInputs[expIdx].Value())
 				if out == "" {
 					m.statusToast = "请填写导出目标目录"
@@ -600,7 +606,7 @@ func (m *serverModel) openDeployStep(step int) {
 				}
 				w.exportDir = out
 				d := w.d
-				m.busy = true
+				m.startBusy("导出用户分发包")
 				return m, func() tea.Msg {
 					res, err := certmanage.Execute("export", certmanage.Options{
 						Dir:             d.CertDir,
@@ -878,6 +884,9 @@ func (m *serverModel) openLogLimitModal() {
 }
 
 func (m *serverModel) saveServerSettingsCmd(proposed config.Server) (tea.Model, tea.Cmd) {
+	if m.rejectIfBusy() {
+		return m, nil
+	}
 	if err := proposed.ValidateDraft(); err != nil {
 		m.statusToast = err.Error()
 		return m, nil
@@ -889,7 +898,7 @@ func (m *serverModel) saveServerSettingsCmd(proposed config.Server) (tea.Model, 
 		(expected.GlobalBandwidth != nil && proposed.GlobalBandwidth != nil && *expected.GlobalBandwidth != *proposed.GlobalBandwidth)
 	m.modal = srvModalNone
 	m.settingsDraft = nil
-	m.busy = true
+	m.startBusy("保存服务端配置")
 	return m, func() tea.Msg {
 		saved, err := certmanage.SaveSettings(cfgPath, certDir, expected, proposed)
 		if err != nil {
