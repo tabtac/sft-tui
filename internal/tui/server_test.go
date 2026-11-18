@@ -869,3 +869,26 @@ func TestServerBusyProgressDoubleSubmitGuardAndContextualFooter(t *testing.T) {
 		t.Fatal("expected busy flag cleared after serverActionResultMsg")
 	}
 }
+
+func TestServerSettingsPerFieldRuntimeDiffAndReloadLabels(t *testing.T) {
+	cfg := config.DefaultServer()
+	cfg.Listen = "127.0.0.1:8443"
+	rt := cfg
+
+	cfg.GlobalBandwidth = &config.Bandwidth{UploadBytesPerSecond: 2_000_000, DownloadBytesPerSecond: 3_000_000, BurstBytes: 256_000}
+	cfg.Limits.MaxStreams = 16
+
+	m := newServerModel(ServerOptions{ExecutableDir: t.TempDir(), ConfigPath: "configs/server.local.json", Page: 4})
+	m.loaded = true
+	m.cfg = cfg
+	m.runtime = &monitor.Snapshot{State: "running", Listen: rt.Listen, Started: time.Now(), Config: rt}
+	m.Update(tea.WindowSizeMsg{Width: 132, Height: 34})
+
+	view := ansi.Strip(m.View())
+	if !strings.Contains(view, "[待热更]") || !strings.Contains(view, "全局总带宽上限") || !strings.Contains(view, "运行: 未启用") {
+		t.Fatalf("expected per-field hot-reload diff on GlobalBandwidth:\n%s", view)
+	}
+	if !strings.Contains(view, "[待重启]") || !strings.Contains(view, "流控参数") || !strings.Contains(view, "需重启生效") {
+		t.Fatalf("expected per-field restart-required diff on Limits.MaxStreams:\n%s", view)
+	}
+}
