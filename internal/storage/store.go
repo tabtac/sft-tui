@@ -909,7 +909,10 @@ func (s *Store) ReadChunkAt(ctx context.Context, taskID protocol.TransferID, off
 func (s *Store) CheckpointDownload(ctx context.Context, taskID protocol.TransferID, offset uint64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.checkpointDownloadLocked(ctx, taskID, offset, false)
+}
 
+func (s *Store) checkpointDownloadLocked(ctx context.Context, taskID protocol.TransferID, offset uint64, renewExpiry bool) error {
 	task, err := s.getTaskLocked(ctx, taskID)
 	if err != nil {
 		return err
@@ -921,10 +924,21 @@ func (s *Store) CheckpointDownload(ctx context.Context, taskID protocol.Transfer
 		return ErrOffsetMismatch
 	}
 
+	idHex := IDToHex(taskID)
 	now := time.Now().Unix()
-	res, err := s.db.ExecContext(ctx, `
-		UPDATE tasks SET offset=?, updated_at=? WHERE id=? AND status=? AND offset<=?
-	`, offset, now, IDToHex(taskID), string(TaskActive), offset)
+	var (
+		res sql.Result
+	)
+	if renewExpiry {
+		expires := now + int64(s.retention.Seconds())
+		res, err = s.db.ExecContext(ctx, `
+			UPDATE tasks SET offset=?, updated_at=?, expires_at=? WHERE id=? AND status=? AND offset<=?
+		`, offset, now, expires, idHex, string(TaskActive), offset)
+	} else {
+		res, err = s.db.ExecContext(ctx, `
+			UPDATE tasks SET offset=?, updated_at=? WHERE id=? AND status=? AND offset<=?
+		`, offset, now, idHex, string(TaskActive), offset)
+	}
 	if err != nil {
 		return err
 	}

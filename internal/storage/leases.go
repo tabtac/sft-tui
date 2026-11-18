@@ -585,29 +585,7 @@ func (s *Store) CheckpointDownloadSession(ctx context.Context, taskID protocol.T
 	if err := s.checkLeaseLocked(idHex, lease); err != nil {
 		return err
 	}
-	task, err := s.getTaskLocked(ctx, taskID)
-	if err != nil {
-		return err
-	}
-	if task.Status != TaskActive {
-		return ErrTaskNotActive
-	}
-	if offset > task.FileSize || offset < task.Offset {
-		return ErrOffsetMismatch
-	}
-	now := time.Now().Unix()
-	expires := now + int64(s.retention.Seconds())
-	res, err := s.db.ExecContext(ctx, `
-		UPDATE tasks SET offset=?, updated_at=?, expires_at=? WHERE id=? AND status=? AND offset<=?
-	`, offset, now, expires, idHex, string(TaskActive), offset)
-	if err != nil {
-		return err
-	}
-	rows, _ := res.RowsAffected()
-	if rows == 0 {
-		return ErrTaskNotActive
-	}
-	return nil
+	return s.checkpointDownloadLocked(ctx, taskID, offset, true)
 }
 
 // FinishDownloadSession 校验租约并将下载任务标记为 COMPLETED。
