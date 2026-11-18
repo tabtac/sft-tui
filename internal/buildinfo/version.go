@@ -1,4 +1,4 @@
 package buildinfo
 
 // Version 当前软件版本号
-const Version = "0.2.5"
+const Version = "0.2.6"
