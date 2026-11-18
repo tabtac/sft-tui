@@ -9,10 +9,12 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 
 	"sft-tui/internal/config"
 	"sft-tui/internal/identity"
@@ -76,6 +78,21 @@ type identitiesScannedMsg struct {
 	choices []identityChoice
 	err     error
 }
+type identityDirDiscoveredMsg struct {
+	dir     string
+	choices []identityChoice
+}
+type identityConnTestMsg struct {
+	path    string
+	latency time.Duration
+	err     error
+}
+type identityTestState struct {
+	testing bool
+	tested  bool
+	latency time.Duration
+	err     string
+}
 type identityActivatedMsg struct {
 	cfg      config.Client
 	label    string
@@ -104,13 +121,15 @@ type model struct {
 	infoScroll    int
 
 	// 文本输入框
-	searchInput   textinput.Model
-	pathInput     textinput.Model
-	idInput       textinput.Model
-	renameInput   textinput.Model
-	editingSearch bool
-	editingPath   bool
-	idInputFocus  bool
+	searchInput    textinput.Model
+	pathInput      textinput.Model
+	idInput        textinput.Model
+	idLabelInput   textinput.Model
+	renameInput    textinput.Model
+	editingSearch  bool
+	editingPath    bool
+	idInputFocus   bool
+	editingIDLabel bool
 
 	// 身份与传输引擎
 	cfg           *config.Client
@@ -144,11 +163,13 @@ type model struct {
 	query                 string
 
 	// 异步操作进度与防重入状态
-	activatingID bool
-	opBusy       bool
-	opLabel      string
-	opStart      time.Time
-	spinIdx      int
+	activatingID  bool
+	testingConn   bool
+	opBusy        bool
+	opLabel       string
+	opStart       time.Time
+	spinIdx       int
+	idTestResults map[string]identityTestState
 
 	// 队列快照视图（无锁）
 	activeTasks   []queue.Task
@@ -217,9 +238,11 @@ func newModel(opts Options) *model {
 		localSelected:  make(map[string]bool),
 		remoteSelected: make(map[string]bool),
 		completedSeen:  make(map[string]bool),
+		idTestResults:  make(map[string]identityTestState),
 		searchInput:    makeInput("输入关键字筛选文件名…"),
 		pathInput:      makeInput("输入本地绝对或相对路径…"),
 		idInput:        makeInput("输入 client*.json 或导出目录路径…"),
+		idLabelInput:   makeInput("输入自定义身份标签 (1–80 字符)…"),
 		renameInput:    makeInput("输入新的目标文件名…"),
 	}
 	m.pathInput.SetValue(opts.Directory)
@@ -250,7 +273,7 @@ func (m *model) tickCmd() tea.Cmd {
 	switch {
 	case m.manager != nil && m.manager.HasRunning():
 		interval = 50 * time.Millisecond
-	case m.activatingID || m.opBusy || m.loadingLocal || m.loadingRemote:
+	case m.activatingID || m.testingConn || m.opBusy || m.loadingLocal || m.loadingRemote:
 		interval = 100 * time.Millisecond
 	}
 	return tea.Tick(interval, func(t time.Time) tea.Msg {
@@ -377,6 +400,62 @@ func (m *model) scanIdentitiesCmd() tea.Cmd {
 			}
 		}
 		return identitiesScannedMsg{choices: out, err: err}
+	}
+}
+
+func (m *model) discoverOrActivatePathCmd(customPath string) tea.Cmd {
+	exeDir := m.opts.ExecutableDir
+	info, statErr := os.Stat(customPath)
+	if statErr == nil && info.IsDir() {
+		return func() tea.Msg {
+			wd, _ := os.Getwd()
+			candidates, discErr := identity.Discover(exeDir, wd, customPath)
+			if discErr != nil {
+				return identityActivatedMsg{err: discErr}
+			}
+			if len(candidates) == 0 {
+				return identityActivatedMsg{err: fmt.Errorf("目录中未找到有效的客户端配置：%s", customPath)}
+			}
+			if len(candidates) > 1 {
+				var found []identityChoice
+				for _, p := range candidates {
+					if prof, e := identity.Preview(p, wd); e == nil {
+						found = append(found, identityChoice{profile: prof, imported: false})
+					}
+				}
+				if len(found) == 0 {
+					return identityActivatedMsg{err: fmt.Errorf("目录中的客户端配置均无法解析：%s", customPath)}
+				}
+				if len(found) > 1 {
+					return identityDirDiscoveredMsg{dir: customPath, choices: found}
+				}
+				return m.activateChoiceCmd(found[0], "")()
+			}
+			return m.activateChoiceCmd(identityChoice{}, customPath)()
+		}
+	}
+	return m.activateChoiceCmd(identityChoice{}, customPath)
+}
+
+func (m *model) testIdentityConnCmd(ch identityChoice) tea.Cmd {
+	path := ch.profile.Path
+	cfg := ch.profile.Config
+	return func() tea.Msg {
+		if path != "" {
+			wd, _ := os.Getwd()
+			if prof, err := identity.Preview(path, wd); err == nil {
+				cfg = prof.Config
+			}
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		start := time.Now()
+		cli, err := transfer.Dial(ctx, cfg)
+		elapsed := time.Since(start)
+		if cli != nil {
+			_ = cli.Close()
+		}
+		return identityConnTestMsg{path: path, latency: elapsed, err: err}
 	}
 }
 
@@ -540,12 +619,77 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case identitiesScannedMsg:
-		m.idChoices = msg.choices
+		existing := make(map[string]identityChoice, len(m.idChoices))
+		for _, ch := range m.idChoices {
+			existing[ch.profile.Path] = ch
+		}
+		// 保留未导入但用户刚编辑过标签或扫描自自定义目录的候选
+		seen := make(map[string]bool, len(msg.choices))
+		out := make([]identityChoice, 0, len(msg.choices))
+		for _, ch := range msg.choices {
+			seen[ch.profile.Path] = true
+			if !ch.imported {
+				if prev, ok := existing[ch.profile.Path]; ok && prev.profile.Label != "" {
+					ch.profile.Label = prev.profile.Label
+				}
+			}
+			out = append(out, ch)
+		}
+		for _, prev := range m.idChoices {
+			if !prev.imported && !seen[prev.profile.Path] {
+				out = append(out, prev)
+			}
+		}
+		m.idChoices = out
 		if m.idCursor >= len(m.idChoices) {
 			m.idCursor = max(0, len(m.idChoices)-1)
 		}
 		if msg.err != nil && len(msg.choices) == 0 {
 			m.statusToast = msg.err.Error()
+		}
+		return m, nil
+
+	case identityDirDiscoveredMsg:
+		m.activatingID = false
+		if m.opLabel == "正在导入身份" || m.opLabel == "正在切换身份" {
+			m.opLabel = ""
+			m.opStart = time.Time{}
+		}
+		byPath := make(map[string]int, len(m.idChoices))
+		for i, ch := range m.idChoices {
+			byPath[ch.profile.Path] = i
+		}
+		firstIdx := -1
+		for _, ch := range msg.choices {
+			if idx, ok := byPath[ch.profile.Path]; ok {
+				if firstIdx < 0 {
+					firstIdx = idx
+				}
+				continue
+			}
+			idx := len(m.idChoices)
+			m.idChoices = append(m.idChoices, ch)
+			byPath[ch.profile.Path] = idx
+			if firstIdx < 0 {
+				firstIdx = idx
+			}
+		}
+		if firstIdx >= 0 {
+			m.idCursor = firstIdx
+		}
+		m.idInputFocus = false
+		m.idInput.Blur()
+		m.statusToast = fmt.Sprintf("目录发现 %d 个身份配置，请预览详情后按 Enter 激活或 t 测连", len(msg.choices))
+		return m, nil
+
+	case identityConnTestMsg:
+		m.testingConn = false
+		if msg.err != nil {
+			m.idTestResults[msg.path] = identityTestState{tested: true, latency: msg.latency, err: msg.err.Error()}
+			m.statusToast = "连接测试失败：" + msg.err.Error()
+		} else {
+			m.idTestResults[msg.path] = identityTestState{tested: true, latency: msg.latency}
+			m.statusToast = fmt.Sprintf("连接测试成功，耗时 %s", msg.latency.Round(time.Millisecond))
 		}
 		return m, nil
 
@@ -830,23 +974,25 @@ func (m *model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 				m.idCursor++
 			}
 		case tea.MouseButtonLeft:
-			maxShow := min(8, len(m.idChoices))
-			listLines := max(1, maxShow)
+			_, listStartRelY, maxShow, inputRelY := m.identityModalMetrics()
 			boxW := min(max(44, m.width-4), 86)
-			boxH := 4 + 2 + listLines + 4
+			_, footer, lines := m.buildIdentityModalContent()
+			boxH := lipgloss.Height(renderModalRawBox(m.width, m.th, "客户端 mTLS 身份管理", lines, footer))
 			boxY := max(0, (m.height-boxH)/2)
 			boxX := max(0, (m.width-boxW)/2)
 			if msg.X < boxX || msg.X >= boxX+boxW {
 				return m, nil
 			}
 			relY := msg.Y - (boxY + 4)
-			if relY >= 2 && relY < 2+maxShow && len(m.idChoices) > 0 {
+			if relY >= listStartRelY && relY < listStartRelY+maxShow && len(m.idChoices) > 0 {
 				start := scrollOffset(m.idCursor, len(m.idChoices), maxShow)
-				idx := start + (relY - 2)
+				idx := start + (relY - listStartRelY)
 				if idx >= 0 && idx < len(m.idChoices) {
-					already := !m.idInputFocus && m.idCursor == idx
+					already := !m.idInputFocus && !m.editingIDLabel && m.idCursor == idx
 					m.idInputFocus = false
+					m.editingIDLabel = false
 					m.idInput.Blur()
+					m.idLabelInput.Blur()
 					m.idCursor = idx
 					if already {
 						if m.activatingID {
@@ -860,7 +1006,9 @@ func (m *model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 						return m, m.activateChoiceCmd(m.idChoices[idx], "")
 					}
 				}
-			} else if relY >= 2+listLines {
+			} else if relY >= inputRelY {
+				m.editingIDLabel = false
+				m.idLabelInput.Blur()
 				m.idInputFocus = true
 				m.idInput.Focus()
 				return m, textinput.Blink
@@ -1007,8 +1155,54 @@ func (m *model) handleModalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case modalIdentity:
+		if m.editingIDLabel {
+			switch k {
+			case "esc":
+				m.editingIDLabel = false
+				m.idLabelInput.Blur()
+				m.statusToast = ""
+				return m, nil
+			case "enter":
+				if m.idCursor < 0 || m.idCursor >= len(m.idChoices) {
+					m.editingIDLabel = false
+					m.idLabelInput.Blur()
+					return m, nil
+				}
+				trimmed := strings.TrimSpace(m.idLabelInput.Value())
+				if trimmed == "" || len([]rune(trimmed)) > 80 || strings.IndexFunc(trimmed, unicode.IsControl) >= 0 {
+					m.statusToast = "身份标签须为 1–80 个字符且不能包含控制字符"
+					m.idLabelInput.Focus()
+					return m, textinput.Blink
+				}
+				ch := &m.idChoices[m.idCursor]
+				if ch.imported && ch.profile.ID != "" {
+					if err := identity.UpdateLabel(m.opts.ExecutableDir, ch.profile.ID, trimmed); err != nil {
+						m.statusToast = err.Error()
+						m.idLabelInput.Focus()
+						return m, textinput.Blink
+					}
+					if m.activeID != "" && ch.profile.ID == m.activeID {
+						m.identityLabel = trimmed
+					}
+					m.statusToast = "已更新身份标签：" + trimmed
+				} else {
+					m.statusToast = "已暂存身份标签，激活导入后持久化：" + trimmed
+				}
+				ch.profile.Label = trimmed
+				m.editingIDLabel = false
+				m.idLabelInput.Blur()
+				return m, nil
+			}
+			var cmd tea.Cmd
+			m.idLabelInput, cmd = m.idLabelInput.Update(msg)
+			return m, cmd
+		}
 		if k == "esc" {
 			m.modal = modalNone
+			m.editingIDLabel = false
+			m.idInputFocus = false
+			m.idInput.Blur()
+			m.idLabelInput.Blur()
 			return m, nil
 		}
 		if k == "tab" {
@@ -1036,7 +1230,7 @@ func (m *model) handleModalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.opLabel = "正在导入身份"
 				m.opStart = time.Now()
 				m.statusToast = "正在校验并导入身份…"
-				return m, m.activateChoiceCmd(identityChoice{}, path)
+				return m, m.discoverOrActivatePathCmd(path)
 			}
 			var cmd tea.Cmd
 			m.idInput, cmd = m.idInput.Update(msg)
@@ -1050,6 +1244,27 @@ func (m *model) handleModalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		case "down", "j":
 			if m.idCursor < len(m.idChoices)-1 {
 				m.idCursor++
+			}
+		case "e":
+			if len(m.idChoices) > 0 && m.idCursor < len(m.idChoices) {
+				m.editingIDLabel = true
+				m.idLabelInput.SetValue(m.idChoices[m.idCursor].profile.Label)
+				m.idLabelInput.Focus()
+				m.idLabelInput.CursorEnd()
+				m.statusToast = ""
+				return m, textinput.Blink
+			}
+		case "t":
+			if len(m.idChoices) > 0 && m.idCursor < len(m.idChoices) {
+				if m.testingConn {
+					m.statusToast = "正在测试连接，请稍候…"
+					return m, nil
+				}
+				ch := m.idChoices[m.idCursor]
+				m.testingConn = true
+				m.idTestResults[ch.profile.Path] = identityTestState{testing: true}
+				m.statusToast = "正在测试 mTLS 握手与身份认证…"
+				return m, m.testIdentityConnCmd(ch)
 			}
 		case "enter":
 			if m.activatingID {

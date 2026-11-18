@@ -15,6 +15,7 @@ import (
 	"sft-tui/internal/identity"
 	"sft-tui/internal/protocol"
 	"sft-tui/internal/queue"
+	"sft-tui/internal/testcert"
 )
 
 func TestClientConflictCancelPreservesSelectionAndHistoryRetryChecksConflict(t *testing.T) {
@@ -328,5 +329,114 @@ func TestClientContextualFooterAndAsyncDoubleSubmitGuard(t *testing.T) {
 	m.focus = areaQueue
 	if cmd := m.toggleAllCmd(); cmd != nil {
 		t.Fatal("expected toggleAllCmd to block concurrent submission when opBusy=true")
+	}
+}
+
+func TestClientIdentityPreviewLabelEditConnTestAndMultiDiscovery(t *testing.T) {
+	cliCfg, _, cleanup := setupTestClientEnv(t)
+	defer cleanup()
+
+	base := t.TempDir()
+	certsDir := filepath.Join(base, "certs")
+	if err := testcert.Generate(certsDir); err != nil {
+		t.Fatal(err)
+	}
+	if err := testcert.IssueClient(certsDir, "alice"); err != nil {
+		t.Fatal(err)
+	}
+	if err := testcert.IssueClient(certsDir, "bob"); err != nil {
+		t.Fatal(err)
+	}
+
+	multiDir := filepath.Join(base, "multi")
+	if err := os.MkdirAll(multiDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	c1 := cliCfg
+	c1.TLS.Certificate = filepath.Join(filepath.Dir(cliCfg.TLS.Certificate), "alice.pem")
+	c2 := cliCfg
+	c2.StateDir = filepath.Join(base, "state-bob")
+	c2.TLS = config.TLSFiles{
+		CACertificate: filepath.Join(certsDir, "ca.pem"),
+		Certificate:   filepath.Join(certsDir, "bob.pem"),
+		PrivateKey:    filepath.Join(certsDir, "bob-key.pem"),
+	}
+	if err := config.SaveJSON(filepath.Join(multiDir, "client.alice.json"), c1); err != nil {
+		t.Fatal(err)
+	}
+	if err := config.SaveJSON(filepath.Join(multiDir, "client.bob.json"), c2); err != nil {
+		t.Fatal(err)
+	}
+
+	m := newModel(Options{ExecutableDir: base, Directory: base})
+	m.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
+	m.modal = modalIdentity
+
+	// 1. 输入包含多个 client*.json 的目录：应展开为多个可选项而非报错拒绝
+	m.idInputFocus = true
+	m.idInput.SetValue(multiDir)
+	_, discCmd := m.Update(keyType(tea.KeyEnter))
+	if discCmd == nil {
+		t.Fatal("expected discover cmd for multi-config directory")
+	}
+	m.Update(discCmd())
+	if len(m.idChoices) < 2 || m.idInputFocus {
+		t.Fatalf("expected >=2 discovered candidates and focus returned to list, len=%d inputFocus=%v toast=%q", len(m.idChoices), m.idInputFocus, m.statusToast)
+	}
+
+	// 2. 验证 80x24 下预览卡渲染不超终端高度，且显示预览信息
+	view80 := ansi.Strip(m.View())
+	if lipgloss.Height(view80) > 24 {
+		t.Fatalf("identity preview modal overflowed 80x24: height=%d\n%s", lipgloss.Height(view80), view80)
+	}
+	if !strings.Contains(view80, "预览:") || !strings.Contains(view80, "指纹:") {
+		t.Fatalf("expected identity preview details in modalIdentity:\n%s", view80)
+	}
+
+	// 3. 测试选中候选身份（指向真实存活 daemon 的 alice）按 t 测试连接
+	aliceIdx := -1
+	for i, ch := range m.idChoices {
+		if strings.Contains(ch.profile.User, "alice") {
+			aliceIdx = i
+			break
+		}
+	}
+	if aliceIdx < 0 {
+		t.Fatalf("expected alice candidate in %+v", m.idChoices)
+	}
+	m.idCursor = aliceIdx
+	_, testCmd := m.Update(keyRune('t'))
+	if testCmd == nil {
+		t.Fatal("expected testIdentityConnCmd on key t")
+	}
+	m.Update(testCmd())
+	if !strings.Contains(ansi.Strip(m.View()), "mTLS 握手通过") {
+		t.Fatalf("expected mTLS handshake success in preview card:\n%s", ansi.Strip(m.View()))
+	}
+
+	// 4. 先导入激活，再按 e 编辑标签并验证持久化
+	_, actCmd := m.Update(keyType(tea.KeyEnter))
+	if actCmd == nil {
+		t.Fatal("expected activate cmd")
+	}
+	m.Update(actCmd())
+	if m.cfg == nil {
+		t.Fatalf("expected client identity activated, toast=%q", m.statusToast)
+	}
+
+	m.Update(keyRune('i'))
+	m.Update(m.scanIdentitiesCmd()())
+	m.Update(keyRune('e'))
+	if !m.editingIDLabel {
+		t.Fatal("expected e to enter editingIDLabel mode")
+	}
+	m.idLabelInput.SetValue("研发生产主节点")
+	m.Update(keyType(tea.KeyEnter))
+	if m.editingIDLabel || m.identityLabel != "研发生产主节点" {
+		t.Fatalf("expected updated active label 研发生产主节点, editing=%v label=%q toast=%q", m.editingIDLabel, m.identityLabel, m.statusToast)
+	}
+	profs, err := identity.Profiles(base)
+	if err != nil || len(profs) == 0 || profs[0].Label != "研发生产主节点" {
+		t.Fatalf("expected updated label persisted to disk: %+v %v", profs, err)
 	}
 }

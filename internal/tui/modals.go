@@ -213,44 +213,8 @@ func (m *model) viewModal(base string) string {
 		return view
 
 	case modalIdentity:
-		lines := []string{
-			"已保存或发现的身份包（↑/↓ 或鼠标点击选择后按 Enter 激活）：",
-			"",
-		}
-		if len(m.idChoices) == 0 {
-			lines = append(lines, m.th.badgeWarn.Render("  未在当前目录及程序旁发现可用的 client*.json，请在下方输入路径导入。"))
-		} else {
-			maxShow := 8
-			if m.height > 0 {
-				maxShow = min(8, max(2, m.height-16))
-			}
-			maxShow = min(maxShow, len(m.idChoices))
-			start := scrollOffset(m.idCursor, len(m.idChoices), maxShow)
-			for i := start; i < start+maxShow; i++ {
-				ch := m.idChoices[i]
-				mark := "  "
-				style := m.th.rowNormal
-				if i == m.idCursor && !m.idInputFocus {
-					mark = "▶ "
-					style = m.th.rowCursor
-				}
-				tag := "已导入"
-				if !ch.imported {
-					tag = "待导入"
-				}
-				if ch.profile.ID != "" && m.idKey != "" && ch.profile.ID == m.activeID {
-					tag = "当前"
-				}
-				exp := ch.profile.Expires.Format("2006-01-02")
-				row := fmt.Sprintf("%s[%s] %s  (到期 %s)", mark, tag, ch.profile.Label, exp)
-				lines = append(lines, style.Render(truncCell(row, innerW)))
-			}
-		}
-		lines = append(lines, "", "从指定目录或配置文件导入新身份：")
-		lines = append(lines, m.idInput.View())
-		lines = appendModalNoticeLines(lines, m.th, m.statusToast, innerW)
-		footer := "Tab 切换列表/路径框 · Enter 切换或导入 · Esc 关闭"
-		return renderModalOverlay(base, "客户端 mTLS 身份管理", lines, footer, m)
+		title, footer, lines := m.buildIdentityModalContent()
+		return renderModalOverlay(base, title, lines, footer, m)
 
 	case modalConflict:
 		dirLabel := "下载目标本地目录已存在同名文件："
@@ -324,4 +288,145 @@ func buildTaskDetailLines(dirLabel, stateText, remote, localPath string, done, s
 		lines = append(lines, "", "错误/提示说明：", "  "+errMsg)
 	}
 	return lines
+}
+
+func (m *model) identityModalMetrics() (innerW, listStartRelY, maxShow, inputRelY int) {
+	_, innerW = modalBoxDimensions(m.width)
+	maxBody := 1 << 20
+	if m.height > 0 {
+		maxBody = max(6, m.height-8)
+	}
+	listStartRelY = 2
+	noticeLines := appendModalNoticeLines(nil, m.th, m.statusToast, innerW)
+	previewRows := 0
+	if len(m.idChoices) > 0 {
+		previewRows = 5 // 空行 + 4行详情预览
+	}
+	inputRows := 3 // 空行 + 提示 + 输入框
+	availList := maxBody - listStartRelY - previewRows - inputRows - len(noticeLines)
+	if len(m.idChoices) == 0 {
+		return innerW, listStartRelY, 0, listStartRelY + 1
+	}
+	maxShow = max(1, min(6, min(len(m.idChoices), availList)))
+	inputRelY = listStartRelY + maxShow + previewRows + 1
+	return innerW, listStartRelY, maxShow, inputRelY
+}
+
+func (m *model) buildIdentityModalContent() (title, footer string, lines []string) {
+	innerW, _, maxShow, _ := m.identityModalMetrics()
+	lines = []string{
+		truncCell("已保存或发现的身份包（↑↓ 选择 · Enter 切换 · e 改标签 · t 测连）：", innerW),
+		"",
+	}
+	if len(m.idChoices) == 0 {
+		lines = append(lines, m.th.badgeWarn.Render(truncCell("  未在当前目录及程序旁发现可用的 client*.json，请在下方输入路径导入。", innerW)))
+	} else {
+		start := scrollOffset(m.idCursor, len(m.idChoices), maxShow)
+		for i := start; i < start+maxShow; i++ {
+			ch := m.idChoices[i]
+			mark := "  "
+			style := m.th.rowNormal
+			if i == m.idCursor && !m.idInputFocus && !m.editingIDLabel {
+				mark = "▶ "
+				style = m.th.rowCursor
+			}
+			tag := "已导入"
+			if !ch.imported {
+				tag = "待导入"
+			}
+			if ch.profile.ID != "" && m.idKey != "" && ch.profile.ID == m.activeID {
+				tag = "当前"
+			}
+			testTag := ""
+			if ts, ok := m.idTestResults[ch.profile.Path]; ok {
+				switch {
+				case ts.testing:
+					testTag = " [" + spinnerChar(m.spinIdx) + "测连中]"
+				case ts.tested && ts.err == "":
+					testTag = fmt.Sprintf(" [✔%dms]", max(1, int(ts.latency.Milliseconds())))
+				case ts.tested && ts.err != "":
+					testTag = " [✕不可达]"
+				}
+			}
+			exp := ch.profile.Expires.Format("2006-01-02")
+			row := fmt.Sprintf("%s[%s] %s  (到期 %s)%s", mark, tag, ch.profile.Label, exp, testTag)
+			lines = append(lines, style.Render(truncCell(row, innerW)))
+		}
+
+		// 当前高亮身份预览卡
+		if m.idCursor >= 0 && m.idCursor < len(m.idChoices) {
+			ch := m.idChoices[m.idCursor]
+			p := ch.profile
+			lines = append(lines, "")
+			user := p.User
+			if user == "" {
+				user = "-"
+			}
+			srv := p.Config.ServerAddress
+			if srv == "" {
+				srv = "-"
+			}
+			san := p.Config.ServerName
+			if san == "" {
+				san = "-"
+			}
+			lines = append(lines, m.th.hintKey.Render(truncCell(fmt.Sprintf("预览: 用户=%s · 地址=%s · SAN=%s", user, srv, san), innerW)))
+
+			fpShort := p.Fingerprint
+			if len(fpShort) > 20 {
+				fpShort = fpShort[:12] + "…" + fpShort[len(fpShort)-6:]
+			} else if fpShort == "" {
+				fpShort = "-"
+			}
+			daysLeft := int(time.Until(p.Expires).Hours() / 24)
+			expNote := fmt.Sprintf("%s (剩%d天)", p.Expires.Format("2006-01-02"), daysLeft)
+			if p.Expires.IsZero() {
+				expNote = "-"
+			} else if daysLeft < 0 {
+				expNote = fmt.Sprintf("%s (已过期!)", p.Expires.Format("2006-01-02"))
+			}
+			expLine := truncCell(fmt.Sprintf("指纹: %s · 到期: %s", fpShort, expNote), innerW)
+			switch {
+			case !p.Expires.IsZero() && daysLeft < 0:
+				lines = append(lines, m.th.badgeErr.Render(expLine))
+			case !p.Expires.IsZero() && daysLeft <= 14:
+				lines = append(lines, m.th.badgeWarn.Render(expLine))
+			default:
+				lines = append(lines, m.th.badgeMuted.Render(expLine))
+			}
+
+			stateDir := p.Config.StateDir
+			if stateDir == "" {
+				stateDir = "-"
+			}
+			lines = append(lines, m.th.badgeMuted.Render(truncCell(fmt.Sprintf("限额: 单文件=%s · 状态目录=%s", progress.FormatBytes(p.Config.MaxFileBytes), stateDir), innerW)))
+
+			connPreview := m.th.badgeMuted.Render(truncCell("连通: 未测试（按 t 测试 mTLS 握手与认证）", innerW))
+			if ts, ok := m.idTestResults[p.Path]; ok {
+				switch {
+				case ts.testing:
+					connPreview = formatBusyBadge(m.th, m.spinIdx, "连通: 正在测试 mTLS 握手…", time.Time{})
+				case ts.tested && ts.err == "":
+					connPreview = m.th.badgeOk.Render(truncCell(fmt.Sprintf("连通: ✔ mTLS 握手通过（耗时 %s）", ts.latency.Round(time.Millisecond)), innerW))
+				case ts.tested && ts.err != "":
+					connPreview = m.th.badgeErr.Render(truncCell("连通: ✕ "+ts.err, innerW))
+				}
+			}
+			lines = append(lines, connPreview)
+		}
+	}
+
+	if m.editingIDLabel {
+		ti := m.idLabelInput
+		ti.Width = min(ti.Width, max(8, innerW-4))
+		lines = append(lines, "", truncCell("修改选中身份标签（Enter 保存 · Esc 取消）：", innerW), ti.View())
+		footer = "编辑标签：Enter 保存 · Esc 取消"
+	} else {
+		ti := m.idInput
+		ti.Width = min(ti.Width, max(8, innerW-4))
+		lines = append(lines, "", truncCell("从目录或配置文件导入（支持多配置目录扫描）：", innerW), ti.View())
+		footer = "Tab 切列表/路径 · e 改标签 · t 测连 · Enter 切换/导入 · Esc 关"
+	}
+	lines = appendModalNoticeLines(lines, m.th, m.statusToast, innerW)
+	return "客户端 mTLS 身份管理", footer, lines
 }
