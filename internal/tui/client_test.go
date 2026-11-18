@@ -440,3 +440,77 @@ func TestClientIdentityPreviewLabelEditConnTestAndMultiDiscovery(t *testing.T) {
 		t.Fatalf("expected updated label persisted to disk: %+v %v", profs, err)
 	}
 }
+
+func TestClientIdentitySwitchWarnsAndConfirmsUnfinishedTasks(t *testing.T) {
+	cliCfg, _, cleanup := setupTestClientEnv(t)
+	defer cleanup()
+
+	base := t.TempDir()
+	srcFile := filepath.Join(base, "payload.bin")
+	if err := os.WriteFile(srcFile, bytes.Repeat([]byte("z"), 512), 0600); err != nil {
+		t.Fatal(err)
+	}
+	altCfg := cliCfg
+	altCfg.StateDir = filepath.Join(base, "alt-state")
+	altPath := filepath.Join(base, "client.alt.json")
+	if err := config.SaveJSON(altPath, altCfg); err != nil {
+		t.Fatal(err)
+	}
+
+	m := newModel(Options{ExecutableDir: base, Directory: base})
+	m.Update(tea.WindowSizeMsg{Width: 90, Height: 26})
+	opened := openIdentityStack(cliCfg, "alice@main")
+	if opened.err != nil {
+		t.Fatal(opened.err)
+	}
+	m.Update(opened)
+	m.manager.SetRunner(nil) // 保持入队任务处于 Waiting/Paused，不依赖远端完成
+	defer m.cleanup()
+
+	if _, err := m.manager.Enqueue([]queue.Spec{{
+		Direction: protocol.DirectionUpload,
+		Remote:    "payload.bin",
+		Path:      srcFile,
+		Size:      512,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	awaitClientQueueSnapshot(t, m, func() bool { return len(m.activeTasks) == 1 })
+
+	// 在有 1 个未完成任务时选择切换新身份，必须先弹出未完成任务影响确认
+	prof, err := identity.PrepareImport(base, base, altPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.modal = modalIdentity
+	m.idChoices = []identityChoice{{profile: prof, imported: true}}
+	m.idCursor = 0
+	_, cmd := m.Update(keyType(tea.KeyEnter))
+	if cmd != nil || m.pendingSwitch == nil {
+		t.Fatalf("expected switch confirmation prompt when unfinished tasks exist, cmd=%v pending=%+v", cmd, m.pendingSwitch)
+	}
+	v := ansi.Strip(m.View())
+	if !strings.Contains(v, "未完成任务：共 1 个") || !strings.Contains(v, "安全暂停") {
+		t.Fatalf("expected unfinished task count and pause impact warning in modal:\n%s", v)
+	}
+
+	// Esc 取消确认后保持原有身份且任务仍在队列
+	m.Update(keyType(tea.KeyEsc))
+	if m.pendingSwitch != nil || m.modal != modalIdentity || m.identityLabel != "alice@main" {
+		t.Fatalf("expected Esc to return to list keeping original identity, pending=%v modal=%v label=%q", m.pendingSwitch, m.modal, m.identityLabel)
+	}
+
+	// 再次 Enter 并确认 'y' 后，真正执行切换
+	_, cmd = m.Update(keyType(tea.KeyEnter))
+	if m.pendingSwitch == nil || cmd != nil {
+		t.Fatalf("expected pendingSwitch before confirmation")
+	}
+	_, confirmCmd := m.Update(keyRune('y'))
+	if confirmCmd == nil {
+		t.Fatal("expected activation cmd after confirming switch")
+	}
+	m.Update(confirmCmd())
+	if m.activatingID {
+		t.Fatal("expected activatingID cleared after identityActivatedMsg")
+	}
+}

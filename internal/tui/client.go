@@ -93,6 +93,13 @@ type identityTestState struct {
 	latency time.Duration
 	err     string
 }
+type identitySwitchConfirm struct {
+	choice      identityChoice
+	customPath  string
+	targetLabel string
+	activeCount int
+	pausedCount int
+}
 type identityActivatedMsg struct {
 	cfg      config.Client
 	label    string
@@ -170,6 +177,7 @@ type model struct {
 	opStart       time.Time
 	spinIdx       int
 	idTestResults map[string]identityTestState
+	pendingSwitch *identitySwitchConfirm
 
 	// 队列快照视图（无锁）
 	activeTasks   []queue.Task
@@ -403,38 +411,93 @@ func (m *model) scanIdentitiesCmd() tea.Cmd {
 	}
 }
 
-func (m *model) discoverOrActivatePathCmd(customPath string) tea.Cmd {
-	exeDir := m.opts.ExecutableDir
-	info, statErr := os.Stat(customPath)
-	if statErr == nil && info.IsDir() {
-		return func() tea.Msg {
-			wd, _ := os.Getwd()
-			candidates, discErr := identity.Discover(exeDir, wd, customPath)
-			if discErr != nil {
-				return identityActivatedMsg{err: discErr}
-			}
-			if len(candidates) == 0 {
-				return identityActivatedMsg{err: fmt.Errorf("目录中未找到有效的客户端配置：%s", customPath)}
-			}
-			if len(candidates) > 1 {
-				var found []identityChoice
-				for _, p := range candidates {
-					if prof, e := identity.Preview(p, wd); e == nil {
-						found = append(found, identityChoice{profile: prof, imported: false})
-					}
-				}
-				if len(found) == 0 {
-					return identityActivatedMsg{err: fmt.Errorf("目录中的客户端配置均无法解析：%s", customPath)}
-				}
-				if len(found) > 1 {
-					return identityDirDiscoveredMsg{dir: customPath, choices: found}
-				}
-				return m.activateChoiceCmd(found[0], "")()
-			}
-			return m.activateChoiceCmd(identityChoice{}, customPath)()
+func (m *model) unfinishedTaskCounts() (active, paused int) {
+	if m.manager == nil {
+		return 0, 0
+	}
+	m.refreshQueueSnapshots()
+	for _, t := range m.activeTasks {
+		if t.State.Active() {
+			active++
+		} else if !t.Terminal() {
+			paused++
 		}
 	}
-	return m.activateChoiceCmd(identityChoice{}, customPath)
+	return active, paused
+}
+
+func (m *model) beginIdentitySwitch(ch identityChoice, customPath string, bypassConfirm bool) tea.Cmd {
+	if m.activatingID {
+		m.statusToast = "正在切换或导入身份，请稍候…"
+		return nil
+	}
+	targetLabel := customPath
+	if targetLabel == "" {
+		targetLabel = ch.profile.Label
+	}
+	if !bypassConfirm {
+		activeN, pausedN := m.unfinishedTaskCounts()
+		if customPath != "" {
+			if info, err := os.Stat(customPath); err == nil && info.IsDir() {
+				// 目录可能含多个配置，先扫描（多配置或存在未完成任务时不直接静默切换）
+				m.activatingID = true
+				m.opLabel = "正在扫描身份目录"
+				m.opStart = time.Now()
+				m.statusToast = "正在扫描目录中的身份配置…"
+				return m.discoverOrActivatePathCmd(customPath, activeN+pausedN > 0)
+			}
+		}
+		if activeN+pausedN > 0 {
+			m.pendingSwitch = &identitySwitchConfirm{
+				choice:      ch,
+				customPath:  customPath,
+				targetLabel: targetLabel,
+				activeCount: activeN,
+				pausedCount: pausedN,
+			}
+			m.statusToast = ""
+			return nil
+		}
+	}
+	m.pendingSwitch = nil
+	m.activatingID = true
+	if customPath != "" {
+		m.opLabel = "正在导入身份"
+		m.statusToast = "正在校验并导入身份…"
+	} else {
+		m.opLabel = "正在切换身份"
+		m.statusToast = "正在切换身份…"
+	}
+	m.opStart = time.Now()
+	return m.activateChoiceCmd(ch, customPath)
+}
+
+func (m *model) discoverOrActivatePathCmd(customPath string, confirmSingle bool) tea.Cmd {
+	exeDir := m.opts.ExecutableDir
+	actCustom := m.activateChoiceCmd(identityChoice{}, customPath)
+	return func() tea.Msg {
+		wd, _ := os.Getwd()
+		candidates, discErr := identity.Discover(exeDir, wd, customPath)
+		if discErr != nil {
+			return identityActivatedMsg{err: discErr}
+		}
+		if len(candidates) == 0 {
+			return identityActivatedMsg{err: fmt.Errorf("目录中未找到有效的客户端配置：%s", customPath)}
+		}
+		if len(candidates) > 1 || confirmSingle {
+			var found []identityChoice
+			for _, p := range candidates {
+				if prof, e := identity.Preview(p, wd); e == nil {
+					found = append(found, identityChoice{profile: prof, imported: false})
+				}
+			}
+			if len(found) == 0 {
+				return identityActivatedMsg{err: fmt.Errorf("目录中的客户端配置均无法解析：%s", customPath)}
+			}
+			return identityDirDiscoveredMsg{dir: customPath, choices: found}
+		}
+		return actCustom()
+	}
 }
 
 func (m *model) testIdentityConnCmd(ch identityChoice) tea.Cmd {
@@ -651,10 +714,8 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case identityDirDiscoveredMsg:
 		m.activatingID = false
-		if m.opLabel == "正在导入身份" || m.opLabel == "正在切换身份" {
-			m.opLabel = ""
-			m.opStart = time.Time{}
-		}
+		m.opLabel = ""
+		m.opStart = time.Time{}
 		byPath := make(map[string]int, len(m.idChoices))
 		for i, ch := range m.idChoices {
 			byPath[ch.profile.Path] = i
@@ -901,9 +962,12 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, tea.Batch(m.loadLocalCmd(m.localDir), m.loadRemoteCmd())
 	case "i", "f4":
 		m.modal = modalIdentity
+		m.pendingSwitch = nil
+		m.editingIDLabel = false
 		m.statusToast = ""
 		m.idInputFocus = false
 		m.idInput.Blur()
+		m.idLabelInput.Blur()
 		return m, m.scanIdentitiesCmd()
 	case "a":
 		if m.focus == areaQueue && !m.historyView {
@@ -995,15 +1059,7 @@ func (m *model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 					m.idLabelInput.Blur()
 					m.idCursor = idx
 					if already {
-						if m.activatingID {
-							m.statusToast = "正在切换或导入身份，请稍候…"
-							return m, nil
-						}
-						m.activatingID = true
-						m.opLabel = "正在切换身份"
-						m.opStart = time.Now()
-						m.statusToast = "正在切换身份…"
-						return m, m.activateChoiceCmd(m.idChoices[idx], "")
+						return m, m.beginIdentitySwitch(m.idChoices[idx], "", false)
 					}
 				}
 			} else if relY >= inputRelY {
@@ -1155,6 +1211,19 @@ func (m *model) handleModalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case modalIdentity:
+		if m.pendingSwitch != nil {
+			switch k {
+			case "esc", "n":
+				m.pendingSwitch = nil
+				m.statusToast = ""
+				return m, nil
+			case "enter", "y":
+				ps := m.pendingSwitch
+				m.pendingSwitch = nil
+				return m, m.beginIdentitySwitch(ps.choice, ps.customPath, true)
+			}
+			return m, nil
+		}
 		if m.editingIDLabel {
 			switch k {
 			case "esc":
@@ -1199,6 +1268,7 @@ func (m *model) handleModalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		if k == "esc" {
 			m.modal = modalNone
+			m.pendingSwitch = nil
 			m.editingIDLabel = false
 			m.idInputFocus = false
 			m.idInput.Blur()
@@ -1216,21 +1286,13 @@ func (m *model) handleModalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		if m.idInputFocus {
 			if k == "enter" {
-				if m.activatingID {
-					m.statusToast = "正在校验或切换身份，请稍候…"
-					return m, nil
-				}
 				path := strings.TrimSpace(m.idInput.Value())
 				if path == "" {
 					m.statusToast = "请输入要导入的配置文件或目录路径"
 					return m, nil
 				}
 				m.idInput.SetValue("")
-				m.activatingID = true
-				m.opLabel = "正在导入身份"
-				m.opStart = time.Now()
-				m.statusToast = "正在校验并导入身份…"
-				return m, m.discoverOrActivatePathCmd(path)
+				return m, m.beginIdentitySwitch(identityChoice{}, path, false)
 			}
 			var cmd tea.Cmd
 			m.idInput, cmd = m.idInput.Update(msg)
@@ -1267,16 +1329,8 @@ func (m *model) handleModalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				return m, m.testIdentityConnCmd(ch)
 			}
 		case "enter":
-			if m.activatingID {
-				m.statusToast = "正在切换身份，请稍候…"
-				return m, nil
-			}
 			if len(m.idChoices) > 0 && m.idCursor < len(m.idChoices) {
-				m.activatingID = true
-				m.opLabel = "正在切换身份"
-				m.opStart = time.Now()
-				m.statusToast = "正在切换身份…"
-				return m, m.activateChoiceCmd(m.idChoices[m.idCursor], "")
+				return m, m.beginIdentitySwitch(m.idChoices[m.idCursor], "", false)
 			}
 		}
 		return m, nil

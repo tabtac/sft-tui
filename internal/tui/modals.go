@@ -314,6 +314,21 @@ func (m *model) identityModalMetrics() (innerW, listStartRelY, maxShow, inputRel
 
 func (m *model) buildIdentityModalContent() (title, footer string, lines []string) {
 	innerW, _, maxShow, _ := m.identityModalMetrics()
+	if m.pendingSwitch != nil {
+		ps := m.pendingSwitch
+		total := ps.activeCount + ps.pausedCount
+		lines = []string{
+			m.th.badgeWarn.Render(truncCell("⚠ 当前身份队列仍有未完成任务，确认切换？", innerW)),
+			"",
+			truncCell("  • 目标身份："+ps.targetLabel, innerW),
+			truncCell(fmt.Sprintf("  • 未完成任务：共 %d 个（进行中 %d · 已暂停/待处理 %d）", total, ps.activeCount, ps.pausedCount), innerW),
+			"",
+			m.th.badgeMuted.Render(truncCell("  切换影响：进行中任务将被安全暂停，断点保留在当前身份 SQLite；", innerW)),
+			m.th.badgeMuted.Render(truncCell("  切回当前身份后可按 [a] 或 [F5] 从断点处继续传输。", innerW)),
+		}
+		lines = appendModalNoticeLines(lines, m.th, m.statusToast, innerW)
+		return "身份切换前影响确认", "Enter / y 确认暂停并切换 · Esc 返回重选", lines
+	}
 	lines = []string{
 		truncCell("已保存或发现的身份包（↑↓ 选择 · Enter 切换 · e 改标签 · t 测连）：", innerW),
 		"",
