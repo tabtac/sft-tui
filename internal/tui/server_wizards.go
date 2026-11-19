@@ -647,10 +647,10 @@ func (m *serverModel) rebuildBasicSettingsForm() {
 	m.clearToast()
 	m.modal = srvModalEditSettings
 	m.addNoteRow([]string{
-		"说明：除全局总带宽可通过 [A] 热加载外，其余设置修改保存后需重启 sftd 生效。",
+		"提示：在此修改基础网络、存储、带宽与日志单文件上限；保存后将告知生效方式。",
 	}, false)
-	listenIdx := m.addKeyedTextRow("listen", "监听地址 (listen)", c.Listen)
-	storageIdx := m.addKeyedTextRow("storage_root", "存储根目录 (storage_root)", c.StorageRoot)
+	listenIdx := m.addKeyedTextRow("listen", "监听地址", c.Listen)
+	storageIdx := m.addKeyedTextRow("storage_root", "存储根目录", c.StorageRoot)
 	upIdx := m.addKeyedSizeUnitRow("bandwidth.upload_bytes_per_second", "默认上传带宽", c.Bandwidth.UploadBytesPerSecond, true)
 	dnIdx := m.addKeyedSizeUnitRow("bandwidth.download_bytes_per_second", "默认下载带宽", c.Bandwidth.DownloadBytesPerSecond, true)
 	burIdx := m.addKeyedSizeUnitRow("bandwidth.burst_bytes", "默认突发配额", c.Bandwidth.BurstBytes, false)
@@ -742,7 +742,7 @@ func (m *serverModel) rebuildBasicSettingsForm() {
 		return -1, nil
 	}
 
-	m.addToggleRow("启用全局总带宽限速 (global_bandwidth)", useGlobal, func(v bool) {
+	m.addToggleRow("启用全局总带宽限速", useGlobal, func(v bool) {
 		_, _ = captureBasic(false)
 		if v {
 			copyGB := gb
@@ -846,43 +846,6 @@ func (m *serverModel) openAdvancedSettingsModal() {
 				return m, m.focusInputRow(badIdx)
 			}
 			return m.saveServerSettingsCmd(*c)
-		}},
-	}
-	m.finalizeFormFocus(true)
-}
-
-func (m *serverModel) openLogLimitModal() {
-	if m.cfgErr != nil {
-		m.setToast("请先加载有效配置")
-		return
-	}
-	m.resetForm()
-	m.clearToast()
-	m.modal = srvModalEditLogLimit
-	m.addNoteRow([]string{
-		"日志单文件大小上限 (64 KiB–1 GiB)；写满后自动清空旧内容重用当前文件，保存后需重启生效。",
-	}, false)
-	logIdx := m.addSizeUnitRow("日志文件大小上限", m.cfg.Logging.MaxFileBytes, false)
-	m.formButtons = []formButton{
-		{label: "取消", onClick: func() (tea.Model, tea.Cmd) {
-			m.modal = srvModalNone
-			m.clearToast()
-			return m, nil
-		}},
-		{label: "保存上限 ★", primary: true, onClick: func() (tea.Model, tea.Cmd) {
-			v, err := m.parseSizeInput(logIdx, "日志文件大小上限")
-			if err != nil {
-				m.setToastSticky(err.Error())
-				return m, m.focusInputRow(logIdx)
-			}
-			next := m.cfg
-			next.Logging.MaxFileBytes = v
-			if err := next.ValidateDraft(); err != nil {
-				m.setToastSticky(err.Error())
-				return m, m.focusInputRow(logIdx)
-			}
-			m.settingsExpected = m.cfg
-			return m.saveServerSettingsCmd(next)
 		}},
 	}
 	m.finalizeFormFocus(true)

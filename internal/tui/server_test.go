@@ -873,14 +873,33 @@ func TestServerSettingsPerFieldRuntimeDiffAndReloadLabels(t *testing.T) {
 	cfg.Listen = "127.0.0.1:8443"
 	rt := cfg
 
-	cfg.GlobalBandwidth = &config.Bandwidth{UploadBytesPerSecond: 2_000_000, DownloadBytesPerSecond: 3_000_000, BurstBytes: 256_000}
-	cfg.Limits.MaxStreams = 16
-
 	m := newServerModel(ServerOptions{ExecutableDir: t.TempDir(), ConfigPath: "configs/server.local.json", Page: 4})
 	m.loaded = true
 	m.cfg = cfg
 	m.runtime = &monitor.Snapshot{State: "running", Listen: rt.Listen, Started: time.Now(), Config: rt}
 	m.Update(tea.WindowSizeMsg{Width: 132, Height: 34})
+
+	// 1. 未修改时界面清爽：不展示多余的 [需重启]/[可热更] 或英文键名括号备注，也不显示独立 [L] 日志上限快捷键
+	cleanView := ansi.Strip(m.View())
+	for _, unwanted := range []string{"[需重启]", "[可热更]", "(resources)", "(limits", "(timeouts)", "(listen)", "(storage_root)", "[L]"} {
+		if strings.Contains(cleanView, unwanted) {
+			t.Fatalf("settings page still contains cluttered token %q:\n%s", unwanted, cleanView)
+		}
+	}
+	// 日志上限修改已整合进基础设置 [m] 中，单独按 L 不得打开旧弹窗
+	m.Update(keyRune('L'))
+	if m.modal != srvModalNone {
+		t.Fatalf("expected L key to no longer open standalone log limit modal, got %v", m.modal)
+	}
+	m.Update(keyRune('m'))
+	if _, ok := m.inputByKey("logging.max_file_bytes"); !ok || m.modal != srvModalEditSettings {
+		t.Fatalf("expected logging.max_file_bytes inside basic settings modal, modal=%v", m.modal)
+	}
+	m.Update(keyType(tea.KeyEsc))
+
+	// 2. 当字段相对运行实例发生变更时，再针对变更项提示 [待热更] 或 [待重启]
+	m.cfg.GlobalBandwidth = &config.Bandwidth{UploadBytesPerSecond: 2_000_000, DownloadBytesPerSecond: 3_000_000, BurstBytes: 256_000}
+	m.cfg.Limits.MaxStreams = 16
 
 	view := ansi.Strip(m.View())
 	if !strings.Contains(view, "[待热更]") || !strings.Contains(view, "全局总带宽上限") || !strings.Contains(view, "运行: 未启用") {

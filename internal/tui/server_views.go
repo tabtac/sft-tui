@@ -280,7 +280,6 @@ func (m *serverModel) renderFooter() string {
 		return renderActionFooter(m.th, m.width, "设置:", []footerChip{
 			{key: "m", label: "基础", reason: cfgReason, essential: true},
 			{key: "a", label: "高级", reason: cfgReason, essential: true},
-			{key: "L", label: "日志限", reason: cfgReason, essential: true},
 			{key: "A", label: "热加载", reason: hotReason, essential: true},
 			{key: "Tab", label: "切页"},
 			{key: "?", label: "帮助"},
@@ -309,7 +308,6 @@ func (m *serverModel) renderFooter() string {
 			{key: "T", label: "时间(" + logSinceLabel(m.logSinceIdx) + ")", essential: true},
 			{key: "/", label: "文本", essential: true},
 			{key: "C", label: "清空", reason: clearReason},
-			{key: "L", label: "上限", reason: cfgReason},
 			{key: "Enter", label: "详情", reason: detailReason},
 			{key: "?", label: "帮助"},
 		})
@@ -837,21 +835,15 @@ func (m *serverModel) settingsFieldLine(label, saved, runtime string, hasRuntime
 	label = sanitizeInline(label)
 	saved = sanitizeInline(saved)
 	runtime = sanitizeInline(runtime)
-	mode := m.th.badgeMuted.Render("[需重启]")
-	if hotReloadable {
-		mode = m.th.badgeID.Render("[可热更]")
-	}
 	diffSuffix := ""
 	if hasRuntime && differ {
 		if hotReloadable {
-			mode = m.th.badgeWarn.Render("[待热更]")
-			diffSuffix = "  " + m.th.badgeWarn.Render("≠ 运行: "+runtime+" [按A热加载]")
+			diffSuffix = "  " + m.th.badgeWarn.Render("[待热更] 按A热加载 · 运行: "+runtime)
 		} else {
-			mode = m.th.badgeErr.Render("[待重启]")
-			diffSuffix = "  " + m.th.badgeErr.Render("≠ 运行: "+runtime+" [需重启生效]")
+			diffSuffix = "  " + m.th.badgeErr.Render("[待重启] 需重启生效 · 运行: "+runtime)
 		}
 	}
-	return fmt.Sprintf("  %s %-26s %s%s", mode, label, saved, diffSuffix)
+	return fmt.Sprintf("  %s %s%s", padPlainRightCell(label, 20), saved, diffSuffix)
 }
 
 func (m *serverModel) settingsLines() []string {
@@ -861,13 +853,13 @@ func (m *serverModel) settingsLines() []string {
 	if hasRt {
 		rt = m.runtime.Config
 	}
-	diffTag := m.th.badgeMuted.Render("（服务离线，修改配置启动后生效）")
+	diffTag := m.th.badgeMuted.Render("服务当前离线（按 [m]/[a] 修改配置，启动服务后生效）")
 	if hasRt {
 		switch {
 		case config.RestartRequired(rt, c):
-			diffTag = m.th.badgeWarn.Render("⚠ 磁盘配置与运行实例存在非热更差异（需重启生效）")
+			diffTag = m.th.badgeWarn.Render("⚠ 存在待重启生效的变更（请择机重启服务）")
 		case !config.HotEqual(rt, c):
-			diffTag = m.th.badgeWarn.Render("⚠ 磁盘配置与运行实例存在未热加载的差异（按 [A] 应用热加载）")
+			diffTag = m.th.badgeWarn.Render("⚠ 存在待热加载的变更（按 [A] 立即热加载）")
 		default:
 			diffTag = m.th.badgeOk.Render("✔ 磁盘配置与运行实例一致")
 		}
@@ -885,52 +877,52 @@ func (m *serverModel) settingsLines() []string {
 	return []string{
 		diffTag,
 		"",
-		m.th.hintKey.Render("【基础网络、存储与日志】  按 [m] 编辑基础/带宽/配额 · [a] 编辑全部高级参数 · [L] 调整日志上限 · [A] 热重载"),
-		m.settingsFieldLine("监听地址 (listen)：", c.Listen, rt.Listen, hasRt, false, c.Listen != rt.Listen),
-		m.settingsFieldLine("存储目录 (storage_root)：", c.StorageRoot, rt.StorageRoot, hasRt, false, c.StorageRoot != rt.StorageRoot),
-		m.settingsFieldLine("日志上限 (logging)：", progress.FormatBytes(c.Logging.MaxFileBytes)+"（达上限清空重写）", progress.FormatBytes(rt.Logging.MaxFileBytes), hasRt, false, c.Logging.MaxFileBytes != rt.Logging.MaxFileBytes),
-		m.settingsFieldLine("TLS 证书链 (tls)：", formatTLSSummary(c.TLS), formatTLSSummary(rt.TLS), hasRt, true, !tlsEqual),
-		m.settingsFieldLine("授权用户/ACL (clients)：", fmt.Sprintf("%d 个用户", len(c.AuthorizedClients)), fmt.Sprintf("%d 个用户", len(rt.AuthorizedClients)), hasRt, true, !clientsEqual),
+		m.th.hintKey.Render("【基础网络、存储与日志】"),
+		m.settingsFieldLine("监听地址", c.Listen, rt.Listen, hasRt, false, c.Listen != rt.Listen),
+		m.settingsFieldLine("存储目录", c.StorageRoot, rt.StorageRoot, hasRt, false, c.StorageRoot != rt.StorageRoot),
+		m.settingsFieldLine("日志单文件上限", progress.FormatBytes(c.Logging.MaxFileBytes), progress.FormatBytes(rt.Logging.MaxFileBytes), hasRt, false, c.Logging.MaxFileBytes != rt.Logging.MaxFileBytes),
+		m.settingsFieldLine("TLS 证书链", formatTLSSummary(c.TLS), formatTLSSummary(rt.TLS), hasRt, true, !tlsEqual),
+		m.settingsFieldLine("授权用户数", fmt.Sprintf("%d 个", len(c.AuthorizedClients)), fmt.Sprintf("%d 个", len(rt.AuthorizedClients)), hasRt, true, !clientsEqual),
 		"",
 		m.th.hintKey.Render("【带宽限速策略】"),
-		m.settingsFieldLine("默认单用户带宽：", formatBandwidthSummary(c.Bandwidth), formatBandwidthSummary(rt.Bandwidth), hasRt, false, c.Bandwidth != rt.Bandwidth),
-		m.settingsFieldLine("全局总带宽上限：", formatGlobalBandwidthSummary(c.GlobalBandwidth), formatGlobalBandwidthSummary(rt.GlobalBandwidth), hasRt, true, !reflect.DeepEqual(c.GlobalBandwidth, rt.GlobalBandwidth)),
+		m.settingsFieldLine("默认单用户带宽", formatBandwidthSummary(c.Bandwidth), formatBandwidthSummary(rt.Bandwidth), hasRt, false, c.Bandwidth != rt.Bandwidth),
+		m.settingsFieldLine("全局总带宽上限", formatGlobalBandwidthSummary(c.GlobalBandwidth), formatGlobalBandwidthSummary(rt.GlobalBandwidth), hasRt, true, !reflect.DeepEqual(c.GlobalBandwidth, rt.GlobalBandwidth)),
 		"",
-		m.th.hintKey.Render("【容量、并发与频率限制 (resources)】"),
-		m.settingsFieldLine("单文件/用户存储配额：",
+		m.th.hintKey.Render("【容量、并发与频率限制】"),
+		m.settingsFieldLine("单文件 / 用户配额",
 			fmt.Sprintf("%s / %s", progress.FormatBytes(c.Resources.MaxFileBytes), progress.FormatBytes(c.Resources.UserStorageBytes)),
 			fmt.Sprintf("%s / %s", progress.FormatBytes(rt.Resources.MaxFileBytes), progress.FormatBytes(rt.Resources.UserStorageBytes)),
 			hasRt, false, c.Resources.MaxFileBytes != rt.Resources.MaxFileBytes || c.Resources.UserStorageBytes != rt.Resources.UserStorageBytes),
-		m.settingsFieldLine("全局连接/并发握手上限：",
+		m.settingsFieldLine("全局连接 / 握手上限",
 			fmt.Sprintf("%d / %d", c.Resources.MaxConnections, c.Resources.MaxHandshakes),
 			fmt.Sprintf("%d / %d", rt.Resources.MaxConnections, rt.Resources.MaxHandshakes),
 			hasRt, false, c.Resources.MaxConnections != rt.Resources.MaxConnections || c.Resources.MaxHandshakes != rt.Resources.MaxHandshakes),
-		m.settingsFieldLine("每IP未认证/每用户连接：",
+		m.settingsFieldLine("每IP未认证 / 每用户",
 			fmt.Sprintf("%d / %d", c.Resources.MaxUnauthenticatedPerIP, c.Resources.MaxConnectionsPerUser),
 			fmt.Sprintf("%d / %d", rt.Resources.MaxUnauthenticatedPerIP, rt.Resources.MaxConnectionsPerUser),
 			hasRt, false, c.Resources.MaxUnauthenticatedPerIP != rt.Resources.MaxUnauthenticatedPerIP || c.Resources.MaxConnectionsPerUser != rt.Resources.MaxConnectionsPerUser),
-		m.settingsFieldLine("每用户最大流/待处理：",
+		m.settingsFieldLine("每用户流 / 待处理",
 			fmt.Sprintf("%d / %d", c.Resources.MaxStreamsPerUser, c.Resources.MaxPendingTransfersPerUser),
 			fmt.Sprintf("%d / %d", rt.Resources.MaxStreamsPerUser, rt.Resources.MaxPendingTransfersPerUser),
 			hasRt, false, c.Resources.MaxStreamsPerUser != rt.Resources.MaxStreamsPerUser || c.Resources.MaxPendingTransfersPerUser != rt.Resources.MaxPendingTransfersPerUser),
-		m.settingsFieldLine("每用户最大文件数：",
+		m.settingsFieldLine("每用户最大文件数",
 			fmt.Sprintf("%d 个", c.Resources.MaxFilesPerUser), fmt.Sprintf("%d 个", rt.Resources.MaxFilesPerUser),
 			hasRt, false, c.Resources.MaxFilesPerUser != rt.Resources.MaxFilesPerUser),
-		m.settingsFieldLine("新建任务/检查点频率：",
+		m.settingsFieldLine("新建任务 / 检查点",
 			fmt.Sprintf("%d/分 · %d/秒", c.Resources.MaxNewTasksPerMinute, c.Resources.MaxUploadCheckpointsPerSecond),
 			fmt.Sprintf("%d/分 · %d/秒", rt.Resources.MaxNewTasksPerMinute, rt.Resources.MaxUploadCheckpointsPerSecond),
 			hasRt, false, c.Resources.MaxNewTasksPerMinute != rt.Resources.MaxNewTasksPerMinute || c.Resources.MaxUploadCheckpointsPerSecond != rt.Resources.MaxUploadCheckpointsPerSecond),
-		m.settingsFieldLine("断点检查点保留时长：",
+		m.settingsFieldLine("检查点保留时长",
 			fmt.Sprintf("%s (%d秒)", time.Duration(c.Resources.TransferRetentionSeconds)*time.Second, c.Resources.TransferRetentionSeconds),
 			fmt.Sprintf("%s (%d秒)", time.Duration(rt.Resources.TransferRetentionSeconds)*time.Second, rt.Resources.TransferRetentionSeconds),
 			hasRt, false, c.Resources.TransferRetentionSeconds != rt.Resources.TransferRetentionSeconds),
 		"",
-		m.th.hintKey.Render("【协议流控与超时 (limits / timeouts)】"),
-		m.settingsFieldLine("流控参数 (limits)：",
+		m.th.hintKey.Render("【协议流控与超时】"),
+		m.settingsFieldLine("流控参数",
 			fmt.Sprintf("流=%d · 分块=%s · 窗口=%s", c.Limits.MaxStreams, progress.FormatBytes(uint64(c.Limits.ChunkSize)), progress.FormatBytes(uint64(c.Limits.WindowSize))),
 			fmt.Sprintf("流=%d · 分块=%s · 窗口=%s", rt.Limits.MaxStreams, progress.FormatBytes(uint64(rt.Limits.ChunkSize)), progress.FormatBytes(uint64(rt.Limits.WindowSize))),
 			hasRt, false, c.Limits != rt.Limits),
-		m.settingsFieldLine("超时秒数 (timeouts)：",
+		m.settingsFieldLine("超时秒数",
 			fmt.Sprintf("握手=%d · HELLO=%d · 读=%d · 写=%d · 空闲=%ds", c.Timeouts.HandshakeSeconds, c.Timeouts.HelloSeconds, c.Timeouts.FrameReadSeconds, c.Timeouts.WriteSeconds, c.Timeouts.IdleSeconds),
 			fmt.Sprintf("握手=%d · HELLO=%d · 读=%d · 写=%d · 空闲=%ds", rt.Timeouts.HandshakeSeconds, rt.Timeouts.HelloSeconds, rt.Timeouts.FrameReadSeconds, rt.Timeouts.WriteSeconds, rt.Timeouts.IdleSeconds),
 			hasRt, false, c.Timeouts != rt.Timeouts),
@@ -951,13 +943,13 @@ func (m *serverModel) renderSettingsPage(bodyH int) string {
 		for i := start; i < end; i++ {
 			ln := all[i]
 			if i == m.cursors[4] {
-				lines = append(lines, m.th.rowCursor.Render(truncCell("▸ "+ln, innerW)))
+				lines = append(lines, m.th.rowCursor.Render(padRightCell("▸ "+ln, innerW)))
 			} else {
-				lines = append(lines, truncCell(ln, innerW))
+				lines = append(lines, truncCell("  "+ln, innerW))
 			}
 		}
 	}
-	return renderPanelBox(m.th, m.th.hintKey.Render("服务端安全参数与全部配置项（↑↓/滚轮浏览 · [m]基础 [a]高级 [L]日志）"), lines, true, m.width, bodyH)
+	return renderPanelBox(m.th, m.th.hintKey.Render("服务端配置与运行参数"), lines, true, m.width, bodyH)
 }
 
 func (m *serverModel) renderLogsPage(bodyH int) string {
@@ -1057,8 +1049,6 @@ func (m *serverModel) modalTitle() string {
 		return "修改服务端基础、带宽与存储设置"
 	case srvModalEditAdvancedSettings:
 		return "修改高级协议流控、超时与资源限额"
-	case srvModalEditLogLimit:
-		return "修改服务日志单文件大小上限"
 	case srvModalDeployWizard:
 		if m.deploy != nil {
 			switch m.deploy.step {

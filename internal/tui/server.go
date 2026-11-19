@@ -44,7 +44,6 @@ const (
 	srvModalCSR
 	srvModalEditSettings
 	srvModalEditAdvancedSettings
-	srvModalEditLogLimit
 	srvModalRotateServer
 	srvModalDeployWizard
 )
@@ -899,11 +898,6 @@ func (m *serverModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.openAdvancedSettingsModal()
 				return m, textinput.Blink
 			}
-		case "L":
-			if m.cfgErr == nil {
-				m.openLogLimitModal()
-				return m, textinput.Blink
-			}
 		case "A":
 			return m, m.reloadServiceCmd()
 		}
@@ -913,11 +907,6 @@ func (m *serverModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.logPaused = !m.logPaused
 			if !m.logPaused {
 				return m, m.pollRuntimeCmd()
-			}
-		case "L":
-			if m.cfgErr == nil {
-				m.openLogLimitModal()
-				return m, textinput.Blink
 			}
 		case "l":
 			order := []string{"", "INFO", "WARN", "ERROR"}
