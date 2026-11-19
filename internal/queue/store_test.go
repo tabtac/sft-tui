@@ -176,3 +176,28 @@ func TestQueueStoreRejectNewerVersion(t *testing.T) {
 		t.Fatal("expected OpenStore to reject database with higher user_version")
 	}
 }
+
+func TestQueueStorePathsWithSpacesUnicodeAndURICharacters(t *testing.T) {
+	for _, name := range []string{"with spaces", "中文状态", "percent%20literal", "hash#literal"} {
+		t.Run(name, func(t *testing.T) {
+			dir := filepath.Join(t.TempDir(), name)
+			s, err := OpenStore(dir, "id-1")
+			if err != nil {
+				t.Fatalf("OpenStore(%q) failed: %v", dir, err)
+			}
+			defer s.Close()
+			if err := s.Write([]Task{{
+				ID:        "t1",
+				Identity:  "id-1",
+				Direction: protocol.DirectionUpload,
+				Remote:    "a.bin",
+				Path:      filepath.Join(dir, "a.bin"),
+				State:     Waiting,
+				Created:   time.Now(),
+				Updated:   time.Now(),
+			}}, false); err != nil {
+				t.Fatalf("Write(%q) failed: %v", dir, err)
+			}
+		})
+	}
+}

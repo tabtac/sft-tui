@@ -1,0 +1,84 @@
+package pal
+
+import (
+	"fmt"
+	"net/url"
+	"os"
+	"path/filepath"
+	"strings"
+)
+
+// SQLiteDSN constructs a cross-platform SQLite file: URI for modernc.org/sqlite.
+// On Windows it converts drive-letter and UNC paths so drive letters are never
+// misparsed as a URI authority (e.g. file:///C:/... instead of file://C:/...).
+func SQLiteDSN(dbPath, query string) (string, error) {
+	return sqliteDSNWithSep(dbPath, query, os.PathSeparator, filepath.Abs)
+}
+
+func sqliteDSNWithSep(dbPath, query string, sep rune, absFn func(string) (string, error)) (string, error) {
+	if strings.TrimSpace(dbPath) == "" {
+		return "", fmt.Errorf("sqlite database path required")
+	}
+	if strings.ContainsRune(dbPath, 0) {
+		return "", fmt.Errorf("sqlite database path contains null byte")
+	}
+
+	// Preserve Windows Win32 extended-length prefix (\\?\...) expected by SQLite winFullPathname.
+	if hasWindowsLongPathPrefix(dbPath) {
+		u := url.URL{
+			Scheme:   "file",
+			Path:     "/" + dbPath,
+			RawQuery: query,
+		}
+		return u.String(), nil
+	}
+
+	normalized := dbPath
+	if sep == '\\' {
+		normalized = strings.ReplaceAll(dbPath, `\`, "/")
+	}
+
+	var uriPath string
+	switch {
+	case hasWindowsDrivePrefix(normalized):
+		if len(normalized) < 3 || normalized[2] != '/' {
+			return "", fmt.Errorf("sqlite drive path %q must be absolute", dbPath)
+		}
+		uriPath = "/" + normalized
+	case strings.HasPrefix(normalized, "///"):
+		uriPath = "/" + strings.TrimLeft(normalized, "/")
+	case strings.HasPrefix(normalized, "//"):
+		// Emit file:////server/share/... so SQLite sees an empty authority and UNC path //server/share/...
+		uriPath = normalized
+	case strings.HasPrefix(normalized, "/"):
+		uriPath = normalized
+	default:
+		if absFn == nil {
+			return "", fmt.Errorf("sqlite path %q must be absolute", dbPath)
+		}
+		absPath, err := absFn(dbPath)
+		if err != nil {
+			return "", fmt.Errorf("resolve sqlite database path %q: %w", dbPath, err)
+		}
+		return sqliteDSNWithSep(absPath, query, sep, nil)
+	}
+
+	u := url.URL{
+		Scheme:   "file",
+		Path:     uriPath,
+		RawQuery: query,
+	}
+	return u.String(), nil
+}
+
+func hasWindowsDrivePrefix(p string) bool {
+	if len(p) < 2 || p[1] != ':' {
+		return false
+	}
+	c := p[0]
+	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+}
+
+func hasWindowsLongPathPrefix(p string) bool {
+	return strings.HasPrefix(p, `\\?\`)
+}

@@ -3,11 +3,11 @@ package storage
 import (
 	"database/sql"
 	"fmt"
-	"net/url"
-	"path/filepath"
 	"strings"
 
 	_ "modernc.org/sqlite"
+
+	"sft-tui/internal/pal"
 )
 
 // schemaSQL 定义元数据持久化表结构与 SQLite 关键 PRAGMA 参数。
@@ -56,12 +56,11 @@ CREATE INDEX IF NOT EXISTS idx_published_user_file ON published_files(user_id, f
 
 // initDB 打开 SQLite 数据库，应用 Schema 并严格读取校验 PRAGMA 参数是否生效。
 func initDB(dbPath string) (*sql.DB, error) {
-	uri := url.URL{
-		Scheme:   "file",
-		Path:     filepath.ToSlash(dbPath),
-		RawQuery: "_pragma=journal_mode(WAL)&_pragma=synchronous(FULL)&_pragma=busy_timeout(5000)&_pragma=foreign_keys(ON)",
+	dsn, err := pal.SQLiteDSN(dbPath, "_pragma=journal_mode(WAL)&_pragma=synchronous(FULL)&_pragma=busy_timeout(5000)&_pragma=foreign_keys(ON)")
+	if err != nil {
+		return nil, fmt.Errorf("failed to build sqlite dsn: %w", err)
 	}
-	db, err := sql.Open("sqlite", uri.String())
+	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open sqlite database: %w", err)
 	}

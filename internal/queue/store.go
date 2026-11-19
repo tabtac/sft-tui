@@ -4,7 +4,6 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
-	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -54,12 +53,11 @@ func OpenStore(dir, identity string) (*Store, error) {
 		}
 	}
 
-	uri := url.URL{
-		Scheme:   "file",
-		Path:     filepath.ToSlash(dbPath),
-		RawQuery: "_pragma=journal_mode(WAL)&_pragma=synchronous(FULL)&_pragma=busy_timeout(3000)&_pragma=foreign_keys(ON)",
+	dsn, err := pal.SQLiteDSN(dbPath, "_pragma=journal_mode(WAL)&_pragma=synchronous(FULL)&_pragma=busy_timeout(3000)&_pragma=foreign_keys(ON)")
+	if err != nil {
+		return nil, err
 	}
-	db, err := sql.Open("sqlite", uri.String())
+	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, err
 	}
