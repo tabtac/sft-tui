@@ -162,30 +162,36 @@ func renderModalOverlay(_ string, title string, lines []string, footer string, m
 	return renderModalBox(m.width, m.height, m.th, title, lines, footer)
 }
 
+func helpKeyRow(th theme, indent, keys, desc string, keyColW int) string {
+	return indent + th.hintKey.Render(padPlainRightCell(keys, keyColW)) + " " + th.rowNormal.Render(desc)
+}
+
 func (m *model) infoModalData() (title string, lines []string, footer string) {
 	switch m.modal {
 	case modalHelp:
+		const kW = 17
 		return "键盘快捷键说明", []string{
 			m.th.hintKey.Render("全局导航"),
-			"  Tab / Shift+Tab  在 本地 → 远端 → 活动队列 → 历史归档 间切换",
-			"  1 / 2 / 3 / 4    直接跳转 本地 / 远端 / 活动队列 / 历史归档",
-			"  v / h            在 活动队列 与 历史归档 之间切换视图",
-			"  q / ?            优雅退出 / 开关本帮助",
+			helpKeyRow(m.th, "  ", "[Tab] / [1-4]", "在 本地/远端/活动队列/历史归档 间切换", kW),
+			helpKeyRow(m.th, "  ", "[v] / [h]", "在 活动队列 与 历史归档 视图间切换", kW),
+			helpKeyRow(m.th, "  ", "[i] / [F4]", "打开客户端 mTLS 身份管理与连接测试", kW),
+			helpKeyRow(m.th, "  ", "[?] / [q]", "开关本帮助 / 安全退出客户端", kW),
 			"",
 			m.th.hintKey.Render("文件浏览（本地 / 远端）"),
-			"  ↑↓ / j k         移动光标 · Backspace 返回上级目录 · Enter 进目录/详情",
-			"  Space            多选普通文件并下移一行",
-			"  u / d / F5       上传本地所选 / 下载远端所选 / 自动执行当前栏传输",
-			"  /  ·  p  ·  o  ·  r   筛选搜索 · 输入目录跳转 · 切换排序 · 刷新列表",
-			"  i / F4           打开身份配置与导入切换面板",
+			helpKeyRow(m.th, "  ", "[↑↓] / [Bksp]", "移动光标 / 返回本地上级目录", kW),
+			helpKeyRow(m.th, "  ", "[Space] / [Enter]", "多选文件并下移 / 打开目录或查看详情", kW),
+			helpKeyRow(m.th, "  ", "[u] / [d] / [F5]", "上传所选 / 下载所选 / 执行当前栏传输", kW),
+			helpKeyRow(m.th, "  ", "[/] / [p]", "筛选搜索文件名 / 输入本地目录跳转", kW),
+			helpKeyRow(m.th, "  ", "[o] / [r]", "切换排序方式 / 刷新本地与远端列表", kW),
 			"",
 			m.th.hintKey.Render("队列与断点控制（统一 SQLite 断点）"),
-			"  Space            智能暂停正在传输的任务，或恢复已暂停/待处理任务",
-			"  F5 / r           在队列或历史中按任务状态恢复、重试或重新入队传输",
-			"  p / c / a        暂停单项 / 取消任务 / 全部暂停或恢复(仅队列区)",
-			"  n / X / Enter    冲突改名重传 / 清空历史归档 / 查看任务与校验详情",
-			"  B / R            查看最近批次摘要 / 一键重试全部失败任务",
-		}, "↑↓/滚轮 滚动 · Esc 或 ? 关闭"
+			helpKeyRow(m.th, "  ", "[Space]", "暂停进行中任务，或恢复暂停/待处理任务", kW),
+			helpKeyRow(m.th, "  ", "[F5] / [r]", "按状态恢复、重试或重新入队传输", kW),
+			helpKeyRow(m.th, "  ", "[p] / [c] / [a]", "暂停单项 / 取消任务 / 全暂停或恢复(仅队列)", kW),
+			helpKeyRow(m.th, "  ", "[n] / [X]", "冲突改名另存重传 / 清空历史归档", kW),
+			helpKeyRow(m.th, "  ", "[B] / [R]", "查看批次结果摘要 / 一键重试失败任务", kW),
+			helpKeyRow(m.th, "  ", "[Enter]", "查看任务进度、路径与校验详情", kW),
+		}, "↑↓/PgUp/PgDn/滚轮 滚动 · Esc / Enter / ? 关闭"
 	case modalDetail:
 		return m.detailTitle, m.detailLines, "↑↓/滚轮 滚动 · Enter 或 Esc 关闭"
 	case modalBatchSummary:

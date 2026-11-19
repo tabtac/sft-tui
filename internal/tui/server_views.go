@@ -1084,21 +1084,39 @@ func (m *serverModel) modalTitle() string {
 func (m *serverModel) infoModalData() (title string, lines []string, footer string) {
 	switch m.modal {
 	case srvModalHelp:
+		const kW = 16
+		const subKW = 14
 		return "服务端管理快捷键", []string{
 			m.th.hintKey.Render("全局快捷键"),
-			"  1–6 / Tab      在 概览 / 用户 / 传输 / 证书 / 设置 / 日志 页面间切换",
-			"  s / x / R      后台启动 sftd / 停止 sftd / 热加载证书与 ACL 配置",
-			"  r / /          手动刷新 / 过滤当前列表",
-			"  q / F10        退出管理界面（后台已启动的 sftd 服务继续保持运行）",
+			helpKeyRow(m.th, "  ", "[1-6] / [Tab]", "在 概览/用户/传输/证书/设置/日志 间切换", kW),
+			helpKeyRow(m.th, "  ", "[↑↓] / [PgUp]", "移动光标或翻页（日志上翻自动暂停跟随）", kW),
+			helpKeyRow(m.th, "  ", "[/] / [r]", "过滤当前列表 / 手动刷新配置与状态", kW),
+			helpKeyRow(m.th, "  ", "[s] / [x]", "后台启动 sftd / 停止运行中的 sftd", kW),
+			helpKeyRow(m.th, "  ", "[R]", "热加载 TLS 证书、用户 ACL 与全局总带宽", kW),
+			helpKeyRow(m.th, "  ", "[?] / [q]", "开关本帮助 / 退出管理界面（服务保持运行）", kW),
 			"",
 			m.th.hintKey.Render("页面专属动作"),
-			"  概览页：  [I] 首次部署向导（缺失配置时自动弹出）  [Enter] 连接详情",
-			"  用户页：  [n] 新建  [t] 启用/吊销  [p] 编辑权限与带宽  [w] 续期  [e] 导出包  [g] 相关日志",
-			"  传输页：  [Enter] 任务详情  [g] 相关日志  [/] 筛选",
-			"  证书页：  [K] 续期CA(365d)  [S] 轮换服务端证书  [C] 签发客户端CSR",
-			"  设置页：  [m] 基础/带宽/存储  [a] 高级协议/超时/资源  [L] 日志上限  [A] 热加载",
-			"  日志页：  [p] 暂停/跟随  [l] 等级  [U] 用户  [F] 文件  [T] 时间窗  [C] 清空筛选  [Enter] 详情",
-		}, "↑↓/滚轮 滚动 · Esc / Enter / ? 关闭"
+			m.th.badgeMuted.Render("  1 概览"),
+			helpKeyRow(m.th, "    ", "[I] / [Enter]", "首次部署向导 / 查看选中会话详情", subKW),
+			m.th.badgeMuted.Render("  2 用户"),
+			helpKeyRow(m.th, "    ", "[n] / [p]", "新建用户 / 编辑启停、权限与带宽策略", subKW),
+			helpKeyRow(m.th, "    ", "[t] / [w]", "启用或吊销用户 / 续期证书（保留启停）", subKW),
+			helpKeyRow(m.th, "    ", "[e] / [g]", "导出客户端包 / 跳转该用户相关日志", subKW),
+			helpKeyRow(m.th, "    ", "[Enter]", "查看用户与证书详情", subKW),
+			m.th.badgeMuted.Render("  3 传输"),
+			helpKeyRow(m.th, "    ", "[Enter] / [g]", "查看传输详情 / 跳转该任务相关日志", subKW),
+			m.th.badgeMuted.Render("  4 证书"),
+			helpKeyRow(m.th, "    ", "[K] / [S]", "续期 CA (365天) / 轮换服务端证书", subKW),
+			helpKeyRow(m.th, "    ", "[C] / [Enter]", "签发外部 CSR / 查看证书详情与指纹", subKW),
+			m.th.badgeMuted.Render("  5 设置"),
+			helpKeyRow(m.th, "    ", "[m] / [a]", "编辑基础设置(含日志上限) / 高级参数", subKW),
+			helpKeyRow(m.th, "    ", "[A]", "热加载可热更配置到运行中的服务", subKW),
+			m.th.badgeMuted.Render("  6 日志"),
+			helpKeyRow(m.th, "    ", "[p] / [l]", "暂停或恢复跟随 / 循环切换最低日志等级", subKW),
+			helpKeyRow(m.th, "    ", "[U] / [F]", "按用户名过滤 / 按文件名过滤", subKW),
+			helpKeyRow(m.th, "    ", "[T] / [C]", "切换时间窗口 / 清空全部筛选条件", subKW),
+			helpKeyRow(m.th, "    ", "[Enter]", "查看单条日志事件详情", subKW),
+		}, "↑↓/PgUp/PgDn/滚轮 滚动 · Esc / Enter / ? 关闭"
 
 	case srvModalDetail:
 		return m.detailTitle, m.detailLines, "↑↓/滚轮 滚动 · Enter / Esc 关闭"

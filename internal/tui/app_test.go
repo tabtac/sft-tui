@@ -694,6 +694,12 @@ func TestClientRenameModalAndScrollableInfoModals(t *testing.T) {
 	if !strings.Contains(v0, "键盘快捷键说明") || !strings.Contains(v0, "关闭") {
 		t.Fatalf("help modal clipped title or footer:\n%s", v0)
 	}
+	_, cliHelpLines, _ := m.infoModalData()
+	for _, ln := range cliHelpLines {
+		if w := lipgloss.Width(ansi.Strip(ln)); w > 70 {
+			t.Fatalf("client help line exceeds 80-col modal inner width (%d > 70): %q", w, ansi.Strip(ln))
+		}
+	}
 	m.Update(keyType(tea.KeyDown))
 	if m.infoScroll == 0 {
 		t.Fatal("down key did not scroll overflowing help modal")

@@ -668,11 +668,17 @@ func TestServerHelpAndDetailModalsScrollWithinTerminalHeight(t *testing.T) {
 	m := newServerModel(ServerOptions{ExecutableDir: t.TempDir(), ConfigPath: "configs/server.local.json"})
 	m.Update(tea.WindowSizeMsg{Width: 80, Height: 14})
 
-	// 1. 帮助弹窗在 80x14 下支持滚动，标题与关闭提示始终在框内
+	// 1. 帮助弹窗在 80x14 下支持滚动，标题与关闭提示始终在框内；在 80x24 下行不乱折
 	m.Update(keyRune('?'))
 	h0 := ansi.Strip(m.View())
 	if lipgloss.Height(h0) > 14 || !strings.Contains(h0, "服务端管理快捷键") || !strings.Contains(h0, "关闭") {
 		t.Fatalf("server help modal overflowed or clipped chrome:\n%s", h0)
+	}
+	_, helpLines, _ := m.infoModalData()
+	for _, ln := range helpLines {
+		if w := lipgloss.Width(ansi.Strip(ln)); w > 70 {
+			t.Fatalf("server help line exceeds 80-col modal inner width (%d > 70): %q", w, ansi.Strip(ln))
+		}
 	}
 	m.Update(keyType(tea.KeyDown))
 	if m.infoScroll == 0 {
