@@ -23,6 +23,7 @@ const (
 	modalRename
 	modalQuit
 	modalClearHistory
+	modalBatchSummary
 )
 
 func modalBoxDimensions(width int) (boxW, innerW int) {
@@ -183,9 +184,12 @@ func (m *model) infoModalData() (title string, lines []string, footer string) {
 			"  F5 / r           在队列或历史中按任务状态恢复、重试或重新入队传输",
 			"  p / c / a        暂停单项 / 取消任务 / 全部暂停或恢复(仅队列区)",
 			"  n / X / Enter    冲突改名重传 / 清空历史归档 / 查看任务与校验详情",
+			"  B / R            查看最近批次摘要 / 一键重试全部失败任务",
 		}, "↑↓/滚轮 滚动 · Esc 或 ? 关闭"
 	case modalDetail:
 		return m.detailTitle, m.detailLines, "↑↓/滚轮 滚动 · Enter 或 Esc 关闭"
+	case modalBatchSummary:
+		return m.batchSummaryModalData()
 	}
 	return "", nil, ""
 }
@@ -207,7 +211,7 @@ func appendModalNoticeLines(lines []string, th theme, notice string, innerW int)
 func (m *model) viewModal(base string) string {
 	_, innerW := modalBoxDimensions(m.width)
 	switch m.modal {
-	case modalHelp, modalDetail:
+	case modalHelp, modalDetail, modalBatchSummary:
 		title, lines, footer := m.infoModalData()
 		view, _ := renderModalScrollBox(m.width, m.height, m.th, title, lines, footer, m.infoScroll)
 		return view

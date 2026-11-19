@@ -111,9 +111,33 @@ type identityActivatedMsg struct {
 	err      error
 }
 type batchOpResultMsg struct {
-	notice string
-	err    error
-	quit   bool
+	notice   string
+	err      error
+	quit     bool
+	enqueued []queue.Task
+}
+type batchTracker struct {
+	id      string
+	started time.Time
+	taskIDs []string
+}
+type batchFailedItem struct {
+	Direction protocol.Direction
+	Remote    string
+	Path      string
+	Error     string
+}
+type batchSummary struct {
+	BatchID    string
+	Started    time.Time
+	Finished   time.Time
+	Total      int
+	Succeeded  int
+	Failed     int
+	Cancelled  int
+	Skipped    int
+	TotalBytes uint64
+	FailedList []batchFailedItem
 }
 
 type model struct {
@@ -170,14 +194,18 @@ type model struct {
 	query                 string
 
 	// 异步操作进度与防重入状态
-	activatingID  bool
-	testingConn   bool
-	opBusy        bool
-	opLabel       string
-	opStart       time.Time
-	spinIdx       int
-	idTestResults map[string]identityTestState
-	pendingSwitch *identitySwitchConfirm
+	activatingID   bool
+	testingConn    bool
+	opBusy         bool
+	opLabel        string
+	opStart        time.Time
+	spinIdx        int
+	idTestResults  map[string]identityTestState
+	pendingSwitch  *identitySwitchConfirm
+	recoveryNotice string
+	activeBatches  map[string]*batchTracker
+	lastBatch      *batchSummary
+	batchHistory   []batchSummary
 
 	// 队列快照视图（无锁）
 	activeTasks   []queue.Task
@@ -247,6 +275,7 @@ func newModel(opts Options) *model {
 		remoteSelected: make(map[string]bool),
 		completedSeen:  make(map[string]bool),
 		idTestResults:  make(map[string]identityTestState),
+		activeBatches:  make(map[string]*batchTracker),
 		searchInput:    makeInput("输入关键字筛选文件名…"),
 		pathInput:      makeInput("输入本地绝对或相对路径…"),
 		idInput:        makeInput("输入 client*.json 或导出目录路径…"),
@@ -794,8 +823,31 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.runner = msg.runner
 		m.modal = modalNone
 		m.connStatus = "已配置，正在拉取远端文件"
-		m.statusToast = "已加载身份：" + msg.label
+		m.recoveryNotice = ""
+		m.activeBatches = make(map[string]*batchTracker)
+		m.lastBatch = nil
 		m.refreshQueueSnapshots()
+		var unfinishedN, pausedN, pendingN, waitingN int
+		for _, t := range m.activeTasks {
+			if t.Terminal() {
+				continue
+			}
+			unfinishedN++
+			switch t.State {
+			case queue.Paused:
+				pausedN++
+			case queue.Pending:
+				pendingN++
+			default:
+				waitingN++
+			}
+		}
+		if unfinishedN > 0 {
+			m.recoveryNotice = fmt.Sprintf("检测到 %d 个未完成断点任务（暂停 %d / 待处理 %d / 等待 %d），去队列按 [a] 恢复或 [F5] 继续", unfinishedN, pausedN, pendingN, waitingN)
+			m.statusToast = m.recoveryNotice
+		} else {
+			m.statusToast = "已加载身份：" + msg.label
+		}
 		return m, m.loadRemoteCmd()
 
 	case batchOpResultMsg:
@@ -806,8 +858,14 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.statusToast = msg.err.Error()
 			return m, nil
 		}
+		if len(msg.enqueued) > 0 {
+			m.recordEnqueuedBatch(msg.enqueued)
+		}
 		if msg.notice != "" {
 			m.statusToast = msg.notice
+		}
+		if len(msg.enqueued) > 0 {
+			m.refreshQueueSnapshots()
 		}
 		if msg.quit {
 			m.cleanup()
@@ -960,6 +1018,19 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, m.retryHistoryCmd()
 		}
 		return m, tea.Batch(m.loadLocalCmd(m.localDir), m.loadRemoteCmd())
+	case "B":
+		if m.lastBatch == nil && len(m.batchHistory) == 0 {
+			m.statusToast = "当前会话暂无已完成批次结果摘要"
+			return m, nil
+		}
+		m.infoScroll = 0
+		m.modal = modalBatchSummary
+		return m, nil
+	case "R":
+		if m.focus == areaQueue {
+			return m, m.retryFailedTasksCmd()
+		}
+		return m, nil
 	case "i", "f4":
 		m.modal = modalIdentity
 		m.pendingSwitch = nil
@@ -1018,7 +1089,7 @@ func (m *model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 	if msg.Action != tea.MouseActionPress || m.width <= 0 || m.height <= 0 {
 		return m, nil
 	}
-	if m.modal == modalHelp || m.modal == modalDetail {
+	if m.modal == modalHelp || m.modal == modalDetail || m.modal == modalBatchSummary {
 		switch msg.Button {
 		case tea.MouseButtonWheelUp:
 			m.scrollClientInfoModal("up")
@@ -1187,7 +1258,12 @@ func (m *model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 	visRows := max(1, botH-3)
-	moveList(&m.queueCursor, len(m.currentQueueTasks()), visRows, msg.Y-(queueY+2))
+	queueRelY := msg.Y - (queueY + 2)
+	if !m.historyView && m.recoveryNotice != "" && len(m.activeTasks) > 0 && visRows >= 3 {
+		visRows--
+		queueRelY--
+	}
+	moveList(&m.queueCursor, len(m.currentQueueTasks()), visRows, queueRelY)
 	return m, nil
 }
 
@@ -1206,6 +1282,18 @@ func (m *model) handleModalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if k == "esc" || k == "enter" || k == "q" {
 			m.modal = modalNone
 			return m, nil
+		}
+		m.scrollClientInfoModal(k)
+		return m, nil
+
+	case modalBatchSummary:
+		switch k {
+		case "esc", "enter", "q", "B":
+			m.modal = modalNone
+			return m, nil
+		case "R":
+			m.modal = modalNone
+			return m, m.retryFailedTasksCmd()
 		}
 		m.scrollClientInfoModal(k)
 		return m, nil
@@ -1420,6 +1508,7 @@ func (m *model) handleModalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 			m.modal = modalNone
 			m.renameTask = nil
+			m.recordEnqueuedBatch(tasks)
 			m.refreshQueueSnapshots()
 			m.statusToast = fmt.Sprintf("已入队 %d 个传输任务", len(tasks))
 			return m, nil
@@ -1737,7 +1826,18 @@ func (m *model) refreshQueueSnapshots() bool {
 	}
 	m.activeTasks = m.manager.Snapshot(false)
 	m.historyTasks = m.manager.Snapshot(true)
+	hasUnfinished := false
+	for _, t := range m.activeTasks {
+		if !t.Terminal() {
+			hasUnfinished = true
+			break
+		}
+	}
+	if !hasUnfinished {
+		m.recoveryNotice = ""
+	}
 	m.clampQueueCursor()
+	m.evaluateBatches()
 
 	refreshFiles := false
 	for _, t := range m.activeTasks {
@@ -1747,6 +1847,173 @@ func (m *model) refreshQueueSnapshots() bool {
 		}
 	}
 	return refreshFiles
+}
+
+func (m *model) recordEnqueuedBatch(tasks []queue.Task) {
+	if len(tasks) == 0 {
+		return
+	}
+	if m.activeBatches == nil {
+		m.activeBatches = make(map[string]*batchTracker)
+	}
+	batchID := tasks[0].Batch
+	if batchID == "" {
+		batchID = tasks[0].ID
+	}
+	ids := make([]string, len(tasks))
+	for i, t := range tasks {
+		ids[i] = t.ID
+	}
+	m.activeBatches[batchID] = &batchTracker{
+		id:      batchID,
+		started: time.Now(),
+		taskIDs: ids,
+	}
+}
+
+func (m *model) evaluateBatches() {
+	if len(m.activeBatches) == 0 {
+		return
+	}
+	byID := make(map[string]queue.Task, len(m.activeTasks)+len(m.historyTasks))
+	for _, t := range m.activeTasks {
+		byID[t.ID] = t
+	}
+	for _, t := range m.historyTasks {
+		byID[t.ID] = t
+	}
+
+	for id, bt := range m.activeBatches {
+		var s batchSummary
+		s.BatchID = id
+		s.Started = bt.started
+		s.Total = len(bt.taskIDs)
+		settled := true
+		for _, tid := range bt.taskIDs {
+			t, ok := byID[tid]
+			if !ok {
+				continue
+			}
+			switch {
+			case t.Terminal():
+				switch t.State {
+				case queue.Completed:
+					s.Succeeded++
+					s.TotalBytes += t.Size
+				case queue.Skipped:
+					s.Skipped++
+				case queue.Cancelled:
+					if t.Error != "" {
+						s.Failed++
+						s.FailedList = append(s.FailedList, batchFailedItem{Direction: t.Direction, Remote: t.Remote, Path: t.Path, Error: t.Error})
+					} else {
+						s.Cancelled++
+					}
+				}
+			case !t.State.Active() && t.Error != "":
+				// preflight 或执行出错转入 Pending/Paused 状态
+				s.Failed++
+				s.FailedList = append(s.FailedList, batchFailedItem{Direction: t.Direction, Remote: t.Remote, Path: t.Path, Error: t.Error})
+			default:
+				settled = false
+			}
+		}
+		if !settled {
+			continue
+		}
+		s.Finished = time.Now()
+		delete(m.activeBatches, id)
+		sCopy := s
+		m.lastBatch = &sCopy
+		m.batchHistory = append([]batchSummary{s}, m.batchHistory...)
+		if len(m.batchHistory) > 20 {
+			m.batchHistory = m.batchHistory[:20]
+		}
+		if s.Failed > 0 {
+			m.statusToast = fmt.Sprintf("批次完成：成功 %d · 失败 %d · 跳过 %d（按 B 查摘要 / R 重失败）", s.Succeeded, s.Failed, s.Skipped)
+		} else {
+			m.statusToast = fmt.Sprintf("批次完成：成功 %d · 跳过 %d（按 B 查看摘要）", s.Succeeded, s.Skipped)
+		}
+	}
+}
+
+func (m *model) failedTaskCount() int {
+	n := 0
+	for _, t := range m.activeTasks {
+		if !t.WantCancel && !t.State.Active() && t.Error != "" && (t.State == queue.Pending || t.State == queue.Paused) {
+			n++
+		}
+	}
+	return n
+}
+
+func (m *model) retryFailedTasksCmd() tea.Cmd {
+	if m.manager == nil {
+		m.statusToast = "请先配置或导入身份（按 i）"
+		return nil
+	}
+	if m.opBusy {
+		m.statusToast = "已有队列控制操作正在执行，请稍候…"
+		return nil
+	}
+	var ids []string
+	for _, t := range m.activeTasks {
+		if !t.WantCancel && !t.State.Active() && t.Error != "" && (t.State == queue.Pending || t.State == queue.Paused) {
+			ids = append(ids, t.ID)
+		}
+	}
+	if len(ids) == 0 {
+		m.statusToast = "当前队列没有失败或报错待处理的任务"
+		return nil
+	}
+	mgr := m.manager
+	m.opBusy = true
+	m.opLabel = fmt.Sprintf("正在重试 %d 个失败任务", len(ids))
+	m.opStart = time.Now()
+	return func() tea.Msg {
+		resumed := 0
+		var firstErr error
+		for _, id := range ids {
+			if err := mgr.Resume(id); err != nil {
+				if firstErr == nil {
+					firstErr = err
+				}
+			} else {
+				resumed++
+			}
+		}
+		if resumed == 0 && firstErr != nil {
+			return batchOpResultMsg{err: firstErr}
+		}
+		notice := fmt.Sprintf("已重新提交 %d 个失败任务继续传输", resumed)
+		if firstErr != nil {
+			notice += "（部分失败：" + firstErr.Error() + "）"
+		}
+		return batchOpResultMsg{notice: notice}
+	}
+}
+
+func (m *model) batchSummaryModalData() (title string, lines []string, footer string) {
+	b := m.lastBatch
+	if b == nil && len(m.batchHistory) > 0 {
+		b = &m.batchHistory[0]
+	}
+	if b == nil {
+		return "批次传输结果摘要", []string{"当前会话尚无已完成批次。"}, "Enter / Esc 关闭"
+	}
+	lines = []string{
+		fmt.Sprintf("批次统计：总计 %d · 成功 %d · 失败 %d · 取消 %d · 跳过 %d", b.Total, b.Succeeded, b.Failed, b.Cancelled, b.Skipped),
+		fmt.Sprintf("累计传输：%s · 耗时 %s", progress.FormatBytes(b.TotalBytes), b.Finished.Sub(b.Started).Round(time.Millisecond)),
+	}
+	if len(b.FailedList) > 0 {
+		lines = append(lines, "", m.th.badgeErr.Render(fmt.Sprintf("失败项清单 (%d 项，按 [R] 一键重试)：", len(b.FailedList))))
+		for _, item := range b.FailedList {
+			lines = append(lines, fmt.Sprintf("  • %s %s — %s", directionIcon(item.Direction), item.Remote, item.Error))
+		}
+	} else {
+		lines = append(lines, "", m.th.badgeOk.Render("✔ 本批无失败项"))
+	}
+	return "批次传输结果摘要", lines, "↑↓ 滚动 · R 重试失败项 · Enter / Esc 关闭"
 }
 
 func clampSortKind(v int) sortKind {
@@ -2112,7 +2379,7 @@ func (m *model) enqueueSpecsCmd(specs []queue.Spec) tea.Cmd {
 		if err != nil {
 			return batchOpResultMsg{err: err}
 		}
-		return batchOpResultMsg{notice: fmt.Sprintf("已入队 %d 个传输任务", len(tasks))}
+		return batchOpResultMsg{notice: fmt.Sprintf("已入队 %d 个传输任务", len(tasks)), enqueued: tasks}
 	}
 }
 
@@ -2139,6 +2406,12 @@ func (m *model) toggleSelectedTaskCmd() tea.Cmd {
 	}
 	mgr := m.manager
 	task := *t
+	if live := mgr.Task(t.ID); live != nil {
+		if live.Terminal() {
+			return nil
+		}
+		task = *live
+	}
 	return func() tea.Msg {
 		switch {
 		case task.State.Active():
@@ -2165,6 +2438,9 @@ func (m *model) resumeOrRetrySelectedCmd() tea.Cmd {
 		return nil
 	}
 	task := *t
+	if live := m.manager.Task(t.ID); live != nil {
+		task = *live
+	}
 	if m.historyView || task.Terminal() {
 		spec := queue.Spec{Direction: task.Direction, Remote: task.Remote, Path: task.Path, Size: task.Size}
 		return m.prepareBatch(task.Direction, []queue.Spec{spec}, false)

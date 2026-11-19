@@ -193,6 +193,15 @@ func (m *model) renderFooter() string {
 		})
 	default:
 		t := m.selectedTask()
+		failCount := m.failedTaskCount()
+		retryReason := ""
+		if failCount == 0 {
+			retryReason = "无失败项"
+		}
+		batchReason := ""
+		if m.lastBatch == nil {
+			batchReason = "暂无"
+		}
 		if m.historyView {
 			emptyReason := ""
 			if len(m.historyTasks) == 0 {
@@ -200,8 +209,10 @@ func (m *model) renderFooter() string {
 			}
 			return renderActionFooter(m.th, m.width, "历史:", []footerChip{
 				{key: "r/F5", label: "重传", reason: emptyReason, essential: true},
+				{key: "R", label: "重失败", reason: retryReason, essential: true},
+				{key: "B", label: "批次", reason: batchReason, essential: true},
 				{key: "Enter", label: "详情", reason: emptyReason, essential: true},
-				{key: "X", label: "清空", reason: emptyReason, essential: true},
+				{key: "X", label: "清空", reason: emptyReason},
 				{key: "v", label: "活动队列", essential: true},
 				{key: "F6", label: "主题"},
 				{key: "?", label: "帮助"},
@@ -233,14 +244,15 @@ func (m *model) renderFooter() string {
 			allReason = "执行中"
 		}
 		return renderActionFooter(m.th, m.width, "队列:", []footerChip{
-			{key: "Space", label: spaceLabel, reason: spaceReason, essential: true},
-			{key: "F5", label: "恢复/重试", reason: f5Reason, essential: true},
-			{key: "n", label: "改名", reason: renameReason, essential: true},
-			{key: "c", label: "取消", reason: cancelReason, essential: true},
-			{key: "a", label: "全暂停/恢", reason: allReason, essential: true},
+			{key: "Spc", label: spaceLabel, reason: spaceReason, essential: true},
+			{key: "F5", label: "恢复/试", reason: f5Reason, essential: true},
+			{key: "R", label: "重失败", reason: retryReason, essential: true},
+			{key: "B", label: "批次", reason: batchReason, essential: true},
+			{key: "n", label: "改名", reason: renameReason},
+			{key: "c", label: "取消", reason: cancelReason},
+			{key: "a", label: "全暂/恢", reason: allReason, essential: true},
 			{key: "v", label: "历史"},
 			{key: "?", label: "帮助"},
-			{key: "q", label: "退出"},
 		})
 	}
 }
@@ -426,6 +438,10 @@ func (m *model) renderQueuePanel(outerW, outerH int) string {
 
 	tasks := m.currentQueueTasks()
 	var lines []string
+	if !m.historyView && m.recoveryNotice != "" && len(m.activeTasks) > 0 && visRows >= 3 {
+		lines = append(lines, m.th.badgeWarn.Render(truncCell("↻ "+m.recoveryNotice, innerW)))
+		visRows--
+	}
 	if len(tasks) == 0 {
 		if m.historyView {
 			lines = append(lines, m.th.badgeMuted.Render(truncCell("（历史归档为空）", innerW)))

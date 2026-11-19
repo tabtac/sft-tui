@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -512,5 +513,140 @@ func TestClientIdentitySwitchWarnsAndConfirmsUnfinishedTasks(t *testing.T) {
 	m.Update(confirmCmd())
 	if m.activatingID {
 		t.Fatal("expected activatingID cleared after identityActivatedMsg")
+	}
+}
+
+func TestClientRecoveryNoticeBatchSummaryAndRetryFailed(t *testing.T) {
+	cliCfg, _, cleanup := setupTestClientEnv(t)
+	defer cleanup()
+
+	dir := t.TempDir()
+	okFile := filepath.Join(dir, "ok.bin")
+	if err := os.WriteFile(okFile, bytes.Repeat([]byte("A"), 256), 0600); err != nil {
+		t.Fatal(err)
+	}
+	// 先写入预设未完成断点任务，验证打开身份栈后的恢复提示
+	preMgr, err := queue.Open(queue.Config{
+		StateDir:     cliCfg.StateDir,
+		Identity:     "alice-recovery",
+		MaxFileBytes: cliCfg.MaxFileBytes,
+		MaxStreams:   2,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	preTasks, err := preMgr.Enqueue([]queue.Spec{{
+		Direction: protocol.DirectionUpload,
+		Remote:    "ok.bin",
+		Path:      okFile,
+		Size:      256,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := preMgr.Pause(preTasks[0].ID); err != nil {
+		t.Fatal(err)
+	}
+	_ = preMgr.Close()
+
+	m := newModel(Options{ExecutableDir: dir, Directory: dir})
+	m.Update(tea.WindowSizeMsg{Width: 110, Height: 30})
+	opened := openIdentityStack(cliCfg, "alice-recover")
+	if opened.err != nil {
+		t.Fatal(opened.err)
+	}
+	// 同 identityKey 若为首次打开（先手动打开匹配的 stateKey 任务，或直接打开真实 identityKey 任务）
+	_ = opened.manager.Close()
+	_ = opened.runner.Close()
+	pre2, err := queue.Open(queue.Config{
+		StateDir:     cliCfg.StateDir,
+		Identity:     opened.idKey,
+		MaxFileBytes: cliCfg.MaxFileBytes,
+		MaxStreams:   2,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t2, err := pre2.Enqueue([]queue.Spec{{
+		Direction: protocol.DirectionUpload,
+		Remote:    "ok.bin",
+		Path:      okFile,
+		Size:      256,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := pre2.Pause(t2[0].ID); err != nil {
+		t.Fatal(err)
+	}
+	_ = pre2.Close()
+
+	reopened := openIdentityStack(cliCfg, "alice-recover")
+	if reopened.err != nil {
+		t.Fatal(reopened.err)
+	}
+	m.Update(reopened)
+	defer m.cleanup()
+
+	if !strings.Contains(m.recoveryNotice, "检测到 1 个未完成断点任务") {
+		t.Fatalf("expected unfinished recovery notice after loading identity, got %q", m.recoveryNotice)
+	}
+	if !strings.Contains(ansi.Strip(m.View()), "检测到 1 个未完成断点任务") {
+		t.Fatalf("expected recovery banner visible in queue view:\n%s", ansi.Strip(m.View()))
+	}
+
+	// 取消旧任务并入队含 Skip + 失败(源文件被删除触发 preflight failure)的新批次，验证批次摘要与 R 重试
+	if err := m.manager.Cancel(t2[0].ID); err != nil {
+		t.Fatal(err)
+	}
+	m.refreshQueueSnapshots()
+
+	missingFile := filepath.Join(dir, "will-fix.bin")
+	cmd := m.enqueueSpecsCmd([]queue.Spec{
+		{Direction: protocol.DirectionUpload, Remote: "skip.bin", Path: okFile, Skip: "用户跳过重名文件"},
+		{Direction: protocol.DirectionUpload, Remote: "will-fix.bin", Path: missingFile, Size: 128},
+	})
+	m.Update(cmd())
+	m.refreshQueueSnapshots()
+
+	if m.lastBatch == nil || m.lastBatch.Total != 2 || m.lastBatch.Skipped != 1 || m.lastBatch.Failed != 1 {
+		t.Fatalf("expected settled batch summary (total=2, skipped=1, failed=1), got %+v", m.lastBatch)
+	}
+	m.Update(keyRune('B'))
+	if m.modal != modalBatchSummary {
+		t.Fatalf("expected modalBatchSummary on key B, got %v", m.modal)
+	}
+	bv := ansi.Strip(m.View())
+	if !strings.Contains(bv, "成功 0 · 失败 1 · 取消 0 · 跳过 1") || !strings.Contains(bv, "will-fix.bin") {
+		t.Fatalf("unexpected batch summary modal content:\n%s", bv)
+	}
+
+	// 补齐缺失源文件后在摘要弹窗按 R 重试失败项，应成功恢复为等待/完成
+	if err := os.WriteFile(missingFile, bytes.Repeat([]byte("R"), 128), 0600); err != nil {
+		t.Fatal(err)
+	}
+	_, retryCmd := m.Update(keyRune('R'))
+	if retryCmd == nil {
+		t.Fatal("expected retry cmd on key R in batch summary")
+	}
+	m.Update(retryCmd())
+
+	deadline := time.Now().Add(8 * time.Second)
+	completed := false
+	for time.Now().Before(deadline) {
+		m.refreshQueueSnapshots()
+		for _, t := range m.historyTasks {
+			if t.Remote == "will-fix.bin" && t.State == queue.Completed {
+				completed = true
+				break
+			}
+		}
+		if completed && m.failedTaskCount() == 0 {
+			break
+		}
+		time.Sleep(30 * time.Millisecond)
+	}
+	if !completed || m.failedTaskCount() != 0 {
+		t.Fatalf("expected retried failed task to complete, active=%+v hist=%+v", m.activeTasks, m.historyTasks)
 	}
 }
