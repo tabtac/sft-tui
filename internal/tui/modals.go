@@ -345,7 +345,11 @@ func (m *model) buildIdentityModalContent() (title, footer string, lines []strin
 		"",
 	}
 	if len(m.idChoices) == 0 {
-		lines = append(lines, m.th.badgeWarn.Render(truncCell("  未在当前目录及程序旁发现可用的 client*.json，请在下方输入路径导入。", innerW)))
+		if m.idInitFailedLabel != "" {
+			lines = append(lines, m.th.badgeWarn.Render(truncPlainCell(fmt.Sprintf("  已识别身份 %s，但%s（详情见下方提示）。", sanitizeInline(m.idInitFailedLabel), identityStageStatusText(m.idInitFailedStage)), innerW)))
+		} else {
+			lines = append(lines, m.th.badgeWarn.Render(truncCell("  未在当前目录及程序旁发现可用的 client*.json，请在下方输入路径导入。", innerW)))
+		}
 	} else {
 		start := scrollOffset(m.idCursor, len(m.idChoices), maxShow)
 		for i := start; i < start+maxShow; i++ {

@@ -684,3 +684,115 @@ func TestClientToastAutoExpiryAndModalValidationPersistence(t *testing.T) {
 		t.Fatalf("expected Esc to close modal and clear validation toast, modal=%v toast=%q", m.modal, m.statusToast)
 	}
 }
+
+func TestClientValidIdentityQueueInitFailurePreservesCause(t *testing.T) {
+	dir := t.TempDir()
+	certsDir := filepath.Join(dir, "certs")
+	if err := testcert.Generate(certsDir); err != nil {
+		t.Fatal(err)
+	}
+	if err := testcert.IssueClient(certsDir, "alice"); err != nil {
+		t.Fatal(err)
+	}
+	blockedState := filepath.Join(dir, "blocked-state")
+	if err := os.WriteFile(blockedState, []byte("ordinary file"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.DefaultClient()
+	cfg.ServerAddress = "127.0.0.1:7443"
+	cfg.ServerName = "localhost"
+	cfg.StateDir = blockedState
+	cfg.TLS = config.TLSFiles{
+		CACertificate: filepath.Join(certsDir, "ca.pem"),
+		Certificate:   filepath.Join(certsDir, "alice.pem"),
+		PrivateKey:    filepath.Join(certsDir, "alice-key.pem"),
+	}
+	cfgPath := filepath.Join(dir, "client.json")
+	if err := config.SaveJSON(cfgPath, cfg); err != nil {
+		t.Fatal(err)
+	}
+
+	m := newModel(Options{ExecutableDir: t.TempDir(), Directory: t.TempDir(), ConfigPath: cfgPath})
+	m.Update(tea.WindowSizeMsg{Width: 100, Height: 28})
+	rawMsg := m.initIdentityCmd()()
+	actMsg, ok := rawMsg.(identityActivatedMsg)
+	if !ok || actMsg.err == nil {
+		t.Fatalf("expected queue init error, got %#v", rawMsg)
+	}
+	if actMsg.stage != identityStageQueue || !actMsg.hasCfg || actMsg.label != "SFT alice@127.0.0.1:7443" {
+		t.Fatalf("unexpected stage/context: %+v", actMsg)
+	}
+	m.Update(actMsg)
+	if m.modal != modalIdentity {
+		t.Fatalf("expected modalIdentity, got %v", m.modal)
+	}
+	view := ansi.Strip(m.View())
+	if strings.Contains(view, "未找到已激活身份") {
+		t.Fatalf("valid identity queue failure misreported as missing identity:\n%s", view)
+	}
+	if !strings.Contains(view, "队列初始化失败") || !strings.Contains(view, "not a directory") {
+		t.Fatalf("expected queue failure and cause in modal view:\n%s", view)
+	}
+	if !strings.Contains(view, "SFT alice@127.0.0.1:7443") {
+		t.Fatalf("expected resolved identity label retained in view:\n%s", view)
+	}
+}
+
+func TestClientValidIdentityTLSFailurePreservesCause(t *testing.T) {
+	dir := t.TempDir()
+	certsDir := filepath.Join(dir, "certs")
+	if err := testcert.Generate(certsDir); err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.DefaultClient()
+	cfg.ServerAddress = "127.0.0.1:7443"
+	cfg.ServerName = "localhost"
+	cfg.StateDir = filepath.Join(dir, "state")
+	cfg.TLS = config.TLSFiles{
+		CACertificate: filepath.Join(certsDir, "ca.pem"),
+		Certificate:   filepath.Join(certsDir, "missing-alice.pem"),
+		PrivateKey:    filepath.Join(certsDir, "missing-alice-key.pem"),
+	}
+	cfgPath := filepath.Join(dir, "client.json")
+	if err := config.SaveJSON(cfgPath, cfg); err != nil {
+		t.Fatal(err)
+	}
+
+	m := newModel(Options{ExecutableDir: t.TempDir(), Directory: t.TempDir(), ConfigPath: cfgPath})
+	m.Update(tea.WindowSizeMsg{Width: 100, Height: 28})
+	rawMsg := m.initIdentityCmd()()
+	actMsg, ok := rawMsg.(identityActivatedMsg)
+	if !ok || actMsg.err == nil {
+		t.Fatalf("expected TLS init error, got %#v", rawMsg)
+	}
+	if actMsg.stage != identityStageTLS || !actMsg.hasCfg {
+		t.Fatalf("unexpected stage/context: %+v", actMsg)
+	}
+	m.Update(actMsg)
+	view := ansi.Strip(m.View())
+	if strings.Contains(view, "未找到已激活身份") {
+		t.Fatalf("valid identity TLS failure misreported as missing identity:\n%s", view)
+	}
+	if !strings.Contains(view, "TLS 证书初始化失败") {
+		t.Fatalf("expected TLS initialization error in view:\n%s", view)
+	}
+}
+
+func TestClientMissingConfigOpensIdentityPicker(t *testing.T) {
+	missingPath := filepath.Join(t.TempDir(), "missing-client.json")
+	m := newModel(Options{ExecutableDir: t.TempDir(), Directory: t.TempDir(), ConfigPath: missingPath})
+	m.Update(tea.WindowSizeMsg{Width: 100, Height: 28})
+	rawMsg := m.initIdentityCmd()()
+	actMsg, ok := rawMsg.(identityActivatedMsg)
+	if !ok || actMsg.err == nil {
+		t.Fatalf("expected lookup error for missing config, got %#v", rawMsg)
+	}
+	if actMsg.stage != identityStageLookup || !isMissingIdentityErr(actMsg.err) {
+		t.Fatalf("expected lookup missing-identity error, got stage=%v err=%v", actMsg.stage, actMsg.err)
+	}
+	m.Update(actMsg)
+	view := ansi.Strip(m.View())
+	if !strings.Contains(view, "身份管理") || !strings.Contains(view, "未找到已激活身份") || !strings.Contains(view, "选择") || !strings.Contains(view, "导入") {
+		t.Fatalf("missing config view did not preserve onboarding guidance:\n%s", view)
+	}
+}

@@ -8,6 +8,7 @@ import (
 	"crypto/x509"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -23,6 +24,9 @@ import (
 	"sft-tui/internal/prompt"
 	"sft-tui/internal/security"
 )
+
+// ErrNotFound 表示当前未找到或未激活任何可用的客户端身份配置。
+var ErrNotFound = errors.New("未找到客户端配置")
 
 type Profile struct {
 	ID          string
@@ -81,7 +85,7 @@ func ResolveInteractive(executableDir, workingDir, sourceDir, explicitConfig str
 			}
 		}
 		if len(candidates) == 0 {
-			return config.Client{}, fmt.Errorf("未找到客户端配置；请将导出包放到 sft 同目录，或通过 -dir / -config 指定")
+			return config.Client{}, fmt.Errorf("%w；请将导出包放到 sft 同目录，或通过 -dir / -config 指定", ErrNotFound)
 		}
 		if len(candidates) > 1 {
 			if in != nil && out != nil {

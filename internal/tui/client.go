@@ -2,6 +2,7 @@ package tui
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -100,11 +101,21 @@ type identitySwitchConfirm struct {
 	activeCount int
 	pausedCount int
 }
+type identityInitStage uint8
+
+const (
+	identityStageLookup identityInitStage = iota
+	identityStageTLS
+	identityStageQueue
+)
+
 type identityActivatedMsg struct {
 	cfg      config.Client
+	hasCfg   bool
 	label    string
 	idKey    string
 	activeID string
+	stage    identityInitStage
 	manager  *queue.Manager
 	runner   *transfer.QueueRunner
 	resetOld bool
@@ -163,13 +174,15 @@ type model struct {
 	editingIDLabel bool
 
 	// 身份与传输引擎
-	cfg           *config.Client
-	identityLabel string
-	idKey         string
-	activeID      string
-	manager       *queue.Manager
-	runner        *transfer.QueueRunner
-	connStatus    string
+	cfg               *config.Client
+	identityLabel     string
+	idKey             string
+	activeID          string
+	manager           *queue.Manager
+	runner            *transfer.QueueRunner
+	connStatus        string
+	idInitFailedStage identityInitStage
+	idInitFailedLabel string
 
 	// 文件列表
 	localDir              string
@@ -393,16 +406,64 @@ func (m *model) initIdentityCmd() tea.Cmd {
 		wd, _ := os.Getwd()
 		cfg, err := identity.Resolve(opts.ExecutableDir, wd, opts.BundleDir, opts.ConfigPath, false, nil)
 		if err != nil {
-			return identityActivatedMsg{err: err}
+			return identityActivatedMsg{
+				stage: identityStageLookup,
+				err:   err,
+			}
 		}
 		return openIdentityStack(cfg, "")
 	}
 }
 
+func identityDisplayLabel(cfg config.Client, customLabel string) string {
+	if customLabel != "" {
+		return customLabel
+	}
+	user := cfg.ServerName
+	if cert, err := security.ReadCertificate(cfg.TLS.Certificate); err == nil && cert.Subject.CommonName != "" {
+		user = cert.Subject.CommonName
+	}
+	if user == "" && cfg.ServerAddress == "" {
+		return ""
+	}
+	return user + "@" + cfg.ServerAddress
+}
+
+func identityStageStatusText(stage identityInitStage) string {
+	switch stage {
+	case identityStageTLS:
+		return "TLS 证书初始化失败"
+	case identityStageQueue:
+		return "队列初始化失败"
+	default:
+		return "身份配置加载失败"
+	}
+}
+
+func isMissingIdentityErr(err error) bool {
+	return errors.Is(err, identity.ErrNotFound) || errors.Is(err, os.ErrNotExist)
+}
+
 func openIdentityStack(cfg config.Client, customLabel string) identityActivatedMsg {
+	label := identityDisplayLabel(cfg, customLabel)
+	if _, err := security.ClientTLS(cfg); err != nil {
+		return identityActivatedMsg{
+			cfg:    cfg,
+			hasCfg: true,
+			label:  label,
+			stage:  identityStageTLS,
+			err:    fmt.Errorf("TLS 证书初始化失败：%w", err),
+		}
+	}
 	idKey, err := security.ClientIdentityKey(cfg)
 	if err != nil {
-		return identityActivatedMsg{err: err}
+		return identityActivatedMsg{
+			cfg:    cfg,
+			hasCfg: true,
+			label:  label,
+			stage:  identityStageTLS,
+			err:    fmt.Errorf("TLS 证书初始化失败：%w", err),
+		}
 	}
 	mgr, err := queue.Open(queue.Config{
 		StateDir:     cfg.StateDir,
@@ -411,21 +472,20 @@ func openIdentityStack(cfg config.Client, customLabel string) identityActivatedM
 		MaxStreams:   cfg.Limits.MaxStreams,
 	})
 	if err != nil {
-		return identityActivatedMsg{err: err}
+		return identityActivatedMsg{
+			cfg:    cfg,
+			hasCfg: true,
+			label:  label,
+			stage:  identityStageQueue,
+			err:    fmt.Errorf("队列初始化失败：%w", err),
+		}
 	}
 	runner := transfer.NewQueueRunner(cfg, mgr)
 	mgr.SetRunner(runner.Run)
 
-	label := customLabel
-	if label == "" {
-		user := cfg.ServerName
-		if cert, err := security.ReadCertificate(cfg.TLS.Certificate); err == nil && cert.Subject.CommonName != "" {
-			user = cert.Subject.CommonName
-		}
-		label = user + "@" + cfg.ServerAddress
-	}
 	return identityActivatedMsg{
 		cfg:     cfg,
+		hasCfg:  true,
 		label:   label,
 		idKey:   idKey,
 		manager: mgr,
@@ -525,10 +585,10 @@ func (m *model) discoverOrActivatePathCmd(customPath string, confirmSingle bool)
 		wd, _ := os.Getwd()
 		candidates, discErr := identity.Discover(exeDir, wd, customPath)
 		if discErr != nil {
-			return identityActivatedMsg{err: discErr}
+			return identityActivatedMsg{stage: identityStageLookup, err: discErr}
 		}
 		if len(candidates) == 0 {
-			return identityActivatedMsg{err: fmt.Errorf("目录中未找到有效的客户端配置：%s", customPath)}
+			return identityActivatedMsg{stage: identityStageLookup, err: fmt.Errorf("目录中未找到有效的客户端配置：%s", customPath)}
 		}
 		if len(candidates) > 1 || confirmSingle {
 			var found []identityChoice
@@ -538,7 +598,7 @@ func (m *model) discoverOrActivatePathCmd(customPath string, confirmSingle bool)
 				}
 			}
 			if len(found) == 0 {
-				return identityActivatedMsg{err: fmt.Errorf("目录中的客户端配置均无法解析：%s", customPath)}
+				return identityActivatedMsg{stage: identityStageLookup, err: fmt.Errorf("目录中的客户端配置均无法解析：%s", customPath)}
 			}
 			return identityDirDiscoveredMsg{dir: customPath, choices: found}
 		}
@@ -584,40 +644,46 @@ func (m *model) activateChoiceCmd(ch identityChoice, customPath string) tea.Cmd 
 		case customPath != "":
 			info, statErr := os.Stat(customPath)
 			if statErr != nil {
-				return identityActivatedMsg{err: statErr}
+				return identityActivatedMsg{stage: identityStageLookup, err: statErr}
 			}
 			target := customPath
 			if info.IsDir() {
 				candidates, discErr := identity.Discover(exeDir, wd, customPath)
 				if discErr != nil {
-					return identityActivatedMsg{err: discErr}
+					return identityActivatedMsg{stage: identityStageLookup, err: discErr}
 				}
 				if len(candidates) == 0 {
-					return identityActivatedMsg{err: fmt.Errorf("目录中未找到有效的客户端配置：%s", customPath)}
+					return identityActivatedMsg{stage: identityStageLookup, err: fmt.Errorf("目录中未找到有效的客户端配置：%s", customPath)}
 				}
 				if len(candidates) > 1 {
-					return identityActivatedMsg{err: fmt.Errorf("目录中存在多个身份配置（%d 个），请直接指定配置文件路径", len(candidates))}
+					return identityActivatedMsg{stage: identityStageLookup, err: fmt.Errorf("目录中存在多个身份配置（%d 个），请直接指定配置文件路径", len(candidates))}
 				}
 				target = candidates[0]
 			}
 			prof, err = identity.PrepareImport(exeDir, wd, target)
 			if err != nil {
-				return identityActivatedMsg{err: err}
+				return identityActivatedMsg{stage: identityStageLookup, err: err}
 			}
 		case ch.imported:
 			prof = ch.profile
 			if _, err = identity.Preview(prof.Path, wd); err != nil {
-				return identityActivatedMsg{err: err}
+				return identityActivatedMsg{cfg: prof.Config, hasCfg: prof.Label != "", label: prof.Label, stage: identityStageLookup, err: err}
 			}
 			useSel = true
 		default:
 			prof, err = identity.PrepareImport(exeDir, wd, ch.profile.Path)
 			if err != nil {
-				return identityActivatedMsg{err: err}
+				return identityActivatedMsg{stage: identityStageLookup, err: err}
 			}
 		}
 		if _, err = security.ClientTLS(prof.Config); err != nil {
-			return identityActivatedMsg{err: err}
+			return identityActivatedMsg{
+				cfg:    prof.Config,
+				hasCfg: true,
+				label:  prof.Label,
+				stage:  identityStageTLS,
+				err:    fmt.Errorf("TLS 证书初始化失败：%w", err),
+			}
 		}
 
 		// 先完成身份索引与持久化校验，再暂停/关闭旧队列与连接，避免后续失败导致现有队列不可用。
@@ -628,7 +694,13 @@ func (m *model) activateChoiceCmd(ch identityChoice, customPath string) tea.Cmd 
 			cfg, err = identity.SelectPrepared(exeDir, prof, prof.Label)
 		}
 		if err != nil {
-			return identityActivatedMsg{err: err}
+			return identityActivatedMsg{
+				cfg:    prof.Config,
+				hasCfg: true,
+				label:  prof.Label,
+				stage:  identityStageLookup,
+				err:    err,
+			}
 		}
 
 		newIDKey, idErr := security.ClientIdentityKey(cfg)
@@ -649,7 +721,13 @@ func (m *model) activateChoiceCmd(ch identityChoice, customPath string) tea.Cmd 
 					if res.manager != nil {
 						_ = res.manager.Close()
 					}
-					return identityActivatedMsg{err: fmt.Errorf("切换身份前暂停当前任务失败：%w", err)}
+					return identityActivatedMsg{
+						cfg:    cfg,
+						hasCfg: true,
+						label:  prof.Label,
+						stage:  identityStageQueue,
+						err:    fmt.Errorf("切换身份前暂停当前任务失败：%w", err),
+					}
 				}
 				_ = oldRunner.Close()
 				_ = oldMgr.Close()
@@ -663,7 +741,13 @@ func (m *model) activateChoiceCmd(ch identityChoice, customPath string) tea.Cmd 
 			err = oldMgr.Quiesce(ctx)
 			cancel()
 			if err != nil {
-				return identityActivatedMsg{err: fmt.Errorf("切换身份前暂停当前任务失败：%w", err)}
+				return identityActivatedMsg{
+					cfg:    cfg,
+					hasCfg: true,
+					label:  prof.Label,
+					stage:  identityStageQueue,
+					err:    fmt.Errorf("切换身份前暂停当前任务失败：%w", err),
+				}
 			}
 			_ = oldRunner.Close()
 			_ = oldMgr.Close()
@@ -822,12 +906,22 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.historyTasks = nil
 			}
 			if m.cfg == nil {
-				firstOpen := m.modal != modalIdentity
 				m.modal = modalIdentity
-				m.connStatus = "需要选择或导入身份"
-				if firstOpen {
+				if msg.stage == identityStageLookup && isMissingIdentityErr(msg.err) {
+					m.idInitFailedStage = 0
+					m.idInitFailedLabel = ""
+					m.identityLabel = "未选择"
+					m.connStatus = "需要选择或导入身份"
 					m.setToastSticky("未找到已激活身份，请从列表选择或输入配置目录导入")
 				} else {
+					m.idInitFailedStage = msg.stage
+					if msg.hasCfg && msg.label != "" {
+						m.idInitFailedLabel = msg.label
+						m.identityLabel = msg.label + " (未就绪)"
+					} else {
+						m.idInitFailedLabel = ""
+					}
+					m.connStatus = identityStageStatusText(msg.stage)
 					m.setToastSticky(msg.err.Error())
 				}
 				return m, m.scanIdentitiesCmd()
@@ -836,6 +930,8 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		// 释放旧实例仅在替换时安全（通常 activateChoiceCmd 已关闭旧实例；启动期无旧实例）
+		m.idInitFailedStage = 0
+		m.idInitFailedLabel = ""
 		m.cfg = &msg.cfg
 		m.identityLabel = msg.label
 		m.idKey = msg.idKey
