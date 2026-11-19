@@ -1030,3 +1030,78 @@ func TestServerManualRefreshCompletionAndToastAutoExpiry(t *testing.T) {
 		t.Fatalf("expected Esc to clear modal validation error, modal=%v toast=%q", m.modal, m.statusToast)
 	}
 }
+
+func TestServerRuntimeMonitorCardAdaptivelyFillsPanelWidth(t *testing.T) {
+	cfg := config.DefaultServer()
+	cfg.Listen = "127.0.0.1:7443"
+	cfg.StorageRoot = "/tmp/sftd-storage"
+	m := newServerModel(ServerOptions{ExecutableDir: t.TempDir(), ConfigPath: "configs/server.local.json", Page: 0})
+	m.loaded = true
+	m.cfg = cfg
+	m.runtime = &monitor.Snapshot{
+		State:          "running",
+		Listen:         cfg.Listen,
+		Started:        time.Now().Add(-5 * time.Minute),
+		StorageAt:      time.Now(),
+		OnlineUsers:    2,
+		Connections:    3,
+		ActiveTasks:    1,
+		PublishedFiles: 12,
+		PublishedBytes: 4 << 20,
+		ReceiveRate:    1_500_000,
+		SendRate:       2_400_000,
+		Received:       30 << 20,
+		Sent:           45 << 20,
+		Completed:      9,
+		Failed:         1,
+	}
+	for i := 0; i < 40; i++ {
+		m.trend = append(m.trend, [2]float64{float64((i%8)+1) * 1e5, float64(((i+3)%8)+1) * 1e5})
+	}
+
+	for _, dims := range [][2]int{{52, 14}, {80, 24}, {120, 34}, {160, 40}} {
+		w, h := dims[0], dims[1]
+		m.Update(tea.WindowSizeMsg{Width: w, Height: h})
+		view := ansi.Strip(m.View())
+		if gotH := lipgloss.Height(view); gotH > h {
+			t.Fatalf("%dx%d view exceeded height: %d > %d\n%s", w, h, gotH, h, view)
+		}
+		for i, ln := range strings.Split(view, "\n") {
+			if gotW := lipgloss.Width(ln); gotW > w {
+				t.Fatalf("%dx%d line %d exceeded width: %d > %d: %q", w, h, i+1, gotW, w, ln)
+			}
+		}
+
+		// 验证“上传趋势”与“下载趋势”均随卡片内宽自适应填满，不在右侧留出大片空白
+		rightW := w
+		if stacked, _, _, _ := overviewLayout(w, h-3); !stacked {
+			rightW = w - w/2
+		}
+		card := ansi.Strip(m.renderRuntimeMonitorCard(rightW, 11))
+		for _, ln := range strings.Split(card, "\n") {
+			if strings.Contains(ln, "上传趋势：") || strings.Contains(ln, "上传：") {
+				trimmed := strings.TrimSpace(strings.Trim(ln, "│ "))
+				wantInner := max(16, rightW-4)
+				if got := lipgloss.Width(trimmed); got != wantInner {
+					t.Fatalf("%dx%d sparkline row did not fill card inner width: got=%d want=%d line=%q", w, h, got, wantInner, ln)
+				}
+			}
+		}
+		if w >= 80 {
+			for _, token := range []string{"实时运行监控", "运行中", "已发布", "成功 9", "上传趋势", "下载趋势"} {
+				if !strings.Contains(view, token) {
+					t.Fatalf("%dx%d overview missing %q:\n%s", w, h, token, view)
+				}
+			}
+		}
+	}
+
+	// 验证离线状态下标题与引导信息同样适配宽度且不换行
+	m.runtime = nil
+	m.runtimeState = "服务未运行（离线）"
+	m.Update(tea.WindowSizeMsg{Width: 120, Height: 34})
+	offlineView := ansi.Strip(m.View())
+	if !strings.Contains(offlineView, "○ 离线") || !strings.Contains(offlineView, "监听：127.0.0.1:7443") {
+		t.Fatalf("expected offline monitor card to show right-aligned status and listen hint:\n%s", offlineView)
+	}
+}

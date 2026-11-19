@@ -105,6 +105,7 @@ type serverModel struct {
 	runtimeState string
 	runtime      *monitor.Snapshot
 	trend        [][2]float64
+	trendStarted time.Time
 
 	// 日志状态
 	logQuery     monitor.LogQuery
@@ -523,9 +524,13 @@ func (m *serverModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.runtime = msg.snap
 		m.runtimeState = msg.runtimeState
 		if msg.snap != nil {
+			if !m.trendStarted.IsZero() && !m.trendStarted.Equal(msg.snap.Started) {
+				m.trend = nil
+			}
+			m.trendStarted = msg.snap.Started
 			m.trend = append(m.trend, [2]float64{msg.snap.ReceiveRate, msg.snap.SendRate})
-			if len(m.trend) > 24 {
-				m.trend = m.trend[len(m.trend)-24:]
+			if len(m.trend) > 120 {
+				m.trend = m.trend[len(m.trend)-120:]
 			}
 		}
 		if m.page == 5 && !m.logPaused {

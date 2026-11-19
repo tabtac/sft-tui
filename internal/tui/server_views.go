@@ -410,9 +410,11 @@ func (m *serverModel) renderOverviewPage(bodyH int) string {
 
 	// 左侧：部署配置卡片
 	var cfgLines []string
+	leftBadge := m.th.badgeMuted.Render("读取中")
 	if !m.loaded {
 		cfgLines = append(cfgLines, m.th.badgeMuted.Render("正在读取服务端配置…"))
 	} else if m.cfgErr != nil {
+		leftBadge = m.th.badgeWarn.Render("待初始化")
 		cfgLines = append(cfgLines, m.th.badgeErr.Render("配置读取失败："+sanitizeInline(m.cfgErr.Error())))
 		cfgLines = append(cfgLines, m.th.badgeWarn.Render("可按 [I] 键启动首次部署与证书初始化向导"))
 	} else {
@@ -421,6 +423,11 @@ func (m *serverModel) renderOverviewPage(bodyH int) string {
 			if c.State != "有效" {
 				warnCount++
 			}
+		}
+		if warnCount > 0 {
+			leftBadge = m.th.badgeWarn.Render(fmt.Sprintf("%d 项告警", warnCount))
+		} else {
+			leftBadge = m.th.badgeOk.Render("配置就绪")
 		}
 		cfgLines = append(cfgLines,
 			"配置："+truncPlainCell(m.opts.ConfigPath, max(8, leftInner-6)),
@@ -439,30 +446,17 @@ func (m *serverModel) renderOverviewPage(bodyH int) string {
 			cfgLines = append(cfgLines, m.th.badgeWarn.Render(fmt.Sprintf("⚠ %d 张证书待处理，按 [4] 查看", warnCount)))
 		}
 	}
-	leftCard := renderPanelBox(m.th, m.th.hintKey.Render("部署环境"), cfgLines, true, leftW, topH)
-
-	// 右侧：流量与存储实时指标卡片
-	var statLines []string
-	if m.runtime == nil {
-		statLines = append(statLines,
-			m.th.badgeMuted.Render(sanitizeInline(m.runtimeState)),
-			"",
-			"按 [s] 后台启动 sftd 后可实时监控连接与流量。",
-		)
-	} else {
-		r := m.runtime
-		statLines = append(statLines,
-			fmt.Sprintf("已发布：%d 个 (%s)", r.PublishedFiles, progress.FormatBytes(r.PublishedBytes)),
-			fmt.Sprintf("吞吐：入 %s  出 %s",
-				m.th.badgeOk.Render(progress.FormatRate(r.ReceiveRate)),
-				m.th.hintKey.Render(progress.FormatRate(r.SendRate))),
-			fmt.Sprintf("累计：入 %s 出 %s · 成功%d/失败%d",
-				progress.FormatBytes(r.Received), progress.FormatBytes(r.Sent), r.Completed, r.Failed),
-			"上传趋势："+m.th.badgeOk.Render(sparklineString(m.trend, 0)),
-			"下载趋势："+m.th.hintKey.Render(sparklineString(m.trend, 1)),
-		)
+	for i := range cfgLines {
+		cfgLines[i] = truncCell(cfgLines[i], leftInner)
 	}
-	rightCard := renderPanelBox(m.th, m.th.hintKey.Render("实时运行监控"), statLines, true, rightW, topH)
+	leftTitle := m.th.hintKey.Render("部署环境")
+	if leftInner >= 26 {
+		leftTitle = spreadRow(leftTitle, leftBadge, leftInner)
+	}
+	leftCard := renderPanelBox(m.th, leftTitle, cfgLines, true, leftW, topH)
+
+	// 右侧：自适应全宽实时运行监控卡片
+	rightCard := m.renderRuntimeMonitorCard(rightW, topH)
 	topArea := lipgloss.JoinHorizontal(lipgloss.Top, leftCard, rightCard)
 	if stacked {
 		topArea = lipgloss.JoinVertical(lipgloss.Left, leftCard, rightCard)
@@ -497,24 +491,188 @@ func (m *serverModel) renderOverviewPage(bodyH int) string {
 	return lipgloss.JoinVertical(lipgloss.Left, topArea, botCard)
 }
 
-func sparklineString(samples [][2]float64, dir int) string {
+func (m *serverModel) renderRuntimeMonitorCard(outerW, outerH int) string {
+	innerW := max(16, outerW-4)
+	dataH := max(1, outerH-3)
+
+	var rtBadge string
+	if m.runtime != nil {
+		uptime := time.Since(m.runtime.Started).Round(time.Second)
+		switch m.runtime.State {
+		case "running":
+			rtBadge = m.th.badgeOk.Render("● 运行中") + m.th.badgeMuted.Render(" · "+uptime.String())
+		case "draining":
+			rtBadge = m.th.badgeWarn.Render("◐ 排空停服") + m.th.badgeMuted.Render(" · "+uptime.String())
+		default:
+			rtBadge = m.th.badgeErr.Render("✕ " + sanitizeInline(m.runtime.State))
+		}
+	} else if strings.Contains(m.runtimeState, "异常") {
+		rtBadge = m.th.badgeErr.Render("✕ 异常")
+	} else {
+		rtBadge = m.th.badgeMuted.Render("○ 离线")
+	}
+
+	title := m.th.hintKey.Render("实时运行监控")
+	if innerW >= 26 {
+		title = spreadRow(title, rtBadge, innerW)
+	}
+
+	var statLines []string
+	if m.runtime == nil {
+		listenHint := sanitizeInline(m.cfg.Listen)
+		if listenHint == "" {
+			listenHint = "未配置"
+		}
+		if innerW >= 42 {
+			statLines = append(statLines,
+				spreadRow(m.th.badgeMuted.Render(sanitizeInline(m.runtimeState)), m.th.badgeMuted.Render("监听："+listenHint), innerW),
+			)
+		} else {
+			statLines = append(statLines, truncCell(m.th.badgeMuted.Render(sanitizeInline(m.runtimeState)), innerW))
+		}
+		if dataH >= 4 {
+			statLines = append(statLines, "")
+		}
+		statLines = append(statLines, truncCell("按 [s] 后台启动 sftd 后可实时监控连接与流量。", innerW))
+		if dataH >= 5 && m.cfgErr == nil {
+			statLines = append(statLines, truncCell(m.th.badgeMuted.Render("运行后将自适应全宽展示吞吐速率、趋势曲线与存储统计。"), innerW))
+		}
+		return renderPanelBox(m.th, title, statLines, true, outerW, outerH)
+	}
+
+	r := m.runtime
+	pubText := fmt.Sprintf("已发布：%d 个 (%s)", r.PublishedFiles, progress.FormatBytes(r.PublishedBytes))
+	sampleText := m.th.badgeMuted.Render("采样：等待首次")
+	if r.StorageError != "" {
+		sampleText = m.th.badgeWarn.Render("采样异常")
+	} else if !r.StorageAt.IsZero() {
+		sampleText = m.th.badgeMuted.Render("采样：" + r.StorageAt.Local().Format("15:04:05"))
+	}
+	inRateVal := m.th.badgeOk.Render(progress.FormatRate(r.ReceiveRate))
+	outRateVal := m.th.hintKey.Render(progress.FormatRate(r.SendRate))
+	sparkRow := func(prefix string, dir int, style lipgloss.Style) string {
+		barW := max(6, innerW-lipgloss.Width(prefix))
+		return truncCell(prefix+renderSparkline(m.th, m.trend, dir, barW, style), innerW)
+	}
+
+	switch {
+	case innerW < 42:
+		statLines = append(statLines,
+			truncCell(pubText, innerW),
+			truncCell("吞吐：入 "+inRateVal+"  出 "+outRateVal, innerW),
+			truncCell(fmt.Sprintf("累计：%s / %s", progress.FormatBytes(r.Received), progress.FormatBytes(r.Sent)), innerW),
+		)
+		if dataH >= 4 {
+			statLines = append(statLines, sparkRow("上传：", 0, m.th.badgeOk))
+		}
+		if dataH >= 5 {
+			statLines = append(statLines, sparkRow("下载：", 1, m.th.hintKey))
+		}
+
+	case dataH >= 7:
+		connText := fmt.Sprintf("在线:%d  连接:%d  活动:%d", r.OnlineUsers, r.Connections, r.ActiveTasks)
+		inRate := "入站：" + inRateVal
+		outRate := "出站：" + outRateVal
+		inTotal := "累计入：" + progress.FormatBytes(r.Received)
+		outTotal := "累计出：" + progress.FormatBytes(r.Sent)
+		taskText := fmt.Sprintf("成功 %d · 失败 %d", r.Completed, r.Failed)
+		if innerW >= 54 {
+			connText = fmt.Sprintf("连接概况：在线 %d · 连接 %d · 活动 %d", r.OnlineUsers, r.Connections, r.ActiveTasks)
+			inRate = "实时入站(上传)：" + inRateVal
+			outRate = "实时出站(下载)：" + outRateVal
+			inTotal = "累计入站：" + progress.FormatBytes(r.Received)
+			outTotal = "累计出站：" + progress.FormatBytes(r.Sent)
+			taskText = fmt.Sprintf("任务：成功 %d · 失败 %d", r.Completed, r.Failed)
+		}
+		sepRow := lipgloss.NewStyle().Foreground(m.th.border).Render(strings.Repeat("─", innerW))
+		if r.State != "running" && !r.DrainStarted.IsZero() {
+			sepRow = m.th.badgeWarn.Render(truncPlainCell(fmt.Sprintf("正在排空停服（已等待 %s · 剩余任务 %d）", time.Since(r.DrainStarted).Round(time.Second), r.ActiveTasks), innerW))
+		} else if r.StorageError != "" {
+			sepRow = m.th.badgeWarn.Render(truncPlainCell("存储采样异常："+r.StorageError, innerW))
+		}
+		statLines = append(statLines,
+			spreadRow(connText, sampleText, innerW),
+			spreadRow(pubText, taskText, innerW),
+			spreadRow(inRate, outRate, innerW),
+			spreadRow(inTotal, outTotal, innerW),
+			sepRow,
+			sparkRow("上传趋势：", 0, m.th.badgeOk),
+			sparkRow("下载趋势：", 1, m.th.hintKey),
+		)
+
+	default:
+		connText := fmt.Sprintf("在线:%d  连接:%d  活动:%d", r.OnlineUsers, r.Connections, r.ActiveTasks)
+		if innerW >= 66 {
+			connText += " · " + sampleText
+		}
+		statLines = append(statLines,
+			spreadRow(connText, pubText, innerW),
+			spreadRow("实时入站(上传)："+inRateVal, "实时出站(下载)："+outRateVal, innerW),
+			spreadRow(fmt.Sprintf("累计：入 %s / 出 %s", progress.FormatBytes(r.Received), progress.FormatBytes(r.Sent)),
+				fmt.Sprintf("任务：成功 %d · 失败 %d", r.Completed, r.Failed), innerW),
+			sparkRow("上传趋势：", 0, m.th.badgeOk),
+			sparkRow("下载趋势：", 1, m.th.hintKey),
+		)
+	}
+	return renderPanelBox(m.th, title, statLines, true, outerW, outerH)
+}
+
+func spreadRow(left, right string, innerW int) string {
+	if innerW <= 0 {
+		return ""
+	}
+	if right == "" {
+		return truncCell(left, innerW)
+	}
+	if left == "" {
+		return truncCell(right, innerW)
+	}
+	lw := lipgloss.Width(left)
+	rw := lipgloss.Width(right)
+	if lw+2+rw <= innerW {
+		return left + strings.Repeat(" ", innerW-lw-rw) + right
+	}
+	if lw+1+rw <= innerW {
+		return left + " " + right
+	}
+	if rw < innerW-4 {
+		return truncCell(left, innerW-1-rw) + " " + right
+	}
+	return truncCell(left+" "+right, innerW)
+}
+
+func renderSparkline(th theme, samples [][2]float64, dir, width int, barStyle lipgloss.Style) string {
+	if width <= 0 {
+		return ""
+	}
 	if len(samples) == 0 {
-		return "—"
+		return th.badgeMuted.Render(strings.Repeat("·", width))
+	}
+	if len(samples) > width {
+		samples = samples[len(samples)-width:]
 	}
 	bars := []rune("▁▂▃▄▅▆▇█")
-	maxVal := 1.0
+	peak := 0.0
 	for _, s := range samples {
-		if s[dir] > maxVal {
-			maxVal = s[dir]
+		if s[dir] > peak {
+			peak = s[dir]
 		}
 	}
 	var b strings.Builder
 	for _, s := range samples {
-		idx := int((s[dir] / maxVal) * float64(len(bars)-1))
+		if peak <= 0 || s[dir] <= 0 {
+			b.WriteRune(bars[0])
+			continue
+		}
+		idx := int((s[dir] / peak) * float64(len(bars)-1))
 		idx = max(0, min(len(bars)-1, idx))
 		b.WriteRune(bars[idx])
 	}
-	return b.String()
+	pad := width - len(samples)
+	if pad > 0 {
+		return th.badgeMuted.Render(strings.Repeat("·", pad)) + barStyle.Render(b.String())
+	}
+	return barStyle.Render(b.String())
 }
 
 func (m *serverModel) renderUsersPage(bodyH int) string {
