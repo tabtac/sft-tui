@@ -86,7 +86,7 @@ func (m *serverModel) openDeployStep(step int) {
 	case 1:
 		m.addNoteRow([]string{
 			"第 1 步 / 4：本机演示使用回环地址；局域网部署选择网卡 IP 或填写实际 DNS，",
-			"监听地址、证书 SAN 和客户端连接地址会自动联动。目标配置：" + truncCell(w.d.Config, 50),
+			"监听地址、证书 SAN 和客户端连接地址会自动联动。目标配置：" + truncPlainCell(w.d.Config, 50),
 		}, false)
 		nicOpts := []string{"手动输入 DNS/IP"}
 		nicOpts = append(nicOpts, w.addresses...)
@@ -190,7 +190,7 @@ func (m *serverModel) openDeployStep(step int) {
 	case 2:
 		m.addNoteRow([]string{
 			"第 2 步 / 4：配置服务端文件根目录；默认使用独立子目录，确认时转为绝对路径。",
-			"目标配置：" + truncCell(w.d.Config, 56),
+			"目标配置：" + truncPlainCell(w.d.Config, 56),
 		}, false)
 		stIdx := m.addTextRow("文件存储根目录", w.d.Storage)
 		capture2 := func() {

@@ -53,21 +53,21 @@ func (m *serverModel) renderHeader() string {
 	brand := m.th.badgeApp.Render(" SFTD-UI ")
 
 	stBadge := m.th.badgeMuted.Render("○ 离线")
-	listenStr := m.cfg.Listen
+	listenStr := sanitizeInline(m.cfg.Listen)
 	if listenStr == "" {
 		listenStr = "—"
 	}
 	rightFull := "等待连接本机服务"
 	rightShort := "待连接"
 	if m.runtime != nil {
-		listenStr = m.runtime.Listen
+		listenStr = sanitizeInline(m.runtime.Listen)
 		switch m.runtime.State {
 		case "running":
 			stBadge = m.th.badgeOk.Render("● 运行中")
 		case "draining":
 			stBadge = m.th.badgeWarn.Render("◐ 排空停服")
 		default:
-			stBadge = m.th.badgeErr.Render("✕ " + m.runtime.State)
+			stBadge = m.th.badgeErr.Render("✕ " + sanitizeInline(m.runtime.State))
 		}
 		uptime := time.Since(m.runtime.Started).Round(time.Second)
 		rightFull = fmt.Sprintf("在线:%d  连接:%d  活动:%d  ↑%s ↓%s  运行 %s",
@@ -77,7 +77,7 @@ func (m *serverModel) renderHeader() string {
 			m.runtime.OnlineUsers,
 			progress.FormatRate(m.runtime.ReceiveRate), progress.FormatRate(m.runtime.SendRate))
 	} else if strings.Contains(m.runtimeState, "异常") {
-		stBadge = m.th.badgeErr.Render("✕ " + truncCell(m.runtimeState, 24))
+		stBadge = m.th.badgeErr.Render("✕ " + truncPlainCell(m.runtimeState, 24))
 	}
 
 	addrBadge := m.th.badgeID.Render(" " + listenStr + " ")
@@ -88,7 +88,7 @@ func (m *serverModel) renderHeader() string {
 		if lipgloss.Width(rightShort) <= avail {
 			rightInfo = rightShort
 		} else if avail >= 6 {
-			rightInfo = truncCell(rightShort, avail)
+			rightInfo = truncPlainCell(rightShort, avail)
 		} else {
 			rightInfo = ""
 		}
@@ -129,7 +129,7 @@ func (m *serverModel) renderTabBar() string {
 		}
 		row += "   " + formatBusyBadge(m.th, m.busySpin, op, m.busyStart)
 	} else if m.statusToast != "" && avail >= 6 {
-		row += "   " + m.th.toast.Render("· "+truncCell(m.statusToast, avail-2))
+		row += "   " + m.th.toast.Render("· "+truncPlainCell(m.statusToast, avail-2))
 	}
 	return lipgloss.NewStyle().Padding(0, 1).Width(m.width).Render(truncCell(row, m.width-2))
 }
@@ -142,7 +142,7 @@ func (m *serverModel) renderFooter() string {
 		} else if m.queryMode == "log-file" {
 			hint = "日志文件名过滤：输入文件名片段 · Enter 应用 · Esc 清空"
 		}
-		return m.th.footerBar.Width(m.width).Render(truncCell(hint, max(1, m.width-2)))
+		return m.th.footerBar.Width(m.width).Render(truncPlainCell(hint, max(1, m.width-2)))
 	}
 	busyReason := ""
 	if m.busy {
@@ -413,7 +413,7 @@ func (m *serverModel) renderOverviewPage(bodyH int) string {
 	if !m.loaded {
 		cfgLines = append(cfgLines, m.th.badgeMuted.Render("正在读取服务端配置…"))
 	} else if m.cfgErr != nil {
-		cfgLines = append(cfgLines, m.th.badgeErr.Render("配置读取失败："+m.cfgErr.Error()))
+		cfgLines = append(cfgLines, m.th.badgeErr.Render("配置读取失败："+sanitizeInline(m.cfgErr.Error())))
 		cfgLines = append(cfgLines, m.th.badgeWarn.Render("可按 [I] 键启动首次部署与证书初始化向导"))
 	} else {
 		warnCount := 0
@@ -423,8 +423,8 @@ func (m *serverModel) renderOverviewPage(bodyH int) string {
 			}
 		}
 		cfgLines = append(cfgLines,
-			"配置："+truncCell(m.opts.ConfigPath, max(8, leftInner-6)),
-			"存储："+truncCell(m.cfg.StorageRoot, max(8, leftInner-6)),
+			"配置："+truncPlainCell(m.opts.ConfigPath, max(8, leftInner-6)),
+			"存储："+truncPlainCell(m.cfg.StorageRoot, max(8, leftInner-6)),
 			fmt.Sprintf("用户：%d 个 · 限额 ↑%s ↓%s",
 				len(m.cfg.AuthorizedClients),
 				progress.FormatRate(float64(m.cfg.Bandwidth.UploadBytesPerSecond)),
@@ -445,7 +445,7 @@ func (m *serverModel) renderOverviewPage(bodyH int) string {
 	var statLines []string
 	if m.runtime == nil {
 		statLines = append(statLines,
-			m.th.badgeMuted.Render(m.runtimeState),
+			m.th.badgeMuted.Render(sanitizeInline(m.runtimeState)),
 			"",
 			"按 [s] 后台启动 sftd 后可实时监控连接与流量。",
 		)
@@ -484,7 +484,7 @@ func (m *serverModel) renderOverviewPage(bodyH int) string {
 				mark = "▶ "
 			}
 			line := fmt.Sprintf("%s#%-4d  %s  %s  在线 %s",
-				mark, p.ID, padRightCell(p.User, min(16, max(8, innerW/5))), padRightCell(p.Remote, min(24, max(12, innerW/3))),
+				mark, p.ID, padPlainRightCell(p.User, min(16, max(8, innerW/5))), padPlainRightCell(p.Remote, min(24, max(12, innerW/3))),
 				time.Since(p.Since).Round(time.Second))
 			if i == m.cursors[0] {
 				peerLines = append(peerLines, m.th.rowCursor.Render(padRightCell(line, innerW)))
@@ -567,7 +567,7 @@ func (m *serverModel) renderUsersPage(bodyH int) string {
 				bwW = max(10, innerW-userW-permW-26)
 			}
 			row := fmt.Sprintf("%s%s  %s  %s  %s  证书:%s",
-				mark, padRightCell(u.UserID, userW), st, padRightCell(perms, permW), padRightCell(bwStr, bwW), certSt)
+				mark, padPlainRightCell(u.UserID, userW), st, padPlainRightCell(perms, permW), padPlainRightCell(bwStr, bwW), sanitizeInline(certSt))
 			if i == m.cursors[1] {
 				lines = append(lines, m.th.rowCursor.Render(padRightCell(row, innerW)))
 			} else {
@@ -600,8 +600,8 @@ func (m *serverModel) renderTransfersPage(bodyH int) string {
 				mark = "▶ "
 			}
 			row := fmt.Sprintf("%s%s  %s  %s  %s  %s/%s  %s",
-				mark, padRightCell(t.User, userW), padRightCell(t.Direction, 8), padRightCell(t.File, fileW),
-				padRightCell(t.State, 10), progress.FormatBytes(t.Offset), progress.FormatBytes(t.Size),
+				mark, padPlainRightCell(t.User, userW), padPlainRightCell(t.Direction, 8), padPlainRightCell(t.File, fileW),
+				padPlainRightCell(t.State, 10), progress.FormatBytes(t.Offset), progress.FormatBytes(t.Size),
 				progress.FormatRate(t.Rate))
 			if i == m.cursors[2] {
 				lines = append(lines, m.th.rowCursor.Render(padRightCell(row, innerW)))
@@ -636,20 +636,18 @@ func (m *serverModel) renderCertsPage(bodyH int) string {
 			if i == m.cursors[3] {
 				mark = "▶ "
 			}
-			st := m.th.badgeOk.Render("✔ " + c.State)
+			stateText := sanitizeInline(c.State)
+			st := m.th.badgeOk.Render("✔ " + stateText)
 			if c.State != "有效" {
-				st = m.th.badgeWarn.Render("⚠ " + c.State)
+				st = m.th.badgeWarn.Render("⚠ " + stateText)
 			}
 			fpPart := ""
 			if fpBudget >= 8 {
-				fp := c.Fingerprint
-				if len(fp) > fpBudget {
-					fp = fp[:fpBudget] + "…"
-				}
+				fp := truncPlainCell(c.Fingerprint, fpBudget)
 				fpPart = "  FP:" + fp
 			}
 			row := fmt.Sprintf("%s%s  %s  %s  到期:%s%s",
-				mark, padRightCell(c.Name, nameW), padRightCell(c.Role, roleW), st, padRightCell(c.Expiry, 16), fpPart)
+				mark, padPlainRightCell(c.Name, nameW), padPlainRightCell(c.Role, roleW), st, padPlainRightCell(c.Expiry, 16), fpPart)
 			if i == m.cursors[3] {
 				lines = append(lines, m.th.rowCursor.Render(padRightCell(row, innerW)))
 			} else {
@@ -679,6 +677,9 @@ func formatTLSSummary(tls config.TLSFiles) string {
 }
 
 func (m *serverModel) settingsFieldLine(label, saved, runtime string, hasRuntime, hotReloadable, differ bool) string {
+	label = sanitizeInline(label)
+	saved = sanitizeInline(saved)
+	runtime = sanitizeInline(runtime)
 	mode := m.th.badgeMuted.Render("[需重启]")
 	if hotReloadable {
 		mode = m.th.badgeID.Render("[可热更]")
@@ -784,7 +785,7 @@ func (m *serverModel) renderSettingsPage(bodyH int) string {
 	visRows := max(1, bodyH-3)
 	var lines []string
 	if m.cfgErr != nil {
-		lines = append(lines, m.th.badgeErr.Render("加载配置失败："+m.cfgErr.Error()))
+		lines = append(lines, m.th.badgeErr.Render("加载配置失败："+sanitizeInline(m.cfgErr.Error())))
 		lines = append(lines, m.th.badgeWarn.Render("可返回 [1 概览] 按 [I] 启动初始化向导"))
 	} else {
 		all := m.settingsLines()
@@ -806,16 +807,16 @@ func (m *serverModel) renderLogsPage(bodyH int) string {
 	innerW := max(20, m.width-4)
 	var filterChips []string
 	if m.logMinLevel != "" {
-		filterChips = append(filterChips, "等级>="+m.logMinLevel)
+		filterChips = append(filterChips, "等级>="+sanitizeInline(m.logMinLevel))
 	}
 	if m.logQuery.User != "" {
-		filterChips = append(filterChips, "用户:"+m.logQuery.User)
+		filterChips = append(filterChips, "用户:"+sanitizeInline(m.logQuery.User))
 	}
 	if m.logQuery.File != "" {
-		filterChips = append(filterChips, "文件:"+m.logQuery.File)
+		filterChips = append(filterChips, "文件:"+sanitizeInline(m.logQuery.File))
 	}
 	if m.logQuery.Text != "" {
-		filterChips = append(filterChips, "文本:"+m.logQuery.Text)
+		filterChips = append(filterChips, "文本:"+sanitizeInline(m.logQuery.Text))
 	}
 	if m.logSinceIdx != 0 {
 		filterChips = append(filterChips, "时段:"+logSinceLabel(m.logSinceIdx))
@@ -838,12 +839,12 @@ func (m *serverModel) renderLogsPage(bodyH int) string {
 
 	var lines []string
 	if len(filterChips) > 0 {
-		bar := m.th.badgeID.Render(truncCell("筛选: "+strings.Join(filterChips, " · ")+"  ([C] 清空)", innerW))
+		bar := m.th.badgeID.Render(truncPlainCell("筛选: "+strings.Join(filterChips, " · ")+"  ([C] 清空)", innerW))
 		lines = append(lines, bar)
 	}
 	switch {
 	case m.logErr != "":
-		lines = append(lines, m.th.badgeErr.Render("日志拉取错误："+m.logErr))
+		lines = append(lines, m.th.badgeErr.Render("日志拉取错误："+sanitizeInline(m.logErr)))
 	case m.logFallback != "":
 		raw := m.filteredLogFallbackLines()
 		if len(raw) == 0 {
@@ -851,7 +852,7 @@ func (m *serverModel) renderLogsPage(bodyH int) string {
 		} else {
 			start := scrollOffset(m.cursors[5], len(raw), visRows)
 			for i := start; i < min(len(raw), start+visRows); i++ {
-				lines = append(lines, truncCell(sanitizeInline(raw[i]), innerW))
+				lines = append(lines, truncPlainCell(raw[i], innerW))
 			}
 		}
 	case len(m.logEvents) == 0:
@@ -864,7 +865,15 @@ func (m *serverModel) renderLogsPage(bodyH int) string {
 			if i == m.cursors[5] {
 				mark = "▶ "
 			}
-			row := fmt.Sprintf("%s#%d %s [%s] %s %s", mark, e.Sequence, e.Time.Local().Format("15:04:05"), e.Level, sanitizeInline(e.Message), sanitizeInline(e.Detail))
+			levelText := sanitizeInline(e.Level)
+			levelView := "[" + levelText + "]"
+			switch strings.ToUpper(strings.TrimSpace(levelText)) {
+			case "ERROR":
+				levelView = m.th.badgeErr.Render(levelView)
+			case "WARN":
+				levelView = m.th.badgeWarn.Render(levelView)
+			}
+			row := fmt.Sprintf("%s#%d %s %s %s %s", mark, e.Sequence, e.Time.Local().Format("15:04:05"), levelView, sanitizeInline(e.Message), sanitizeInline(e.Detail))
 			if i == m.cursors[5] {
 				lines = append(lines, m.th.rowCursor.Render(truncCell(row, innerW)))
 			} else {

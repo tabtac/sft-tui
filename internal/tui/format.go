@@ -17,15 +17,16 @@ import (
 // sanitizeInline 替换换行符与控制字符为空格，防止日志或异常名称破坏单行渲染或注入转义序列。
 func sanitizeInline(s string) string {
 	return strings.Map(func(r rune) rune {
-		if r < ' ' || r == 0x7f {
+		if r < ' ' || (r >= 0x7f && r <= 0x9f) {
 			return ' '
 		}
 		return r
 	}, s)
 }
 
+// truncCell 按显示宽度截断文本并保留已有合法 ANSI 样式序列。
+// 来自外部文件名、日志或错误信息的未受信任纯文本应先调用 sanitizeInline / truncPlainCell 再着色。
 func truncCell(s string, width int) string {
-	s = sanitizeInline(s)
 	if width <= 0 {
 		return ""
 	}
@@ -33,6 +34,11 @@ func truncCell(s string, width int) string {
 		return s
 	}
 	return ansi.Truncate(s, width, "…")
+}
+
+// truncPlainCell 先清理控制字符，再按显示宽度截断未着色的外部或原始文本。
+func truncPlainCell(s string, width int) string {
+	return truncCell(sanitizeInline(s), width)
 }
 
 func padRightCell(s string, width int) string {
@@ -45,6 +51,10 @@ func padRightCell(s string, width int) string {
 		return s + strings.Repeat(" ", width-w)
 	}
 	return s
+}
+
+func padPlainRightCell(s string, width int) string {
+	return padRightCell(sanitizeInline(s), width)
 }
 
 func padLeftCell(s string, width int) string {
@@ -150,7 +160,7 @@ func formatTaskMetrics(t queue.Task) string {
 		return fmt.Sprintf("%s  %s  ETA %s", sizeStr, progress.FormatRate(t.Speed), formatETA(t.ETA))
 	}
 	if t.Error != "" {
-		return sizeStr + "  ·  " + t.Error
+		return sizeStr + "  ·  " + sanitizeInline(t.Error)
 	}
 	return sizeStr
 }
@@ -162,7 +172,7 @@ func spinnerChar(tick int) string {
 }
 
 func formatBusyBadge(th theme, tick int, label string, started time.Time) string {
-	txt := spinnerChar(tick) + " " + label
+	txt := spinnerChar(tick) + " " + sanitizeInline(label)
 	if !started.IsZero() {
 		if sec := int(time.Since(started).Seconds()); sec >= 1 {
 			txt += fmt.Sprintf(" (%ds)", sec)
@@ -187,11 +197,14 @@ func renderActionFooter(th theme, width int, areaPrefix string, chips []footerCh
 	}
 	items := make([]renderedChip, 0, len(chips))
 	for _, c := range chips {
+		key := sanitizeInline(c.key)
+		label := sanitizeInline(c.label)
+		reason := sanitizeInline(c.reason)
 		var txt string
-		if c.reason != "" {
-			txt = th.badgeMuted.Render(fmt.Sprintf("[%s]%s(%s)", c.key, c.label, c.reason))
+		if reason != "" {
+			txt = th.badgeMuted.Render(fmt.Sprintf("[%s]%s(%s)", key, label, reason))
 		} else {
-			txt = th.hintKey.Render("["+c.key+"]") + th.rowNormal.Render(c.label)
+			txt = th.hintKey.Render("["+key+"]") + th.rowNormal.Render(label)
 		}
 		items = append(items, renderedChip{text: txt, width: lipgloss.Width(txt), essential: c.essential})
 	}
@@ -206,7 +219,7 @@ func renderActionFooter(th theme, width int, areaPrefix string, chips []footerCh
 	var prefixRendered string
 	prefixW := 0
 	if areaPrefix != "" {
-		prefixRendered = th.hintKey.Render(areaPrefix)
+		prefixRendered = th.hintKey.Render(sanitizeInline(areaPrefix))
 		prefixW = lipgloss.Width(prefixRendered)
 	}
 

@@ -1655,8 +1655,8 @@ func (m *model) handleLocalKey(k string) (tea.Model, tea.Cmd) {
 			}
 			m.detailTitle = "本地文件信息"
 			m.detailLines = []string{
-				"名称：" + e.name,
-				"路径：" + e.path,
+				"名称：" + sanitizeInline(e.name),
+				"路径：" + sanitizeInline(e.path),
 				fmt.Sprintf("大小：%s (%d B)", progress.FormatBytes(uint64(max(0, e.size))), e.size),
 				"",
 				"按 u 或 F5 加入上传队列（按 Space 可多选）",
@@ -1708,11 +1708,11 @@ func (m *model) handleRemoteKey(k string) (tea.Model, tea.Cmd) {
 			f := m.visibleRemote[m.remoteCursor]
 			m.detailTitle = "远端文件信息"
 			m.detailLines = []string{
-				"文件名：" + f.FileName,
+				"文件名：" + sanitizeInline(f.FileName),
 				fmt.Sprintf("大小：  %s (%d B)", progress.FormatBytes(f.Size), f.Size),
 				fmt.Sprintf("SHA-256：%x", f.SHA256),
 				"",
-				"按 d 或 F5 下载至当前本地目录（" + m.localDir + "）",
+				"按 d 或 F5 下载至当前本地目录（" + sanitizeInline(m.localDir) + "）",
 			}
 			m.infoScroll = 0
 			m.modal = modalDetail
@@ -2008,7 +2008,7 @@ func (m *model) batchSummaryModalData() (title string, lines []string, footer st
 	if len(b.FailedList) > 0 {
 		lines = append(lines, "", m.th.badgeErr.Render(fmt.Sprintf("失败项清单 (%d 项，按 [R] 一键重试)：", len(b.FailedList))))
 		for _, item := range b.FailedList {
-			lines = append(lines, fmt.Sprintf("  • %s %s — %s", directionIcon(item.Direction), item.Remote, item.Error))
+			lines = append(lines, fmt.Sprintf("  • %s %s — %s", directionIcon(item.Direction), sanitizeInline(item.Remote), sanitizeInline(item.Error)))
 		}
 	} else {
 		lines = append(lines, "", m.th.badgeOk.Render("✔ 本批无失败项"))

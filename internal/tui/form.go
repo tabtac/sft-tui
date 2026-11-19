@@ -242,9 +242,13 @@ func (f *formState) addToggleRow(label string, checked bool, onToggle func(bool)
 }
 
 func (f *formState) addNoteRow(lines []string, accent bool) {
+	cleaned := make([]string, len(lines))
+	for i, ln := range lines {
+		cleaned[i] = sanitizeInline(ln)
+	}
 	f.formRows = append(f.formRows, formRow{
 		kind:       formRowNote,
-		lines:      lines,
+		lines:      cleaned,
 		noteAccent: accent,
 	})
 }
@@ -674,7 +678,7 @@ func (m *serverModel) formRowBaseHeight(r formRow, innerW int) int {
 }
 
 func (m *serverModel) modalFormNoticeLines(innerW int) []string {
-	toast := strings.TrimSpace(m.statusToast)
+	toast := sanitizeInline(strings.TrimSpace(m.statusToast))
 	if toast == "" {
 		return nil
 	}
@@ -828,7 +832,7 @@ func (m *serverModel) renderDropdownPopup(opts []string, innerW, maxH int) []dro
 			mark = "▶ "
 			st = m.th.rowCursor
 		}
-		text := padRightCell(mark+truncCell(opts[idx], max(4, maxW-2)), maxW)
+		text := padPlainRightCell(mark+truncPlainCell(opts[idx], max(4, maxW-2)), maxW)
 		out = append(out, dropdownLine{
 			text:   "    " + st.Render(text),
 			optIdx: idx,
@@ -919,12 +923,12 @@ func (m *serverModel) buildFormViewAndHits(innerW int) ([]string, string, []form
 
 		case formRowSelect:
 			sf := m.formSelects[r.selectIdx]
-			lines = append(lines, prefix+m.th.hintKey.Render(truncCell(r.label, max(8, innerW-2))))
+			lines = append(lines, prefix+m.th.hintKey.Render(truncPlainCell(r.label, max(8, innerW-2))))
 			cur := ""
 			if sf.selected >= 0 && sf.selected < len(sf.options) {
 				cur = sf.options[sf.selected]
 			}
-			box := fmt.Sprintf("[ %s ▼ ]", truncCell(cur, max(8, innerW-12)))
+			box := fmt.Sprintf("[ %s ▼ ]", truncPlainCell(cur, max(8, innerW-12)))
 			if focused {
 				lines = append(lines, "  "+m.th.tabActive.Render(box))
 			} else {
@@ -947,7 +951,7 @@ func (m *serverModel) buildFormViewAndHits(innerW int) ([]string, string, []form
 			if focused {
 				st = m.th.rowCursor
 			}
-			rowStr := truncCell(fmt.Sprintf("%s%s %s", prefix, box, r.label), innerW)
+			rowStr := truncPlainCell(fmt.Sprintf("%s%s %s", prefix, box, r.label), innerW)
 			lines = append(lines, st.Render(rowStr))
 			hits = append(hits, formHitBox{y0: yStart, y1: len(lines), x0: 0, x1: innerW, kind: hitFormRow, row: i})
 		}

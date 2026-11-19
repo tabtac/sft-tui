@@ -707,8 +707,8 @@ func (m *serverModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.detailTitle = "连接详情"
 				m.detailLines = []string{
 					fmt.Sprintf("连接 ID： %d", p.ID),
-					fmt.Sprintf("授权用户：%s", p.User),
-					fmt.Sprintf("远端地址：%s", p.Remote),
+					fmt.Sprintf("授权用户：%s", sanitizeInline(p.User)),
+					fmt.Sprintf("远端地址：%s", sanitizeInline(p.Remote)),
 					fmt.Sprintf("建立时间：%s", p.Since.Local().Format("2006-01-02 15:04:05")),
 				}
 				m.infoScroll = 0
@@ -785,13 +785,13 @@ func (m *serverModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.detailTitle = "服务端传输任务详情"
 				m.detailLines = []string{
 					fmt.Sprintf("任务 / 连接：%d  (连接 #%d · 流 #%d)", t.ID, t.Connection, t.Stream),
-					fmt.Sprintf("用户与方向：%s · %s", t.User, t.Direction),
-					fmt.Sprintf("文件名：    %s", t.File),
+					fmt.Sprintf("用户与方向：%s · %s", sanitizeInline(t.User), sanitizeInline(t.Direction)),
+					fmt.Sprintf("文件名：    %s", sanitizeInline(t.File)),
 					fmt.Sprintf("进度与速率：%d / %d B · %.1f B/s", t.Offset, t.Size, t.Rate),
-					fmt.Sprintf("当前状态：  %s", t.State),
+					fmt.Sprintf("当前状态：  %s", sanitizeInline(t.State)),
 				}
 				if t.Error != "" {
-					m.detailLines = append(m.detailLines, "", "错误信息：", "  "+t.Error)
+					m.detailLines = append(m.detailLines, "", "错误信息：", "  "+sanitizeInline(t.Error))
 				}
 				m.infoScroll = 0
 				m.modal = srvModalDetail
@@ -810,13 +810,13 @@ func (m *serverModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		case "enter":
 			if m.cursors[3] < len(m.certs) {
 				c := m.certs[m.cursors[3]]
-				m.detailTitle = "证书详情 · " + c.Name
+				m.detailTitle = "证书详情 · " + sanitizeInline(c.Name)
 				m.detailLines = []string{
-					"角色：    " + c.Role,
-					"路径：    " + c.Path,
-					"状态：    " + c.State,
-					"到期/备注：" + c.Expiry,
-					"SHA-256： " + c.Fingerprint,
+					"角色：    " + sanitizeInline(c.Role),
+					"路径：    " + sanitizeInline(c.Path),
+					"状态：    " + sanitizeInline(c.State),
+					"到期/备注：" + sanitizeInline(c.Expiry),
+					"SHA-256： " + sanitizeInline(c.Fingerprint),
 				}
 				m.infoScroll = 0
 				m.modal = srvModalDetail
@@ -892,13 +892,13 @@ func (m *serverModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			if m.logFallback == "" && m.cursors[5] < len(m.logEvents) {
 				e := m.logEvents[m.cursors[5]]
 				m.logPaused = true
-				m.detailTitle = fmt.Sprintf("日志事件 #%d [%s]", e.Sequence, e.Level)
+				m.detailTitle = fmt.Sprintf("日志事件 #%d [%s]", e.Sequence, sanitizeInline(e.Level))
 				m.detailLines = []string{
 					"时间：  " + e.Time.Local().Format("2006-01-02 15:04:05"),
-					"消息：  " + e.Message,
-					"用户：  " + e.User,
-					"文件：  " + e.File,
-					"详情：  " + e.Detail,
+					"消息：  " + sanitizeInline(e.Message),
+					"用户：  " + sanitizeInline(e.User),
+					"文件：  " + sanitizeInline(e.File),
+					"详情：  " + sanitizeInline(e.Detail),
 				}
 				m.infoScroll = 0
 				m.modal = srvModalDetail
@@ -1180,13 +1180,13 @@ func (m *serverModel) showUserDetailModal(u config.AuthorizedClient) {
 		bwText = fmt.Sprintf("↑ %d B/s · ↓ %d B/s · Burst %d B", u.Bandwidth.UploadBytesPerSecond, u.Bandwidth.DownloadBytesPerSecond, u.Bandwidth.BurstBytes)
 	}
 	ins := security.InspectCertificate(u.Certificate, time.Now())
-	m.detailTitle = "用户详情 · " + u.UserID
+	m.detailTitle = "用户详情 · " + sanitizeInline(u.UserID)
 	m.detailLines = []string{
 		"授权状态：" + status,
-		"操作权限：" + strings.Join(u.Permissions, ", "),
+		"操作权限：" + sanitizeInline(strings.Join(u.Permissions, ", ")),
 		"带宽策略：" + bwText,
-		"证书路径：" + u.Certificate,
-		fmt.Sprintf("证书状态：%s · 指纹 %s", ins.State, ins.Fingerprint),
+		"证书路径：" + sanitizeInline(u.Certificate),
+		fmt.Sprintf("证书状态：%s · 指纹 %s", sanitizeInline(ins.State), sanitizeInline(ins.Fingerprint)),
 	}
 	m.infoScroll = 0
 	m.modal = srvModalDetail

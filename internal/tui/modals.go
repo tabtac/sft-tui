@@ -56,14 +56,14 @@ func wrapModalLines(lines []string, innerW int) []string {
 func renderModalRawBox(width int, th theme, title string, lines []string, footer string) string {
 	boxW, innerW := modalBoxDimensions(width)
 	var body []string
-	body = append(body, th.modalTitle.Render(truncCell(title, innerW)))
+	body = append(body, th.modalTitle.Render(truncPlainCell(title, innerW)))
 	body = append(body, lipgloss.NewStyle().Foreground(th.border).Render(strings.Repeat("─", innerW)))
 	for _, ln := range lines {
 		body = append(body, ln)
 	}
 	if footer != "" {
 		body = append(body, lipgloss.NewStyle().Foreground(th.border).Render(strings.Repeat("─", innerW)))
-		body = append(body, th.badgeMuted.Render(truncCell(footer, innerW)))
+		body = append(body, th.badgeMuted.Render(truncPlainCell(footer, innerW)))
 	}
 	return th.modalBox.Width(boxW - 2).Render(strings.Join(body, "\n"))
 }
@@ -195,10 +195,11 @@ func (m *model) infoModalData() (title string, lines []string, footer string) {
 }
 
 func appendModalNoticeLines(lines []string, th theme, notice string, innerW int) []string {
-	if strings.TrimSpace(notice) == "" {
+	cleaned := sanitizeInline(strings.TrimSpace(notice))
+	if cleaned == "" {
 		return lines
 	}
-	wrapped := wrapModalLines([]string{"! " + notice}, innerW)
+	wrapped := wrapModalLines([]string{"! " + cleaned}, innerW)
 	out := make([]string, 0, len(lines)+len(wrapped)+1)
 	out = append(out, lines...)
 	out = append(out, "")
@@ -231,7 +232,7 @@ func (m *model) viewModal(base string) string {
 		}
 		limit := min(5, len(m.conflictNames))
 		for i := 0; i < limit; i++ {
-			lines = append(lines, "  • "+truncCell(m.conflictNames[i], max(12, innerW-6)))
+			lines = append(lines, "  • "+truncPlainCell(m.conflictNames[i], max(12, innerW-6)))
 		}
 		if len(m.conflictNames) > limit {
 			lines = append(lines, fmt.Sprintf("  … 另有 %d 个冲突文件", len(m.conflictNames)-limit))
@@ -276,20 +277,20 @@ func (m *model) viewModal(base string) string {
 
 func buildTaskDetailLines(dirLabel, stateText, remote, localPath string, done, size uint64, shaHex, tid, errMsg string, updated time.Time) []string {
 	lines := []string{
-		fmt.Sprintf("方向与状态：%s · %s", dirLabel, stateText),
-		fmt.Sprintf("远端文件名：%s", remote),
-		fmt.Sprintf("本地路径：  %s", localPath),
+		fmt.Sprintf("方向与状态：%s · %s", sanitizeInline(dirLabel), sanitizeInline(stateText)),
+		fmt.Sprintf("远端文件名：%s", sanitizeInline(remote)),
+		fmt.Sprintf("本地路径：  %s", sanitizeInline(localPath)),
 		fmt.Sprintf("进度与大小：%s / %s", progress.FormatBytes(done), progress.FormatBytes(size)),
 		fmt.Sprintf("最近更新：  %s", updated.Format("2006-01-02 15:04:05")),
 	}
 	if tid != "" {
-		lines = append(lines, "TransferID："+tid)
+		lines = append(lines, "TransferID："+sanitizeInline(tid))
 	}
 	if shaHex != "" {
-		lines = append(lines, "SHA-256：   "+shaHex)
+		lines = append(lines, "SHA-256：   "+sanitizeInline(shaHex))
 	}
 	if errMsg != "" {
-		lines = append(lines, "", "错误/提示说明：", "  "+errMsg)
+		lines = append(lines, "", "错误/提示说明：", "  "+sanitizeInline(errMsg))
 	}
 	return lines
 }
@@ -322,10 +323,10 @@ func (m *model) buildIdentityModalContent() (title, footer string, lines []strin
 		ps := m.pendingSwitch
 		total := ps.activeCount + ps.pausedCount
 		lines = []string{
-			m.th.badgeWarn.Render(truncCell("⚠ 当前身份队列仍有未完成任务，确认切换？", innerW)),
+			m.th.badgeWarn.Render(truncPlainCell("⚠ 当前身份队列仍有未完成任务，确认切换？", innerW)),
 			"",
-			truncCell("  • 目标身份："+ps.targetLabel, innerW),
-			truncCell(fmt.Sprintf("  • 未完成任务：共 %d 个（进行中 %d · 已暂停/待处理 %d）", total, ps.activeCount, ps.pausedCount), innerW),
+			truncPlainCell("  • 目标身份："+ps.targetLabel, innerW),
+			truncPlainCell(fmt.Sprintf("  • 未完成任务：共 %d 个（进行中 %d · 已暂停/待处理 %d）", total, ps.activeCount, ps.pausedCount), innerW),
 			"",
 			m.th.badgeMuted.Render(truncCell("  切换影响：进行中任务将被安全暂停，断点保留在当前身份 SQLite；", innerW)),
 			m.th.badgeMuted.Render(truncCell("  切回当前身份后可按 [a] 或 [F5] 从断点处继续传输。", innerW)),
@@ -368,8 +369,8 @@ func (m *model) buildIdentityModalContent() (title, footer string, lines []strin
 				}
 			}
 			exp := ch.profile.Expires.Format("2006-01-02")
-			row := fmt.Sprintf("%s[%s] %s  (到期 %s)%s", mark, tag, ch.profile.Label, exp, testTag)
-			lines = append(lines, style.Render(truncCell(row, innerW)))
+			row := fmt.Sprintf("%s[%s] %s  (到期 %s)%s", mark, tag, sanitizeInline(ch.profile.Label), exp, testTag)
+			lines = append(lines, style.Render(truncPlainCell(row, innerW)))
 		}
 
 		// 当前高亮身份预览卡
@@ -377,21 +378,21 @@ func (m *model) buildIdentityModalContent() (title, footer string, lines []strin
 			ch := m.idChoices[m.idCursor]
 			p := ch.profile
 			lines = append(lines, "")
-			user := p.User
+			user := sanitizeInline(p.User)
 			if user == "" {
 				user = "-"
 			}
-			srv := p.Config.ServerAddress
+			srv := sanitizeInline(p.Config.ServerAddress)
 			if srv == "" {
 				srv = "-"
 			}
-			san := p.Config.ServerName
+			san := sanitizeInline(p.Config.ServerName)
 			if san == "" {
 				san = "-"
 			}
-			lines = append(lines, m.th.hintKey.Render(truncCell(fmt.Sprintf("预览: 用户=%s · 地址=%s · SAN=%s", user, srv, san), innerW)))
+			lines = append(lines, m.th.hintKey.Render(truncPlainCell(fmt.Sprintf("预览: 用户=%s · 地址=%s · SAN=%s", user, srv, san), innerW)))
 
-			fpShort := p.Fingerprint
+			fpShort := sanitizeInline(p.Fingerprint)
 			if len(fpShort) > 20 {
 				fpShort = fpShort[:12] + "…" + fpShort[len(fpShort)-6:]
 			} else if fpShort == "" {
@@ -404,7 +405,7 @@ func (m *model) buildIdentityModalContent() (title, footer string, lines []strin
 			} else if daysLeft < 0 {
 				expNote = fmt.Sprintf("%s (已过期!)", p.Expires.Format("2006-01-02"))
 			}
-			expLine := truncCell(fmt.Sprintf("指纹: %s · 到期: %s", fpShort, expNote), innerW)
+			expLine := truncPlainCell(fmt.Sprintf("指纹: %s · 到期: %s", fpShort, expNote), innerW)
 			switch {
 			case !p.Expires.IsZero() && daysLeft < 0:
 				lines = append(lines, m.th.badgeErr.Render(expLine))
@@ -414,11 +415,11 @@ func (m *model) buildIdentityModalContent() (title, footer string, lines []strin
 				lines = append(lines, m.th.badgeMuted.Render(expLine))
 			}
 
-			stateDir := p.Config.StateDir
+			stateDir := sanitizeInline(p.Config.StateDir)
 			if stateDir == "" {
 				stateDir = "-"
 			}
-			lines = append(lines, m.th.badgeMuted.Render(truncCell(fmt.Sprintf("限额: 单文件=%s · 状态目录=%s", progress.FormatBytes(p.Config.MaxFileBytes), stateDir), innerW)))
+			lines = append(lines, m.th.badgeMuted.Render(truncPlainCell(fmt.Sprintf("限额: 单文件=%s · 状态目录=%s", progress.FormatBytes(p.Config.MaxFileBytes), stateDir), innerW)))
 
 			connPreview := m.th.badgeMuted.Render(truncCell("连通: 未测试（按 t 测试 mTLS 握手与认证）", innerW))
 			if ts, ok := m.idTestResults[p.Path]; ok {
@@ -428,7 +429,7 @@ func (m *model) buildIdentityModalContent() (title, footer string, lines []strin
 				case ts.tested && ts.err == "":
 					connPreview = m.th.badgeOk.Render(truncCell(fmt.Sprintf("连通: ✔ mTLS 握手通过（耗时 %s）", ts.latency.Round(time.Millisecond)), innerW))
 				case ts.tested && ts.err != "":
-					connPreview = m.th.badgeErr.Render(truncCell("连通: ✕ "+ts.err, innerW))
+					connPreview = m.th.badgeErr.Render(truncPlainCell("连通: ✕ "+ts.err, innerW))
 				}
 			}
 			lines = append(lines, connPreview)

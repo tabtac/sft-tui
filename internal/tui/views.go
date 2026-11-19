@@ -39,7 +39,7 @@ func (m *model) View() string {
 
 func (m *model) renderHeader() string {
 	brand := m.th.badgeApp.Render(" SFT-TUI ")
-	idBadge := m.th.badgeID.Render(" 身份: " + m.identityLabel + " ")
+	idBadge := m.th.badgeID.Render(" 身份: " + sanitizeInline(m.identityLabel) + " ")
 
 	connStyle := m.th.badgeMuted
 	connIcon := "○ "
@@ -59,7 +59,7 @@ func (m *model) renderHeader() string {
 		connStyle = m.th.badgeErr
 		connIcon = "✕ "
 	}
-	connBadge := connStyle.Render(connIcon + truncCell(connText, 26))
+	connBadge := connStyle.Render(connIcon + truncPlainCell(connText, 26))
 
 	var runCount, pauseCount int
 	var totalRate float64
@@ -83,7 +83,7 @@ func (m *model) renderHeader() string {
 }
 
 func (m *model) renderSubHeader() string {
-	pathView := m.th.badgeMuted.Render("目录: ") + truncCell(m.localDir, max(12, m.width/3))
+	pathView := m.th.badgeMuted.Render("目录: ") + truncPlainCell(m.localDir, max(12, m.width/3))
 	if m.editingPath {
 		pathView = m.pathInput.View()
 	}
@@ -92,7 +92,7 @@ func (m *model) renderSubHeader() string {
 	if m.editingSearch {
 		searchView += m.searchInput.View()
 	} else if m.query != "" {
-		searchView += m.th.badgeOk.Render(truncCell(m.query, 24))
+		searchView += m.th.badgeOk.Render(truncPlainCell(m.query, 24))
 	} else {
 		searchView += m.th.badgeMuted.Render("全部")
 	}
@@ -105,7 +105,7 @@ func (m *model) renderSubHeader() string {
 	case m.activatingID:
 		msg = "  " + formatBusyBadge(m.th, m.spinIdx, "身份切换中", m.opStart)
 	case m.statusToast != "":
-		msg = "  " + m.th.toast.Render("· "+truncCell(m.statusToast, max(10, m.width/4)))
+		msg = "  " + m.th.toast.Render("· "+truncPlainCell(m.statusToast, max(10, m.width/4)))
 	}
 	line := pathView + "   " + searchView + "   " + sortLabel + msg
 	return lipgloss.NewStyle().Padding(0, 1).Width(m.width).Render(truncCell(line, m.width-2))
@@ -367,7 +367,7 @@ func (m *model) renderLocalPanel(outerW, outerH int) string {
 				icon = "▸ "
 				sz = padLeftCell("<DIR>", sizeW)
 			}
-			row := truncCell(fmt.Sprintf("%s %s%s %s", mark, icon, padRightCell(e.name, nameW), sz), innerW)
+			row := truncPlainCell(fmt.Sprintf("%s %s%s %s", mark, icon, padPlainRightCell(e.name, nameW), sz), innerW)
 			if i == m.localCursor && m.focus == areaLocal {
 				lines = append(lines, m.th.rowCursor.Render(padRightCell(row, innerW)))
 			} else if e.regular && m.localSelected[e.path] {
@@ -395,7 +395,7 @@ func (m *model) renderRemotePanel(outerW, outerH int) string {
 	case m.cfg == nil:
 		lines = append(lines, m.th.badgeMuted.Render(truncCell("尚未配置或导入身份，按 i 打开身份配置", innerW)))
 	case m.remoteErr != "":
-		lines = append(lines, m.th.badgeErr.Render(truncCell("远端列表暂不可用："+m.remoteErr, innerW)))
+		lines = append(lines, m.th.badgeErr.Render(truncPlainCell("远端列表暂不可用："+m.remoteErr, innerW)))
 		lines = append(lines, m.th.badgeMuted.Render(truncCell("按 r 重新刷新连接，本地队列与断点继续可用", innerW)))
 	case len(m.visibleRemote) == 0:
 		lines = append(lines, m.th.badgeMuted.Render(truncCell("（远端暂无匹配文件，选中本地文件后按 u/F5 上传）", innerW)))
@@ -409,7 +409,7 @@ func (m *model) renderRemotePanel(outerW, outerH int) string {
 			if m.remoteSelected[f.FileName] {
 				mark = "[✓]"
 			}
-			row := truncCell(fmt.Sprintf("%s %s %s", mark, padRightCell(f.FileName, nameW), padLeftCell(progress.FormatBytes(f.Size), sizeW)), innerW)
+			row := truncPlainCell(fmt.Sprintf("%s %s %s", mark, padPlainRightCell(f.FileName, nameW), padLeftCell(progress.FormatBytes(f.Size), sizeW)), innerW)
 			if i == m.remoteCursor && m.focus == areaRemote {
 				lines = append(lines, m.th.rowCursor.Render(padRightCell(row, innerW)))
 			} else if m.remoteSelected[f.FileName] {
@@ -439,7 +439,7 @@ func (m *model) renderQueuePanel(outerW, outerH int) string {
 	tasks := m.currentQueueTasks()
 	var lines []string
 	if !m.historyView && m.recoveryNotice != "" && len(m.activeTasks) > 0 && visRows >= 3 {
-		lines = append(lines, m.th.badgeWarn.Render(truncCell("↻ "+m.recoveryNotice, innerW)))
+		lines = append(lines, m.th.badgeWarn.Render(truncPlainCell("↻ "+m.recoveryNotice, innerW)))
 		visRows--
 	}
 	if len(tasks) == 0 {
@@ -467,10 +467,10 @@ func (m *model) renderQueuePanel(outerW, outerH int) string {
 			rowText := truncCell(fmt.Sprintf("%s%s  %s  %s  %s  %s",
 				pointer,
 				directionIcon(t.Direction),
-				padRightCell(t.Remote, nameW),
+				padPlainRightCell(t.Remote, nameW),
 				badge,
 				bar,
-				truncCell(metrics, max(10, innerW-nameW-barW-26)),
+				truncPlainCell(metrics, max(10, innerW-nameW-barW-26)),
 			), innerW)
 			if i == m.queueCursor && m.focus == areaQueue {
 				lines = append(lines, m.th.rowCursor.Render(padRightCell(rowText, innerW)))
