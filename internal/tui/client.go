@@ -265,7 +265,7 @@ func newModel(opts Options) *model {
 	m := &model{
 		opts:           opts,
 		prefsPath:      prefsPath,
-		th:             makeTheme(!prefs.Light),
+		th:             makeTheme(),
 		localSort:      clampSortKind(prefs.LocalOrder),
 		remoteSort:     clampSortKind(prefs.RemoteOrder),
 		focus:          areaLocal,
@@ -896,9 +896,9 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
-	case themeSavedMsg:
+	case prefsSavedMsg:
 		if msg.err != nil {
-			m.setToastError("无法保存主题偏好：" + msg.err.Error())
+			m.setToastError("无法保存界面偏好：" + msg.err.Error())
 		}
 		return m, nil
 
@@ -915,15 +915,6 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	k := msg.String()
 	if k == "ctrl+c" {
 		return m.requestExit()
-	}
-	if k == "f6" {
-		m.th = makeTheme(!m.th.dark)
-		if m.th.dark {
-			m.setToast("已切换为深色主题")
-		} else {
-			m.setToast("已切换为浅色主题")
-		}
-		return m, saveUIPrefsCmd(m.prefsPath, m.currentPrefs())
 	}
 
 	// 1. 文本编辑态优先独占输入（避免误触单字母快捷键）
@@ -2049,7 +2040,6 @@ func clampSortKind(v int) sortKind {
 
 func (m *model) currentPrefs() uiPrefs {
 	return uiPrefs{
-		Light:       !m.th.dark,
 		LocalOrder:  int(m.localSort),
 		RemoteOrder: int(m.remoteSort),
 	}

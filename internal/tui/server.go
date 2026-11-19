@@ -28,7 +28,6 @@ type ServerOptions struct {
 	ExecutableDir string
 	ConfigPath    string
 	LogPath       string
-	PrefsPath     string
 	Page          int // 0=概览, 1=用户, 2=传输, 3=证书, 4=设置, 5=日志
 }
 
@@ -91,7 +90,6 @@ type serverTickMsg time.Time
 
 type serverModel struct {
 	opts          ServerOptions
-	prefsPath     string
 	th            theme
 	width, height int
 	page          int // 0..5
@@ -174,15 +172,13 @@ func newServerModel(opts ServerOptions) *serverModel {
 			opts.ExecutableDir = filepath.Dir(exe)
 		}
 	}
-	prefsPath := resolvePrefsPath(opts.PrefsPath, opts.ExecutableDir, ".sftd-prefs.json")
 	qi := textinput.New()
 	qi.Placeholder = "输入关键字筛选…"
 	qi.CharLimit = 256
 	qi.Width = 40
 	return &serverModel{
 		opts:         opts,
-		prefsPath:    prefsPath,
-		th:           makeTheme(loadThemePref(prefsPath)),
+		th:           makeTheme(),
 		page:         max(0, min(5, opts.Page)),
 		runtimeState: "正在连接本机控制端点…",
 		queryInput:   qi,
@@ -611,12 +607,6 @@ func (m *serverModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.setToast("用户包已导出：" + msg.outDir)
 		return m, nil
 
-	case themeSavedMsg:
-		if msg.err != nil {
-			m.setToastError("无法保存主题偏好：" + msg.err.Error())
-		}
-		return m, nil
-
 	case tea.KeyMsg:
 		return m.handleKey(msg)
 
@@ -630,15 +620,6 @@ func (m *serverModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	k := msg.String()
 	if k == "ctrl+c" {
 		return m, tea.Quit
-	}
-	if k == "f6" {
-		m.th = makeTheme(!m.th.dark)
-		if m.th.dark {
-			m.setToast("已切换为深色主题")
-		} else {
-			m.setToast("已切换为浅色主题")
-		}
-		return m, saveThemePrefCmd(m.prefsPath, m.th.dark)
 	}
 
 	if m.editingQuery {

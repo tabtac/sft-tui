@@ -214,7 +214,6 @@ func (m *model) renderFooter() string {
 				{key: "Enter", label: "详情", reason: emptyReason, essential: true},
 				{key: "X", label: "清空", reason: emptyReason},
 				{key: "v", label: "活动队列", essential: true},
-				{key: "F6", label: "主题"},
 				{key: "?", label: "帮助"},
 				{key: "q", label: "退出"},
 			})

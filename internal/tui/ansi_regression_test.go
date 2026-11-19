@@ -95,9 +95,10 @@ func TestRegressionANSITrueColorInterfaceBarsDoNotLeakSGR(t *testing.T) {
 	t.Cleanup(func() { lipgloss.SetDefaultRenderer(previous) })
 
 	for _, dark := range []bool{false, true} {
+		renderer.SetHasDarkBackground(dark)
 		for _, width := range []int{80, 120} {
 			t.Run(fmt.Sprintf("dark=%v/width=%d", dark, width), func(t *testing.T) {
-				th := makeTheme(dark)
+				th := makeTheme()
 				if probe := th.badgeApp.Render("probe"); !strings.Contains(probe, "\x1b[") {
 					t.Fatal("fixture must emit real ANSI styles even without a terminal")
 				}
@@ -134,6 +135,16 @@ func TestRegressionANSITrueColorInterfaceBarsDoNotLeakSGR(t *testing.T) {
 							t.Errorf("interface bar exceeds terminal width: %d > %d", w, width)
 						}
 					})
+				}
+				// 动态对比度：深浅色终端背景下 footerBar 应各自输出高对比度前景色。
+				darkFooter := ""
+				renderer.SetHasDarkBackground(true)
+				darkFooter = th.footerBar.Render("footer")
+				renderer.SetHasDarkBackground(false)
+				lightFooter := th.footerBar.Render("footer")
+				renderer.SetHasDarkBackground(dark)
+				if darkFooter == lightFooter {
+					t.Errorf("expected footerBar AdaptiveColor to change between dark and light backgrounds")
 				}
 			})
 		}
@@ -198,7 +209,7 @@ func TestRegressionANSITrueColorFullViewsAndUntrustedPayloads(t *testing.T) {
 	cfg.Limits.MaxStreams = 16
 
 	srv := &serverModel{
-		th: makeTheme(true), width: 100, height: 30,
+		th: makeTheme(), width: 100, height: 30,
 		loaded: true, cfg: cfg,
 		certs: []certRow{
 			{Name: "ca" + evilEsc, Role: "ca", State: "有效", Expiry: "2028-01-01", Fingerprint: "ABCDEF1234567890"},
@@ -231,8 +242,9 @@ func TestRegressionANSITrueColorFullViewsAndUntrustedPayloads(t *testing.T) {
 
 	for _, dims := range [][2]int{{80, 24}, {120, 32}} {
 		w, h := dims[0], dims[1]
+		renderer.SetHasDarkBackground(dims[0] == 80)
 		cli := newModel(Options{ExecutableDir: t.TempDir(), Directory: t.TempDir()})
-		cli.th = makeTheme(dims[0] == 80)
+		cli.th = makeTheme()
 		cli.width, cli.height = w, h
 		cli.cfg = &config.Client{}
 		cli.identityLabel = "alice" + evilEsc

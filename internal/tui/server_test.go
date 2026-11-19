@@ -188,23 +188,15 @@ func TestServerEmptyPagesClampStaleCursor(t *testing.T) {
 	}
 }
 
-func TestServerThemePersistenceAndMouseInteraction(t *testing.T) {
+func TestServerMouseInteractionAndNoF6Toggle(t *testing.T) {
 	exeDir := t.TempDir()
-	prefsPath := filepath.Join(exeDir, ".sftd-prefs.json")
-	m := newServerModel(ServerOptions{ExecutableDir: exeDir, ConfigPath: filepath.Join(t.TempDir(), "server.json"), PrefsPath: prefsPath})
+	m := newServerModel(ServerOptions{ExecutableDir: exeDir, ConfigPath: filepath.Join(t.TempDir(), "server.json")})
 	m.Update(tea.WindowSizeMsg{Width: 110, Height: 30})
-	if !m.th.dark {
-		t.Fatal("default server theme should be dark")
+	if _, cmd := m.Update(keyType(tea.KeyF6)); cmd != nil || m.statusToast != "" {
+		t.Fatalf("expected F6 theme toggle removed from server panel, cmd=%v toast=%q", cmd, m.statusToast)
 	}
-	_, cmd := m.Update(keyType(tea.KeyF6))
-	if cmd == nil {
-		t.Fatal("F6 did not emit save command")
-	}
-	m.Update(cmd())
-
-	reloaded := newServerModel(ServerOptions{ExecutableDir: exeDir, ConfigPath: filepath.Join(t.TempDir(), "server.json"), PrefsPath: prefsPath})
-	if reloaded.th.dark {
-		t.Fatal("server light theme preference did not persist")
+	if strings.Contains(ansi.Strip(m.renderFooter()), "F6") {
+		t.Fatalf("expected F6 removed from server footer:\n%s", ansi.Strip(m.renderFooter()))
 	}
 
 	// 点击标签栏第 2 个页签 "2 用户"

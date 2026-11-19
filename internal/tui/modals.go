@@ -170,7 +170,7 @@ func (m *model) infoModalData() (title string, lines []string, footer string) {
 			"  Tab / Shift+Tab  在 本地 → 远端 → 活动队列 → 历史归档 间切换",
 			"  1 / 2 / 3 / 4    直接跳转 本地 / 远端 / 活动队列 / 历史归档",
 			"  v / h            在 活动队列 与 历史归档 之间切换视图",
-			"  F6 / q / ?       切换深浅主题 / 优雅退出 / 开关本帮助",
+			"  q / ?            优雅退出 / 开关本帮助",
 			"",
 			m.th.hintKey.Render("文件浏览（本地 / 远端）"),
 			"  ↑↓ / j k         移动光标 · Backspace 返回上级目录 · Enter 进目录/详情",

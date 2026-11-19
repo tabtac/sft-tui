@@ -13,12 +13,11 @@ import (
 )
 
 type uiPrefs struct {
-	Light       bool `json:"light"`
-	LocalOrder  int  `json:"local_order,omitempty"`
-	RemoteOrder int  `json:"remote_order,omitempty"`
+	LocalOrder  int `json:"local_order,omitempty"`
+	RemoteOrder int `json:"remote_order,omitempty"`
 }
 
-type themeSavedMsg struct {
+type prefsSavedMsg struct {
 	err error
 }
 
@@ -44,10 +43,6 @@ func loadUIPrefs(path string) uiPrefs {
 	return prefs
 }
 
-func loadThemePref(path string) bool {
-	return !loadUIPrefs(path).Light
-}
-
 func saveUIPrefsCmd(path string, prefs uiPrefs) tea.Cmd {
 	if path == "" {
 		return nil
@@ -55,19 +50,13 @@ func saveUIPrefsCmd(path string, prefs uiPrefs) tea.Cmd {
 	return func() tea.Msg {
 		data, err := json.MarshalIndent(prefs, "", "  ")
 		if err != nil {
-			return themeSavedMsg{err: err}
+			return prefsSavedMsg{err: err}
 		}
 		if err := pal.EnsurePrivateDir(filepath.Dir(path)); err != nil && !os.IsExist(err) {
-			return themeSavedMsg{err: err}
+			return prefsSavedMsg{err: err}
 		}
-		return themeSavedMsg{err: pal.StageAndReplaceMode(path, append(data, '\n'), 0600, false)}
+		return prefsSavedMsg{err: pal.StageAndReplaceMode(path, append(data, '\n'), 0600, false)}
 	}
-}
-
-func saveThemePrefCmd(path string, dark bool) tea.Cmd {
-	prefs := loadUIPrefs(path)
-	prefs.Light = !dark
-	return saveUIPrefsCmd(path, prefs)
 }
 
 func tabHitIndex(x, startOffset int, labels []string, th theme, activeIdx int) int {
@@ -88,18 +77,16 @@ func tabHitIndex(x, startOffset int, labels []string, th theme, activeIdx int) i
 }
 
 type theme struct {
-	dark        bool
-	primary     lipgloss.Color
-	secondary   lipgloss.Color
-	accent      lipgloss.Color
-	success     lipgloss.Color
-	warning     lipgloss.Color
-	danger      lipgloss.Color
-	muted       lipgloss.Color
-	text        lipgloss.Color
-	border      lipgloss.Color
-	panelBg     lipgloss.Color
-	highlightBg lipgloss.Color
+	primary     lipgloss.TerminalColor
+	secondary   lipgloss.TerminalColor
+	accent      lipgloss.TerminalColor
+	success     lipgloss.TerminalColor
+	warning     lipgloss.TerminalColor
+	danger      lipgloss.TerminalColor
+	muted       lipgloss.TerminalColor
+	text        lipgloss.TerminalColor
+	border      lipgloss.TerminalColor
+	highlightBg lipgloss.TerminalColor
 
 	headerBar   lipgloss.Style
 	badgeApp    lipgloss.Style
@@ -122,34 +109,25 @@ type theme struct {
 	hintKey     lipgloss.Style
 }
 
-func makeTheme(dark bool) theme {
-	t := theme{dark: dark}
-	if dark {
-		t.primary = lipgloss.Color("#38BDF8")     // 晴空蓝
-		t.secondary = lipgloss.Color("#818CF8")   // 靛紫
-		t.accent = lipgloss.Color("#22D3EE")      // 青蓝焦点
-		t.success = lipgloss.Color("#34D399")     // 翡翠绿
-		t.warning = lipgloss.Color("#FBBF24")     // 琥珀黄
-		t.danger = lipgloss.Color("#F87171")      // 珊瑚红
-		t.muted = lipgloss.Color("#64748B")       // 暗灰
-		t.text = lipgloss.Color("#E2E8F0")        // 柔白
-		t.border = lipgloss.Color("#334155")      // 细边框灰
-		t.highlightBg = lipgloss.Color("#1E293B") // 选中行底色
-	} else {
-		t.primary = lipgloss.Color("#0284C7")
-		t.secondary = lipgloss.Color("#4F46E5")
-		t.accent = lipgloss.Color("#0369A1")
-		t.success = lipgloss.Color("#059669")
-		t.warning = lipgloss.Color("#D97706")
-		t.danger = lipgloss.Color("#DC2626")
-		t.muted = lipgloss.Color("#6B7280")
-		t.text = lipgloss.Color("#0F172A")
-		t.border = lipgloss.Color("#CBD5E1")
-		t.highlightBg = lipgloss.Color("#E0F2FE")
+// makeTheme 构建基于终端深浅背景动态自适应的高对比度配色方案。
+func makeTheme() theme {
+	t := theme{
+		primary:     lipgloss.AdaptiveColor{Dark: "#38BDF8", Light: "#0369A1"}, // 晴空蓝 / 深天蓝
+		secondary:   lipgloss.AdaptiveColor{Dark: "#A5B4FC", Light: "#4338CA"}, // 靛紫
+		accent:      lipgloss.AdaptiveColor{Dark: "#22D3EE", Light: "#0E7490"}, // 青蓝焦点
+		success:     lipgloss.AdaptiveColor{Dark: "#34D399", Light: "#047857"}, // 翡翠绿
+		warning:     lipgloss.AdaptiveColor{Dark: "#FBBF24", Light: "#B45309"}, // 琥珀黄
+		danger:      lipgloss.AdaptiveColor{Dark: "#F87171", Light: "#B91C1C"}, // 珊瑚红
+		muted:       lipgloss.AdaptiveColor{Dark: "#94A3B8", Light: "#475569"}, // 高对比次级文字
+		text:        lipgloss.AdaptiveColor{Dark: "#F1F5F9", Light: "#0F172A"}, // 主正文
+		border:      lipgloss.AdaptiveColor{Dark: "#475569", Light: "#94A3B8"}, // 细边框灰
+		highlightBg: lipgloss.AdaptiveColor{Dark: "#1E293B", Light: "#DBEAFE"}, // 选中行底色
 	}
+	footerFg := lipgloss.AdaptiveColor{Dark: "#CBD5E1", Light: "#334155"}
+	badgeAppFg := lipgloss.AdaptiveColor{Dark: "#0F172A", Light: "#FFFFFF"}
 
 	t.headerBar = lipgloss.NewStyle().Foreground(t.text).Padding(0, 1)
-	t.badgeApp = lipgloss.NewStyle().Background(t.primary).Foreground(lipgloss.Color("#0F172A")).Bold(true).Padding(0, 1)
+	t.badgeApp = lipgloss.NewStyle().Background(t.primary).Foreground(badgeAppFg).Bold(true).Padding(0, 1)
 	t.badgeID = lipgloss.NewStyle().Background(t.highlightBg).Foreground(t.text).Bold(true).Padding(0, 1)
 	t.badgeOk = lipgloss.NewStyle().Foreground(t.success).Bold(true)
 	t.badgeWarn = lipgloss.NewStyle().Foreground(t.warning).Bold(true)
@@ -167,7 +145,7 @@ func makeTheme(dark bool) theme {
 
 	t.tabActive = lipgloss.NewStyle().
 		Background(t.primary).
-		Foreground(lipgloss.Color("#0F172A")).
+		Foreground(badgeAppFg).
 		Bold(true).
 		Padding(0, 1)
 	t.tabInactive = lipgloss.NewStyle().
@@ -177,7 +155,7 @@ func makeTheme(dark bool) theme {
 	t.rowNormal = lipgloss.NewStyle().Foreground(t.text)
 	t.rowCursor = lipgloss.NewStyle().Background(t.highlightBg).Foreground(t.accent).Bold(true)
 	t.rowSelected = lipgloss.NewStyle().Foreground(t.success).Bold(true)
-	t.footerBar = lipgloss.NewStyle().Foreground(t.muted).Padding(0, 1)
+	t.footerBar = lipgloss.NewStyle().Foreground(footerFg).Padding(0, 1)
 	t.toast = lipgloss.NewStyle().Foreground(t.warning).Bold(true)
 
 	t.modalBox = lipgloss.NewStyle().

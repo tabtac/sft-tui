@@ -655,9 +655,9 @@ func TestClientToastAutoExpiryAndModalValidationPersistence(t *testing.T) {
 	m := newModel(Options{ExecutableDir: t.TempDir(), Directory: t.TempDir()})
 	m.Update(tea.WindowSizeMsg{Width: 100, Height: 28})
 
-	m.Update(keyType(tea.KeyF6))
+	m.Update(keyRune('o'))
 	if m.statusToast == "" {
-		t.Fatal("expected theme toast after F6")
+		t.Fatal("expected sort toast after o")
 	}
 	m.Update(tickMsg(time.Now().Add(1 * time.Second)))
 	if m.statusToast == "" {

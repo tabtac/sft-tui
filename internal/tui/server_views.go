@@ -189,7 +189,6 @@ func (m *serverModel) renderFooter() string {
 			{key: "I", label: "向导", reason: wizReason, essential: true},
 			{key: "Enter", label: "详情", reason: detailReason},
 			{key: "Tab", label: "切页"},
-			{key: "F6", label: "主题"},
 			{key: "?", label: "帮助"},
 			{key: "q", label: "退出", reason: quitReason, essential: true},
 		})
@@ -1089,7 +1088,7 @@ func (m *serverModel) infoModalData() (title string, lines []string, footer stri
 			m.th.hintKey.Render("全局快捷键"),
 			"  1–6 / Tab      在 概览 / 用户 / 传输 / 证书 / 设置 / 日志 页面间切换",
 			"  s / x / R      后台启动 sftd / 停止 sftd / 热加载证书与 ACL 配置",
-			"  r / / / F6     手动刷新 / 过滤当前列表 / 切换深浅色主题",
+			"  r / /          手动刷新 / 过滤当前列表",
 			"  q / F10        退出管理界面（后台已启动的 sftd 服务继续保持运行）",
 			"",
 			m.th.hintKey.Render("页面专属动作"),

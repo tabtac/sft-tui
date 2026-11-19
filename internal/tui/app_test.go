@@ -151,9 +151,8 @@ func TestBubbleTeaLayoutNavigationAndInputIsolation(t *testing.T) {
 	if m.focus != areaQueue || !m.historyView {
 		t.Fatalf("expected history queue view, got focus=%v hist=%v", m.focus, m.historyView)
 	}
-	m.Update(keyType(tea.KeyF6)) // 切换浅色主题
-	if m.th.dark {
-		t.Fatal("expected light theme after F6")
+	if _, cmd := m.Update(keyType(tea.KeyF6)); cmd != nil || m.statusToast != "" {
+		t.Fatalf("expected F6 theme toggle removed, got cmd=%v toast=%q", cmd, m.statusToast)
 	}
 }
 
@@ -456,26 +455,11 @@ func TestDownloadConflictResolutionPreservesDirectoryAndSource(t *testing.T) {
 	}
 }
 
-func TestClientThemePreferencePersistenceAcrossRestarts(t *testing.T) {
-	exeDir := t.TempDir()
-	prefsPath := filepath.Join(exeDir, ".sft-prefs.json")
-	m := newModel(Options{ExecutableDir: exeDir, Directory: t.TempDir(), PrefsPath: prefsPath})
-	if !m.th.dark {
-		t.Fatal("default theme should be dark")
-	}
+func TestClientAdaptiveThemeEmitsNoF6Action(t *testing.T) {
+	m := newModel(Options{ExecutableDir: t.TempDir(), Directory: t.TempDir()})
 	_, cmd := m.Update(tea.KeyMsg{Type: tea.KeyF6})
-	if cmd == nil {
-		t.Fatal("F6 did not emit theme save command")
-	}
-	if m.th.dark {
-		t.Fatal("F6 did not toggle dark theme off")
-	}
-	savedMsg := cmd()
-	m.Update(savedMsg)
-
-	reloaded := newModel(Options{ExecutableDir: exeDir, Directory: t.TempDir(), PrefsPath: prefsPath})
-	if reloaded.th.dark {
-		t.Fatal("light theme preference was not restored on restart")
+	if cmd != nil || m.statusToast != "" {
+		t.Fatalf("F6 should be a no-op after removing theme switcher: cmd=%v toast=%q", cmd, m.statusToast)
 	}
 }
 
