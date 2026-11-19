@@ -181,6 +181,52 @@ func formatBusyBadge(th theme, tick int, label string, started time.Time) string
 	return th.badgeWarn.Render(txt)
 }
 
+const (
+	toastDuration      = 2500 * time.Millisecond
+	toastErrorDuration = 3000 * time.Millisecond
+)
+
+func applyToast(dst *string, until *time.Time, msg string, ttl time.Duration) {
+	*dst = msg
+	if msg == "" || ttl <= 0 {
+		*until = time.Time{}
+		return
+	}
+	*until = time.Now().Add(ttl)
+}
+
+func expireToast(dst *string, until *time.Time, now time.Time) {
+	if *dst == "" || until.IsZero() {
+		return
+	}
+	if !now.Before(*until) {
+		*dst = ""
+		*until = time.Time{}
+	}
+}
+
+func effectiveTickNow(tickAt time.Time) time.Time {
+	now := time.Now()
+	if tickAt.After(now) {
+		return tickAt
+	}
+	return now
+}
+
+func remainingToastInterval(toast string, until time.Time, base time.Duration) time.Duration {
+	if toast == "" || until.IsZero() {
+		return base
+	}
+	rem := time.Until(until)
+	if rem <= 0 {
+		return min(base, 50*time.Millisecond)
+	}
+	if rem < base {
+		return rem
+	}
+	return base
+}
+
 type footerChip struct {
 	key       string
 	label     string

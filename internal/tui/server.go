@@ -60,12 +60,14 @@ type certRow struct {
 }
 
 type serverConfigLoadedMsg struct {
+	seq   uint64
 	cfg   config.Server
 	certs []certRow
 	err   error
 }
 
 type serverRuntimePolledMsg struct {
+	seq          uint64
 	endpointRoot string
 	snap         *monitor.Snapshot
 	runtimeState string
@@ -122,17 +124,23 @@ type serverModel struct {
 	queryInput   textinput.Model
 
 	// 游标与详情弹窗
-	cursors     [6]int
-	modal       serverModalKind
-	infoScroll  int
-	detailTitle string
-	detailLines []string
-	statusToast string
-	busy        bool
-	busyOp      string
-	busyStart   time.Time
-	busySpin    int
-	lastPoll    time.Time
+	cursors        [6]int
+	modal          serverModalKind
+	infoScroll     int
+	detailTitle    string
+	detailLines    []string
+	statusToast    string
+	toastUntil     time.Time
+	refreshSeq     uint64
+	refreshCfgSeq  uint64
+	refreshPollSeq uint64
+	refreshCfgErr  error
+	refreshPollErr error
+	busy           bool
+	busyOp         string
+	busyStart      time.Time
+	busySpin       int
+	lastPoll       time.Time
 
 	// 多字段表单输入与向导状态
 	formState
@@ -193,10 +201,50 @@ func (m *serverModel) tickCmd() tea.Cmd {
 	interval := time.Second
 	if m.busy {
 		interval = 150 * time.Millisecond
+	} else if m.modal == srvModalNone {
+		interval = remainingToastInterval(m.statusToast, m.toastUntil, interval)
 	}
 	return tea.Tick(interval, func(t time.Time) tea.Msg {
 		return serverTickMsg(t)
 	})
+}
+
+func (m *serverModel) setToast(msg string) {
+	m.refreshCfgSeq = 0
+	m.refreshPollSeq = 0
+	applyToast(&m.statusToast, &m.toastUntil, msg, toastDuration)
+}
+
+func (m *serverModel) setToastError(msg string) {
+	m.refreshCfgSeq = 0
+	m.refreshPollSeq = 0
+	applyToast(&m.statusToast, &m.toastUntil, msg, toastErrorDuration)
+}
+
+func (m *serverModel) setToastSticky(msg string) {
+	m.refreshCfgSeq = 0
+	m.refreshPollSeq = 0
+	applyToast(&m.statusToast, &m.toastUntil, msg, 0)
+}
+
+func (m *serverModel) clearToast() {
+	m.setToast("")
+}
+
+func (m *serverModel) completeManualRefresh() {
+	if m.refreshCfgSeq != 0 || m.refreshPollSeq != 0 || m.modal != srvModalNone {
+		return
+	}
+	switch {
+	case m.refreshCfgErr != nil:
+		m.setToastError("刷新完成，配置加载失败：" + m.refreshCfgErr.Error())
+	case m.refreshPollErr != nil:
+		m.setToastError("配置已刷新；运行状态查询异常：" + m.refreshPollErr.Error())
+	case m.runtime != nil:
+		m.setToast("已刷新配置与运行状态")
+	default:
+		m.setToast("已刷新配置（服务未运行）")
+	}
 }
 
 func (m *serverModel) startBusy(op string) {
@@ -220,14 +268,18 @@ func (m *serverModel) rejectIfBusy() bool {
 		op = "后台操作"
 	}
 	if sec := int(time.Since(m.busyStart).Seconds()); sec >= 1 {
-		m.statusToast = fmt.Sprintf("正在执行%s（已耗时 %ds），请稍候完成…", op, sec)
+		m.setToast(fmt.Sprintf("正在执行%s（已耗时 %ds），请稍候完成…", op, sec))
 	} else {
-		m.statusToast = fmt.Sprintf("正在执行%s，请稍候完成…", op)
+		m.setToast(fmt.Sprintf("正在执行%s，请稍候完成…", op))
 	}
 	return true
 }
 
 func (m *serverModel) loadConfigCmd() tea.Cmd {
+	return m.loadConfigSeqCmd(0)
+}
+
+func (m *serverModel) loadConfigSeqCmd(seq uint64) tea.Cmd {
 	cfgPath := m.opts.ConfigPath
 	return func() tea.Msg {
 		c, err := config.LoadServerDraft(cfgPath)
@@ -254,7 +306,7 @@ func (m *serverModel) loadConfigCmd() tea.Cmd {
 				addCert(u.UserID, role, u.Certificate)
 			}
 		}
-		return serverConfigLoadedMsg{cfg: c, certs: certs, err: err}
+		return serverConfigLoadedMsg{seq: seq, cfg: c, certs: certs, err: err}
 	}
 }
 
@@ -282,6 +334,10 @@ func (m *serverModel) resetLogsAndPollCmd() tea.Cmd {
 }
 
 func (m *serverModel) pollRuntimeCmd() tea.Cmd {
+	return m.pollRuntimeSeqCmd(0)
+}
+
+func (m *serverModel) pollRuntimeSeqCmd(seq uint64) tea.Cmd {
 	cfgPath := m.opts.ConfigPath
 	root := m.endpointRoot
 	diskRoot := ""
@@ -317,6 +373,7 @@ func (m *serverModel) pollRuntimeCmd() tea.Cmd {
 		}
 
 		var out serverRuntimePolledMsg
+		out.seq = seq
 		out.endpointRoot = root
 		out.err = err
 		out.snap = snap
@@ -429,6 +486,10 @@ func (m *serverModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case serverTickMsg:
 		m.busySpin = (m.busySpin + 1) % len(spinnerFrames)
+		now := effectiveTickNow(time.Time(msg))
+		if m.modal == srvModalNone {
+			expireToast(&m.statusToast, &m.toastUntil, now)
+		}
 		if !m.busy || time.Since(m.lastPoll) >= time.Second {
 			m.lastPoll = time.Now()
 			return m, tea.Batch(m.tickCmd(), m.pollRuntimeCmd())
@@ -450,6 +511,11 @@ func (m *serverModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.beginDeployWizard()
 		}
 		m.clampCursors()
+		if msg.seq != 0 && msg.seq == m.refreshCfgSeq {
+			m.refreshCfgSeq = 0
+			m.refreshCfgErr = msg.err
+			m.completeManualRefresh()
+		}
 		return m, nil
 
 	case serverRuntimePolledMsg:
@@ -474,14 +540,21 @@ func (m *serverModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.cursors[5] = max(0, m.currentPageLen()-1)
 		}
 		m.clampCursors()
+		if msg.seq != 0 && msg.seq == m.refreshPollSeq {
+			m.refreshPollSeq = 0
+			m.refreshPollErr = msg.err
+			m.completeManualRefresh()
+		}
 		return m, nil
 
 	case serverActionResultMsg:
 		m.stopBusy()
 		if msg.err != nil {
-			m.statusToast = "操作失败：" + msg.err.Error()
+			m.setToastError("操作失败：" + msg.err.Error())
 		} else if msg.notice != "" {
-			m.statusToast = msg.notice
+			m.setToast(msg.notice)
+		} else if m.toastUntil.IsZero() {
+			m.clearToast()
 		}
 		var cmds []tea.Cmd
 		if msg.refresh {
@@ -499,7 +572,7 @@ func (m *serverModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.deploy.summaryErr = msg.err.Error()
 				m.openDeployStep(4)
 			} else {
-				m.statusToast = "部署初始化失败：" + msg.err.Error()
+				m.setToastError("部署初始化失败：" + msg.err.Error())
 			}
 			return m, nil
 		}
@@ -513,7 +586,7 @@ func (m *serverModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.opts.ConfigPath == "" && msg.d.Config != "" {
 			m.opts.ConfigPath = msg.d.Config
 		}
-		m.statusToast = "部署初始化已完成"
+		m.setToast("部署初始化已完成")
 		return m, tea.Batch(m.loadConfigCmd(), m.pollRuntimeCmd())
 
 	case deployExportDoneMsg:
@@ -523,19 +596,19 @@ func (m *serverModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.deploy.finishMsg = "部署已保存；导出失败：" + msg.err.Error()
 				m.openDeployStep(5)
 			}
-			m.statusToast = "导出失败：" + msg.err.Error()
+			m.setToastError("导出失败：" + msg.err.Error())
 			return m, nil
 		}
 		if m.deploy != nil {
 			m.deploy.finishMsg = "用户包已成功导出至：" + msg.outDir
 			m.openDeployStep(5)
 		}
-		m.statusToast = "用户包已导出：" + msg.outDir
+		m.setToast("用户包已导出：" + msg.outDir)
 		return m, nil
 
 	case themeSavedMsg:
 		if msg.err != nil {
-			m.statusToast = "无法保存主题偏好：" + msg.err.Error()
+			m.setToastError("无法保存主题偏好：" + msg.err.Error())
 		}
 		return m, nil
 
@@ -556,9 +629,9 @@ func (m *serverModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if k == "f6" {
 		m.th = makeTheme(!m.th.dark)
 		if m.th.dark {
-			m.statusToast = "已切换为深色主题"
+			m.setToast("已切换为深色主题")
 		} else {
-			m.statusToast = "已切换为浅色主题"
+			m.setToast("已切换为浅色主题")
 		}
 		return m, saveThemePrefCmd(m.prefsPath, m.th.dark)
 	}
@@ -652,8 +725,14 @@ func (m *serverModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.queryInput.CursorEnd()
 		return m, textinput.Blink
 	case "r":
-		m.statusToast = "正在刷新配置与运行状态…"
-		return m, tea.Batch(m.loadConfigCmd(), m.pollRuntimeCmd())
+		m.setToastSticky("正在刷新配置与运行状态…")
+		m.refreshSeq++
+		seq := m.refreshSeq
+		m.refreshCfgSeq = seq
+		m.refreshPollSeq = seq
+		m.refreshCfgErr = nil
+		m.refreshPollErr = nil
+		return m, tea.Batch(m.loadConfigSeqCmd(seq), m.pollRuntimeSeqCmd(seq))
 	case "R":
 		return m, m.reloadServiceCmd()
 	case "s":
@@ -665,7 +744,7 @@ func (m *serverModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if m.runtime != nil {
 			m.modal = srvModalStop
 		} else {
-			m.statusToast = "本机服务当前未运行"
+			m.setToast("本机服务当前未运行")
 		}
 		return m, nil
 	case "up", "k":
@@ -756,7 +835,7 @@ func (m *serverModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.logCursor = 0
 				m.logEvents = nil
 				m.logPaused = false
-				m.statusToast = "已按用户过滤并跳转至相关日志：" + u.UserID
+				m.setToast("已按用户过滤并跳转至相关日志：" + u.UserID)
 				return m.switchPage(5)
 			}
 		case "enter":
@@ -776,7 +855,7 @@ func (m *serverModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.logCursor = 0
 				m.logEvents = nil
 				m.logPaused = false
-				m.statusToast = fmt.Sprintf("已跳转至 %s / %s 的相关日志", t.User, t.File)
+				m.setToast(fmt.Sprintf("已跳转至 %s / %s 的相关日志", t.User, t.File))
 				return m.switchPage(5)
 			}
 		case "enter":
@@ -886,7 +965,7 @@ func (m *serverModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.logQuery = monitor.LogQuery{}
 			m.logMinLevel = ""
 			m.logSinceIdx = 0
-			m.statusToast = "已清空全部日志筛选条件"
+			m.setToast("已清空全部日志筛选条件")
 			return m, m.resetLogsAndPollCmd()
 		case "enter":
 			if m.logFallback == "" && m.cursors[5] < len(m.logEvents) {
@@ -1030,7 +1109,7 @@ func (m *serverModel) initForm(labels, defaults, toggleLabels []string, toggles 
 
 func (m *serverModel) openNewUserModal() {
 	m.resetForm()
-	m.statusToast = ""
+	m.clearToast()
 	m.targetUser = nil
 	m.modal = srvModalNewUser
 	m.addTextRow("用户名", "")
@@ -1046,14 +1125,14 @@ func (m *serverModel) openNewUserModal() {
 	m.addSizeUnitRow("自定义下载速率", bw.DownloadBytesPerSecond, true)
 	m.addSizeUnitRow("自定义突发配额", bw.BurstBytes, false)
 	m.formButtons = []formButton{
-		{label: "取消", onClick: func() (tea.Model, tea.Cmd) { m.modal = srvModalNone; m.statusToast = ""; return m, nil }},
+		{label: "取消", onClick: func() (tea.Model, tea.Cmd) { m.modal = srvModalNone; m.clearToast(); return m, nil }},
 		{label: "创建用户 ★", primary: true, onClick: func() (tea.Model, tea.Cmd) { return m.submitModalForm() }},
 	}
 	m.finalizeFormFocus(true)
 }
 
 func (m *serverModel) openCSRModal(user string) {
-	m.statusToast = ""
+	m.clearToast()
 	m.targetUser = nil
 	m.initForm([]string{"用户名", "CSR 文件路径", "有效期(天)"}, []string{user, "", "30"}, nil, nil)
 	m.modal = srvModalCSR
@@ -1083,7 +1162,7 @@ func (m *serverModel) openEditPolicyModal(u config.AuthorizedClient) {
 	m.targetUser = &uCopy
 
 	m.resetForm()
-	m.statusToast = ""
+	m.clearToast()
 	m.modal = srvModalEditPolicy
 	m.addToggleRow("启用该用户", !u.Disabled, nil)
 	m.addToggleRow("允许上传", hasUp, nil)
@@ -1093,7 +1172,7 @@ func (m *serverModel) openEditPolicyModal(u config.AuthorizedClient) {
 	m.addSizeUnitRow("下载速率", bw.DownloadBytesPerSecond, true)
 	m.addSizeUnitRow("突发配额", bw.BurstBytes, false)
 	m.formButtons = []formButton{
-		{label: "取消", onClick: func() (tea.Model, tea.Cmd) { m.modal = srvModalNone; m.targetUser = nil; m.statusToast = ""; return m, nil }},
+		{label: "取消", onClick: func() (tea.Model, tea.Cmd) { m.modal = srvModalNone; m.targetUser = nil; m.clearToast(); return m, nil }},
 		{label: "保存策略 ★", primary: true, onClick: func() (tea.Model, tea.Cmd) { return m.submitModalForm() }},
 	}
 	m.finalizeFormFocus(false)
@@ -1102,14 +1181,14 @@ func (m *serverModel) openEditPolicyModal(u config.AuthorizedClient) {
 func (m *serverModel) openExportUserModal(u config.AuthorizedClient) {
 	uCopy := u
 	m.targetUser = &uCopy
-	m.statusToast = ""
+	m.clearToast()
 	outDir := filepath.Join("bundles", u.UserID)
 	m.initForm([]string{"导出目标目录"}, []string{outDir}, []string{"仅导出公开证书(-public-only，不含私钥)"}, []bool{u.ExternalKey})
 	m.modal = srvModalExportUser
 }
 
 func (m *serverModel) openRotateServerModal() {
-	m.statusToast = ""
+	m.clearToast()
 	m.targetUser = nil
 	m.initForm([]string{"服务端 SAN(逗号分隔 DNS/IP，留空沿用)", "有效期(天)"}, []string{"", "30"}, nil, nil)
 	m.modal = srvModalRotateServer
@@ -1204,6 +1283,9 @@ func (m *serverModel) scrollServerInfoModal(k string) {
 func (m *serverModel) handleModalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	k := msg.String()
 	if k == "esc" && !m.dropdownOpen {
+		if m.modal != srvModalHelp && m.modal != srvModalDetail && m.modal != srvModalStop {
+			m.clearToast()
+		}
 		m.modal = srvModalNone
 		m.targetUser = nil
 		m.settingsDraft = nil
@@ -1357,16 +1439,16 @@ func (m *serverModel) submitModalForm() (tea.Model, tea.Cmd) {
 	case srvModalNewUser:
 		name := strings.TrimSpace(m.formInputs[0].Value())
 		if !config.ValidUserPath(name) || isReservedIdentityName(name) {
-			m.statusToast = "用户名无效（须为字母/数字/._-，且不能为系统保留名）"
+			m.setToastSticky("用户名无效（须为字母/数字/._-，且不能为系统保留名）")
 			return m, m.focusInputRow(0)
 		}
 		if existing, ok := m.findAuthorizedClient(name); ok {
-			m.statusToast = fmt.Sprintf("用户 %q 已存在", existing.UserID)
+			m.setToastSticky(fmt.Sprintf("用户 %q 已存在", existing.UserID))
 			return m, m.focusInputRow(0)
 		}
 		days, err := parseStrictCertDays(m.formInputs[1].Value())
 		if err != nil {
-			m.statusToast = err.Error()
+			m.setToastSticky(err.Error())
 			return m, m.focusInputRow(1)
 		}
 		perms := []string{}
@@ -1381,11 +1463,11 @@ func (m *serverModel) submitModalForm() (tea.Model, tea.Cmd) {
 			var badIdx int
 			bw, badIdx, err = m.validateBandwidthInputs(2, 3, 4)
 			if err != nil {
-				m.statusToast = err.Error()
+				m.setToastSticky(err.Error())
 				return m, m.focusInputRow(badIdx)
 			}
 		}
-		m.statusToast = ""
+		m.clearToast()
 		m.modal = srvModalNone
 		o := m.certBaseOptions(name)
 		o.Days = days
@@ -1395,28 +1477,28 @@ func (m *serverModel) submitModalForm() (tea.Model, tea.Cmd) {
 	case srvModalCSR:
 		name := strings.TrimSpace(m.formInputs[0].Value())
 		if !config.ValidUserPath(name) || isReservedIdentityName(name) {
-			m.statusToast = "用户名无效（须为字母/数字/._-，且不能为系统保留名）"
+			m.setToastSticky("用户名无效（须为字母/数字/._-，且不能为系统保留名）")
 			return m, m.focusInputRow(0)
 		}
 		renewTarget := m.targetUser != nil && (m.targetUser.UserID == name || (runtime.GOOS == "windows" && strings.EqualFold(m.targetUser.UserID, name)))
 		if !renewTarget {
 			if existing, ok := m.findAuthorizedClient(name); ok {
-				m.statusToast = fmt.Sprintf("用户 %q 已存在（如需续期请从用户列表按 [w]）", existing.UserID)
+				m.setToastSticky(fmt.Sprintf("用户 %q 已存在（如需续期请从用户列表按 [w]）", existing.UserID))
 				return m, m.focusInputRow(0)
 			}
 		}
 		csr := strings.TrimSpace(m.formInputs[1].Value())
 		if csr == "" {
-			m.statusToast = "CSR 文件路径不能为空"
+			m.setToastSticky("CSR 文件路径不能为空")
 			return m, m.focusInputRow(1)
 		}
 		days, err := parseStrictCertDays(m.formInputs[2].Value())
 		if err != nil {
-			m.statusToast = err.Error()
+			m.setToastSticky(err.Error())
 			return m, m.focusInputRow(2)
 		}
 		if _, err := security.ReadCSR(csr); err != nil {
-			m.statusToast = err.Error()
+			m.setToastSticky(err.Error())
 			return m, m.focusInputRow(1)
 		}
 		var expected *config.AuthorizedClient
@@ -1425,7 +1507,7 @@ func (m *serverModel) submitModalForm() (tea.Model, tea.Cmd) {
 			expected = &uCopy
 			name = uCopy.UserID
 		}
-		m.statusToast = ""
+		m.clearToast()
 		m.modal = srvModalNone
 		m.targetUser = nil
 		o := m.certBaseOptions(name)
@@ -1458,11 +1540,11 @@ func (m *serverModel) submitModalForm() (tea.Model, tea.Cmd) {
 			var err error
 			bw, badIdx, err = m.validateBandwidthInputs(0, 1, 2)
 			if err != nil {
-				m.statusToast = err.Error()
+				m.setToastSticky(err.Error())
 				return m, m.focusInputRow(badIdx)
 			}
 		}
-		m.statusToast = ""
+		m.clearToast()
 		m.modal = srvModalNone
 		m.targetUser = nil
 		o := m.certBaseOptions(u.UserID)
@@ -1484,11 +1566,11 @@ func (m *serverModel) submitModalForm() (tea.Model, tea.Cmd) {
 		}
 		out := strings.TrimSpace(m.formInputs[0].Value())
 		if out == "" {
-			m.statusToast = "导出目标目录不能为空"
+			m.setToastSticky("导出目标目录不能为空")
 			return m, m.focusInputRow(0)
 		}
 		u := *m.targetUser
-		m.statusToast = ""
+		m.clearToast()
 		m.modal = srvModalNone
 		m.targetUser = nil
 		o := m.certBaseOptions(u.UserID)
@@ -1506,16 +1588,16 @@ func (m *serverModel) submitModalForm() (tea.Model, tea.Cmd) {
 		hosts := strings.TrimSpace(m.formInputs[0].Value())
 		if hosts != "" {
 			if _, _, err := security.ParseServerNames(hosts); err != nil {
-				m.statusToast = err.Error()
+				m.setToastSticky(err.Error())
 				return m, m.focusInputRow(0)
 			}
 		}
 		days, err := parseStrictCertDays(m.formInputs[1].Value())
 		if err != nil {
-			m.statusToast = err.Error()
+			m.setToastSticky(err.Error())
 			return m, m.focusInputRow(1)
 		}
-		m.statusToast = ""
+		m.clearToast()
 		m.modal = srvModalNone
 		o := m.certBaseOptions("")
 		o.Hosts = hosts
@@ -1585,13 +1667,13 @@ func (m *serverModel) startServiceCmd() tea.Cmd {
 		return nil
 	}
 	if m.runtime != nil && m.runtime.State == "running" {
-		m.statusToast = "服务已在运行中"
+		m.setToast("服务已在运行中")
 		return nil
 	}
 	cfgPath := m.opts.ConfigPath
 	exeDir := m.opts.ExecutableDir
 	m.startBusy("后台启动 sftd 服务")
-	m.statusToast = "正在后台启动 sftd 服务…"
+	m.setToastSticky("正在后台启动 sftd 服务…")
 	return func() tea.Msg {
 		exe, err := os.Executable()
 		if err != nil {

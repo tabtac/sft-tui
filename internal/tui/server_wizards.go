@@ -36,7 +36,7 @@ type deployExportDoneMsg struct {
 
 func (m *serverModel) beginDeployWizard() {
 	if m.cfgErr == nil && m.loaded {
-		m.statusToast = "当前部署配置已存在，可在 [5 设置] 或 [2 用户] 中维护"
+		m.setToast("当前部署配置已存在，可在 [5 设置] 或 [2 用户] 中维护")
 		return
 	}
 	if m.deploy == nil {
@@ -79,7 +79,7 @@ func (m *serverModel) openDeployStep(step int) {
 	}
 	w.step = step
 	m.resetForm()
-	m.statusToast = ""
+	m.clearToast()
 	m.modal = srvModalDeployWizard
 
 	switch step {
@@ -144,22 +144,22 @@ func (m *serverModel) openDeployStep(step int) {
 			{label: "返回面板", onClick: func() (tea.Model, tea.Cmd) {
 				capture1()
 				m.modal = srvModalNone
-				m.statusToast = "部署向导输入已暂存，按 [I] 可继续"
+				m.setToast("部署向导输入已暂存，按 [I] 可继续")
 				return m, nil
 			}},
 			{label: "下一步 ▶", primary: true, onClick: func() (tea.Model, tea.Cmd) {
 				capture1()
 				host, port, err := setup.ValidateAddress(w.d.Address)
 				if err != nil {
-					m.statusToast = err.Error()
+					m.setToastSticky(err.Error())
 					return m, m.focusInputRow(addrIdx)
 				}
 				if w.scene == 0 && host != "localhost" && (net.ParseIP(host) == nil || !net.ParseIP(host).IsLoopback()) {
-					m.statusToast = "跨主机地址请将部署场景切换为「局域网 / 跨主机部署」"
+					m.setToastSticky("跨主机地址请将部署场景切换为「局域网 / 跨主机部署」")
 					return m, m.focusSelectRow(sceneIdx)
 				}
 				if _, lport, err := net.SplitHostPort(w.d.Listen); err != nil || lport == "" {
-					m.statusToast = "监听地址格式无效，须为 IP:端口（如 0.0.0.0:7443）"
+					m.setToastSticky("监听地址格式无效，须为 IP:端口（如 0.0.0.0:7443）")
 					return m, m.focusInputRow(listenIdx)
 				}
 				baseKey := fmt.Sprintf("%d:%s", w.scene, w.d.Address)
@@ -205,7 +205,7 @@ func (m *serverModel) openDeployStep(step int) {
 			{label: "下一步 ▶", primary: true, onClick: func() (tea.Model, tea.Cmd) {
 				capture2()
 				if w.d.Storage == "" {
-					m.statusToast = "存储目录不能为空"
+					m.setToastSticky("存储目录不能为空")
 					return m, m.focusInputRow(stIdx)
 				}
 				if !filepath.IsAbs(w.d.Storage) {
@@ -213,7 +213,7 @@ func (m *serverModel) openDeployStep(step int) {
 				}
 				abs, err := filepath.Abs(w.d.Storage)
 				if err != nil {
-					m.statusToast = err.Error()
+					m.setToastSticky(err.Error())
 					return m, m.focusInputRow(stIdx)
 				}
 				w.d.Storage = abs
@@ -324,7 +324,7 @@ func (m *serverModel) openDeployStep(step int) {
 			}},
 			{label: "下一步 ▶", primary: true, onClick: func() (tea.Model, tea.Cmd) {
 				if badIdx, err := capture3(true); err != nil {
-					m.statusToast = err.Error()
+					m.setToastSticky(err.Error())
 					return m, m.focusInputRow(badIdx)
 				}
 				for _, p := range []*string{&w.d.CertDir, &w.d.ClientDir} {
@@ -485,7 +485,7 @@ func (m *serverModel) openDeployStep(step int) {
 			}},
 			{label: "下一步：部署摘要 ▶", primary: true, onClick: func() (tea.Model, tea.Cmd) {
 				if badIdx, err := capture35(true); err != nil {
-					m.statusToast = err.Error()
+					m.setToastSticky(err.Error())
 					return m, m.focusInputRow(badIdx)
 				}
 				w.summaryErr = ""
@@ -539,7 +539,7 @@ func (m *serverModel) openDeployStep(step int) {
 			}
 			m.startBusy("初始化部署与证书")
 			m.modal = srvModalNone
-			m.statusToast = "正在生成证书与初始化部署…"
+			m.setToastSticky("正在生成证书与初始化部署…")
 			cfgPath := d.Config
 			return m, func() tea.Msg {
 				if _, err := setup.InitializeDeployment(d); err != nil {
@@ -588,6 +588,9 @@ func (m *serverModel) openDeployStep(step int) {
 				w.exportDir = strings.TrimSpace(m.formInputs[expIdx].Value())
 				m.modal = srvModalNone
 				m.deploy = nil
+				if m.statusToast != "" {
+					m.setToast(m.statusToast)
+				}
 				return m, tea.Batch(m.loadConfigCmd(), m.pollRuntimeCmd())
 			}},
 			{label: "启动/检查服务", onClick: func() (tea.Model, tea.Cmd) {
@@ -601,7 +604,7 @@ func (m *serverModel) openDeployStep(step int) {
 				}
 				out := strings.TrimSpace(m.formInputs[expIdx].Value())
 				if out == "" {
-					m.statusToast = "请填写导出目标目录"
+					m.setToastSticky("请填写导出目标目录")
 					return m, nil
 				}
 				w.exportDir = out
@@ -626,7 +629,7 @@ func (m *serverModel) openDeployStep(step int) {
 
 func (m *serverModel) openEditSettingsModal() {
 	if m.cfgErr != nil {
-		m.statusToast = "请先加载或初始化有效的服务端配置"
+		m.setToast("请先加载或初始化有效的服务端配置")
 		return
 	}
 	draft := m.cfg
@@ -641,7 +644,7 @@ func (m *serverModel) rebuildBasicSettingsForm() {
 		return
 	}
 	m.resetForm()
-	m.statusToast = ""
+	m.clearToast()
 	m.modal = srvModalEditSettings
 	m.addNoteRow([]string{
 		"说明：除全局总带宽可通过 [A] 热加载外，其余设置修改保存后需重启 sftd 生效。",
@@ -756,11 +759,12 @@ func (m *serverModel) rebuildBasicSettingsForm() {
 		{label: "取消", onClick: func() (tea.Model, tea.Cmd) {
 			m.modal = srvModalNone
 			m.settingsDraft = nil
+			m.clearToast()
 			return m, nil
 		}},
 		{label: "下一步：协议与资源限额 ▶", onClick: func() (tea.Model, tea.Cmd) {
 			if badIdx, err := captureBasic(true); err != nil {
-				m.statusToast = err.Error()
+				m.setToastSticky(err.Error())
 				return m, m.focusInputRow(badIdx)
 			}
 			m.openAdvancedSettingsModal()
@@ -768,7 +772,7 @@ func (m *serverModel) rebuildBasicSettingsForm() {
 		}},
 		{label: "直接保存 ★", primary: true, onClick: func() (tea.Model, tea.Cmd) {
 			if badIdx, err := captureBasic(true); err != nil {
-				m.statusToast = err.Error()
+				m.setToastSticky(err.Error())
 				return m, m.focusInputRow(badIdx)
 			}
 			return m.saveServerSettingsCmd(*c)
@@ -780,7 +784,7 @@ func (m *serverModel) rebuildBasicSettingsForm() {
 func (m *serverModel) openAdvancedSettingsModal() {
 	if m.settingsDraft == nil {
 		if m.cfgErr != nil {
-			m.statusToast = "请先加载有效的服务端配置"
+			m.setToast("请先加载有效的服务端配置")
 			return
 		}
 		draft := m.cfg
@@ -789,7 +793,7 @@ func (m *serverModel) openAdvancedSettingsModal() {
 	}
 	c := m.settingsDraft
 	m.resetForm()
-	m.statusToast = ""
+	m.clearToast()
 	m.modal = srvModalEditAdvancedSettings
 	m.addNoteRow([]string{
 		"高级协议、超时与资源限额（↑↓/Tab/鼠标浏览完整 18 项配置，全部项保存后重启服务生效）：",
@@ -838,7 +842,7 @@ func (m *serverModel) openAdvancedSettingsModal() {
 		}},
 		{label: "保存全部设置 ★", primary: true, onClick: func() (tea.Model, tea.Cmd) {
 			if badIdx, err := applyAdv(); err != nil {
-				m.statusToast = err.Error()
+				m.setToastSticky(err.Error())
 				return m, m.focusInputRow(badIdx)
 			}
 			return m.saveServerSettingsCmd(*c)
@@ -849,11 +853,11 @@ func (m *serverModel) openAdvancedSettingsModal() {
 
 func (m *serverModel) openLogLimitModal() {
 	if m.cfgErr != nil {
-		m.statusToast = "请先加载有效配置"
+		m.setToast("请先加载有效配置")
 		return
 	}
 	m.resetForm()
-	m.statusToast = ""
+	m.clearToast()
 	m.modal = srvModalEditLogLimit
 	m.addNoteRow([]string{
 		"日志单文件大小上限 (64 KiB–1 GiB)；写满后自动清空旧内容重用当前文件，保存后需重启生效。",
@@ -862,18 +866,19 @@ func (m *serverModel) openLogLimitModal() {
 	m.formButtons = []formButton{
 		{label: "取消", onClick: func() (tea.Model, tea.Cmd) {
 			m.modal = srvModalNone
+			m.clearToast()
 			return m, nil
 		}},
 		{label: "保存上限 ★", primary: true, onClick: func() (tea.Model, tea.Cmd) {
 			v, err := m.parseSizeInput(logIdx, "日志文件大小上限")
 			if err != nil {
-				m.statusToast = err.Error()
+				m.setToastSticky(err.Error())
 				return m, m.focusInputRow(logIdx)
 			}
 			next := m.cfg
 			next.Logging.MaxFileBytes = v
 			if err := next.ValidateDraft(); err != nil {
-				m.statusToast = err.Error()
+				m.setToastSticky(err.Error())
 				return m, m.focusInputRow(logIdx)
 			}
 			m.settingsExpected = m.cfg
@@ -888,7 +893,7 @@ func (m *serverModel) saveServerSettingsCmd(proposed config.Server) (tea.Model, 
 		return m, nil
 	}
 	if err := proposed.ValidateDraft(); err != nil {
-		m.statusToast = err.Error()
+		m.setToastSticky(err.Error())
 		return m, nil
 	}
 	expected := m.settingsExpected
@@ -896,6 +901,7 @@ func (m *serverModel) saveServerSettingsCmd(proposed config.Server) (tea.Model, 
 	cfgPath := m.opts.ConfigPath
 	gbChanged := (expected.GlobalBandwidth == nil) != (proposed.GlobalBandwidth == nil) ||
 		(expected.GlobalBandwidth != nil && proposed.GlobalBandwidth != nil && *expected.GlobalBandwidth != *proposed.GlobalBandwidth)
+	m.clearToast()
 	m.modal = srvModalNone
 	m.settingsDraft = nil
 	m.startBusy("保存服务端配置")

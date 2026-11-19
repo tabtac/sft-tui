@@ -213,6 +213,7 @@ type model struct {
 	queueCursor   int
 	completedSeen map[string]bool
 	statusToast   string
+	toastUntil    time.Time
 	quitting      bool
 
 	// 弹窗辅助数据
@@ -303,6 +304,22 @@ func (m *model) Init() tea.Cmd {
 		m.initIdentityCmd(),
 		m.tickCmd(),
 	)
+}
+
+func (m *model) setToast(msg string) {
+	applyToast(&m.statusToast, &m.toastUntil, msg, toastDuration)
+}
+
+func (m *model) setToastError(msg string) {
+	applyToast(&m.statusToast, &m.toastUntil, msg, toastErrorDuration)
+}
+
+func (m *model) setToastSticky(msg string) {
+	applyToast(&m.statusToast, &m.toastUntil, msg, 0)
+}
+
+func (m *model) clearToast() {
+	m.setToast("")
 }
 
 func (m *model) tickCmd() tea.Cmd {
@@ -457,7 +474,7 @@ func (m *model) unfinishedTaskCounts() (active, paused int) {
 
 func (m *model) beginIdentitySwitch(ch identityChoice, customPath string, bypassConfirm bool) tea.Cmd {
 	if m.activatingID {
-		m.statusToast = "正在切换或导入身份，请稍候…"
+		m.setToastSticky("正在切换或导入身份，请稍候…")
 		return nil
 	}
 	targetLabel := customPath
@@ -472,7 +489,7 @@ func (m *model) beginIdentitySwitch(ch identityChoice, customPath string, bypass
 				m.activatingID = true
 				m.opLabel = "正在扫描身份目录"
 				m.opStart = time.Now()
-				m.statusToast = "正在扫描目录中的身份配置…"
+				m.setToastSticky("正在扫描目录中的身份配置…")
 				return m.discoverOrActivatePathCmd(customPath, activeN+pausedN > 0)
 			}
 		}
@@ -484,7 +501,7 @@ func (m *model) beginIdentitySwitch(ch identityChoice, customPath string, bypass
 				activeCount: activeN,
 				pausedCount: pausedN,
 			}
-			m.statusToast = ""
+			m.clearToast()
 			return nil
 		}
 	}
@@ -492,10 +509,10 @@ func (m *model) beginIdentitySwitch(ch identityChoice, customPath string, bypass
 	m.activatingID = true
 	if customPath != "" {
 		m.opLabel = "正在导入身份"
-		m.statusToast = "正在校验并导入身份…"
+		m.setToastSticky("正在校验并导入身份…")
 	} else {
 		m.opLabel = "正在切换身份"
-		m.statusToast = "正在切换身份…"
+		m.setToastSticky("正在切换身份…")
 	}
 	m.opStart = time.Now()
 	return m.activateChoiceCmd(ch, customPath)
@@ -668,6 +685,10 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tickMsg:
 		m.spinIdx = (m.spinIdx + 1) % len(spinnerFrames)
+		now := effectiveTickNow(time.Time(msg))
+		if m.modal == modalNone && !m.activatingID && !m.testingConn && !m.opBusy {
+			expireToast(&m.statusToast, &m.toastUntil, now)
+		}
 		if m.refreshQueueSnapshots() {
 			return m, tea.Batch(m.tickCmd(), m.loadLocalCmd(m.localDir), m.loadRemoteCmd())
 		}
@@ -680,7 +701,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.loadingLocal = false
 		if msg.err != nil {
 			m.pendingLocalFocusPath = ""
-			m.statusToast = "无法读取目录：" + msg.err.Error()
+			m.setToastError("无法读取目录：" + msg.err.Error())
 			return m, nil
 		}
 		prevDir := m.localDir
@@ -737,7 +758,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.idCursor = max(0, len(m.idChoices)-1)
 		}
 		if msg.err != nil && len(msg.choices) == 0 {
-			m.statusToast = msg.err.Error()
+			m.setToastError(msg.err.Error())
 		}
 		return m, nil
 
@@ -769,17 +790,17 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.idInputFocus = false
 		m.idInput.Blur()
-		m.statusToast = fmt.Sprintf("目录发现 %d 个身份配置，请预览详情后按 Enter 激活或 t 测连", len(msg.choices))
+		m.setToastSticky(fmt.Sprintf("目录发现 %d 个身份配置，请预览详情后按 Enter 激活或 t 测连", len(msg.choices)))
 		return m, nil
 
 	case identityConnTestMsg:
 		m.testingConn = false
 		if msg.err != nil {
 			m.idTestResults[msg.path] = identityTestState{tested: true, latency: msg.latency, err: msg.err.Error()}
-			m.statusToast = "连接测试失败：" + msg.err.Error()
+			m.setToastSticky("连接测试失败：" + msg.err.Error())
 		} else {
 			m.idTestResults[msg.path] = identityTestState{tested: true, latency: msg.latency}
-			m.statusToast = fmt.Sprintf("连接测试成功，耗时 %s", msg.latency.Round(time.Millisecond))
+			m.setToastSticky(fmt.Sprintf("连接测试成功，耗时 %s", msg.latency.Round(time.Millisecond)))
 		}
 		return m, nil
 
@@ -805,13 +826,13 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.modal = modalIdentity
 				m.connStatus = "需要选择或导入身份"
 				if firstOpen {
-					m.statusToast = "未找到已激活身份，请从列表选择或输入配置目录导入"
+					m.setToastSticky("未找到已激活身份，请从列表选择或输入配置目录导入")
 				} else {
-					m.statusToast = msg.err.Error()
+					m.setToastSticky(msg.err.Error())
 				}
 				return m, m.scanIdentitiesCmd()
 			}
-			m.statusToast = msg.err.Error()
+			m.setToastError(msg.err.Error())
 			return m, nil
 		}
 		// 释放旧实例仅在替换时安全（通常 activateChoiceCmd 已关闭旧实例；启动期无旧实例）
@@ -844,9 +865,9 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		if unfinishedN > 0 {
 			m.recoveryNotice = fmt.Sprintf("检测到 %d 个未完成断点任务（暂停 %d / 待处理 %d / 等待 %d），去队列按 [a] 恢复或 [F5] 继续", unfinishedN, pausedN, pendingN, waitingN)
-			m.statusToast = m.recoveryNotice
+			m.setToast(m.recoveryNotice)
 		} else {
-			m.statusToast = "已加载身份：" + msg.label
+			m.setToast("已加载身份：" + msg.label)
 		}
 		return m, m.loadRemoteCmd()
 
@@ -855,14 +876,16 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.opLabel = ""
 		m.opStart = time.Time{}
 		if msg.err != nil {
-			m.statusToast = msg.err.Error()
+			m.setToastError(msg.err.Error())
 			return m, nil
 		}
 		if len(msg.enqueued) > 0 {
 			m.recordEnqueuedBatch(msg.enqueued)
 		}
 		if msg.notice != "" {
-			m.statusToast = msg.notice
+			m.setToast(msg.notice)
+		} else if m.toastUntil.IsZero() {
+			m.clearToast()
 		}
 		if len(msg.enqueued) > 0 {
 			m.refreshQueueSnapshots()
@@ -875,7 +898,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case themeSavedMsg:
 		if msg.err != nil {
-			m.statusToast = "无法保存主题偏好：" + msg.err.Error()
+			m.setToastError("无法保存主题偏好：" + msg.err.Error())
 		}
 		return m, nil
 
@@ -896,9 +919,9 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if k == "f6" {
 		m.th = makeTheme(!m.th.dark)
 		if m.th.dark {
-			m.statusToast = "已切换为深色主题"
+			m.setToast("已切换为深色主题")
 		} else {
-			m.statusToast = "已切换为浅色主题"
+			m.setToast("已切换为浅色主题")
 		}
 		return m, saveUIPrefsCmd(m.prefsPath, m.currentPrefs())
 	}
@@ -1006,11 +1029,11 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		case areaRemote:
 			m.remoteSort = (m.remoteSort + 1) % 4
 			m.rebuildRemoteVisible()
-			m.statusToast = "远端排序：" + m.sortLabel(m.remoteSort)
+			m.setToast("远端排序：" + m.sortLabel(m.remoteSort))
 		default:
 			m.localSort = (m.localSort + 1) % 4
 			m.rebuildLocalVisible()
-			m.statusToast = "本地排序：" + m.sortLabel(m.localSort)
+			m.setToast("本地排序：" + m.sortLabel(m.localSort))
 		}
 		return m, saveUIPrefsCmd(m.prefsPath, m.currentPrefs())
 	case "r":
@@ -1020,7 +1043,7 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, tea.Batch(m.loadLocalCmd(m.localDir), m.loadRemoteCmd())
 	case "B":
 		if m.lastBatch == nil && len(m.batchHistory) == 0 {
-			m.statusToast = "当前会话暂无已完成批次结果摘要"
+			m.setToast("当前会话暂无已完成批次结果摘要")
 			return m, nil
 		}
 		m.infoScroll = 0
@@ -1035,7 +1058,7 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.modal = modalIdentity
 		m.pendingSwitch = nil
 		m.editingIDLabel = false
-		m.statusToast = ""
+		m.clearToast()
 		m.idInputFocus = false
 		m.idInput.Blur()
 		m.idLabelInput.Blur()
@@ -1303,7 +1326,7 @@ func (m *model) handleModalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			switch k {
 			case "esc", "n":
 				m.pendingSwitch = nil
-				m.statusToast = ""
+				m.clearToast()
 				return m, nil
 			case "enter", "y":
 				ps := m.pendingSwitch
@@ -1317,7 +1340,7 @@ func (m *model) handleModalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			case "esc":
 				m.editingIDLabel = false
 				m.idLabelInput.Blur()
-				m.statusToast = ""
+				m.clearToast()
 				return m, nil
 			case "enter":
 				if m.idCursor < 0 || m.idCursor >= len(m.idChoices) {
@@ -1327,23 +1350,23 @@ func (m *model) handleModalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				}
 				trimmed := strings.TrimSpace(m.idLabelInput.Value())
 				if trimmed == "" || len([]rune(trimmed)) > 80 || strings.IndexFunc(trimmed, unicode.IsControl) >= 0 {
-					m.statusToast = "身份标签须为 1–80 个字符且不能包含控制字符"
+					m.setToastSticky("身份标签须为 1–80 个字符且不能包含控制字符")
 					m.idLabelInput.Focus()
 					return m, textinput.Blink
 				}
 				ch := &m.idChoices[m.idCursor]
 				if ch.imported && ch.profile.ID != "" {
 					if err := identity.UpdateLabel(m.opts.ExecutableDir, ch.profile.ID, trimmed); err != nil {
-						m.statusToast = err.Error()
+						m.setToastSticky(err.Error())
 						m.idLabelInput.Focus()
 						return m, textinput.Blink
 					}
 					if m.activeID != "" && ch.profile.ID == m.activeID {
 						m.identityLabel = trimmed
 					}
-					m.statusToast = "已更新身份标签：" + trimmed
+					m.setToastSticky("已更新身份标签：" + trimmed)
 				} else {
-					m.statusToast = "已暂存身份标签，激活导入后持久化：" + trimmed
+					m.setToastSticky("已暂存身份标签，激活导入后持久化：" + trimmed)
 				}
 				ch.profile.Label = trimmed
 				m.editingIDLabel = false
@@ -1361,6 +1384,7 @@ func (m *model) handleModalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.idInputFocus = false
 			m.idInput.Blur()
 			m.idLabelInput.Blur()
+			m.clearToast()
 			return m, nil
 		}
 		if k == "tab" {
@@ -1376,7 +1400,7 @@ func (m *model) handleModalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			if k == "enter" {
 				path := strings.TrimSpace(m.idInput.Value())
 				if path == "" {
-					m.statusToast = "请输入要导入的配置文件或目录路径"
+					m.setToastSticky("请输入要导入的配置文件或目录路径")
 					return m, nil
 				}
 				m.idInput.SetValue("")
@@ -1401,19 +1425,19 @@ func (m *model) handleModalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.idLabelInput.SetValue(m.idChoices[m.idCursor].profile.Label)
 				m.idLabelInput.Focus()
 				m.idLabelInput.CursorEnd()
-				m.statusToast = ""
+				m.clearToast()
 				return m, textinput.Blink
 			}
 		case "t":
 			if len(m.idChoices) > 0 && m.idCursor < len(m.idChoices) {
 				if m.testingConn {
-					m.statusToast = "正在测试连接，请稍候…"
+					m.setToastSticky("正在测试连接，请稍候…")
 					return m, nil
 				}
 				ch := m.idChoices[m.idCursor]
 				m.testingConn = true
 				m.idTestResults[ch.profile.Path] = identityTestState{testing: true}
-				m.statusToast = "正在测试 mTLS 握手与身份认证…"
+				m.setToastSticky("正在测试 mTLS 握手与身份认证…")
 				return m, m.testIdentityConnCmd(ch)
 			}
 		case "enter":
@@ -1429,7 +1453,7 @@ func (m *model) handleModalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.modal = modalNone
 			m.pendingSpecs = nil
 			m.conflictNames = nil
-			m.statusToast = ""
+			m.clearToast()
 			return m, nil
 		case "r", "a":
 			specs := m.resolveConflictsAutoRename()
@@ -1437,7 +1461,7 @@ func (m *model) handleModalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.modal = modalNone
 			m.pendingSpecs = nil
 			m.conflictNames = nil
-			m.statusToast = ""
+			m.clearToast()
 			return m, m.enqueueSpecsCmd(specs)
 		case "s":
 			specs := m.resolveConflictsSkip()
@@ -1445,7 +1469,7 @@ func (m *model) handleModalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.modal = modalNone
 			m.pendingSpecs = nil
 			m.conflictNames = nil
-			m.statusToast = ""
+			m.clearToast()
 			return m, m.enqueueSpecsCmd(specs)
 		}
 		return m, nil
@@ -1455,7 +1479,7 @@ func (m *model) handleModalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		case "esc":
 			m.modal = modalNone
 			m.renameTask = nil
-			m.statusToast = ""
+			m.clearToast()
 			return m, nil
 		case "enter":
 			t := m.renameTask
@@ -1465,12 +1489,12 @@ func (m *model) handleModalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 			newName := strings.TrimSpace(m.renameInput.Value())
 			if newName == "" {
-				m.statusToast = "新文件名不能为空"
+				m.setToastSticky("新文件名不能为空")
 				m.renameInput.Focus()
 				return m, textinput.Blink
 			}
 			if err := protocol.ValidateName(newName); err != nil {
-				m.statusToast = "文件名无效：" + err.Error()
+				m.setToastSticky("文件名无效：" + err.Error())
 				m.renameInput.Focus()
 				return m, textinput.Blink
 			}
@@ -1479,7 +1503,7 @@ func (m *model) handleModalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				spec.Remote = newName
 				for _, f := range m.remoteEntries {
 					if f.FileName == newName {
-						m.statusToast = "远端已存在同名文件：" + newName
+						m.setToastSticky("远端已存在同名文件：" + newName)
 						m.renameInput.Focus()
 						return m, textinput.Blink
 					}
@@ -1487,22 +1511,22 @@ func (m *model) handleModalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			} else {
 				spec.Path = filepath.Join(filepath.Dir(t.Path), newName)
 				if _, err := os.Lstat(spec.Path); err == nil {
-					m.statusToast = "本地目录已存在同名文件：" + newName
+					m.setToastSticky("本地目录已存在同名文件：" + newName)
 					m.renameInput.Focus()
 					return m, textinput.Blink
 				} else if !os.IsNotExist(err) {
-					m.statusToast = err.Error()
+					m.setToastSticky(err.Error())
 					m.renameInput.Focus()
 					return m, textinput.Blink
 				}
 			}
 			if m.manager == nil {
-				m.statusToast = "当前队列不可用，请先激活身份"
+				m.setToastSticky("当前队列不可用，请先激活身份")
 				return m, nil
 			}
 			tasks, err := m.manager.Enqueue([]queue.Spec{spec})
 			if err != nil {
-				m.statusToast = err.Error()
+				m.setToastSticky(err.Error())
 				m.renameInput.Focus()
 				return m, textinput.Blink
 			}
@@ -1510,7 +1534,7 @@ func (m *model) handleModalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.renameTask = nil
 			m.recordEnqueuedBatch(tasks)
 			m.refreshQueueSnapshots()
-			m.statusToast = fmt.Sprintf("已入队 %d 个传输任务", len(tasks))
+			m.setToast(fmt.Sprintf("已入队 %d 个传输任务", len(tasks)))
 			return m, nil
 		}
 		var cmd tea.Cmd
@@ -1524,14 +1548,14 @@ func (m *model) handleModalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, nil
 		case "p":
 			if m.opBusy {
-				m.statusToast = "已有退出或批量操作正在执行，请稍候…"
+				m.setToast("已有退出或批量操作正在执行，请稍候…")
 				return m, nil
 			}
 			m.modal = modalNone
 			m.opBusy = true
 			m.opLabel = "正在暂停并等待检查点确认"
 			m.opStart = time.Now()
-			m.statusToast = "正在等待服务端确认暂停检查点后退出…"
+			m.setToastSticky("正在等待服务端确认暂停检查点后退出…")
 			return m, m.pauseAllAndQuitCmd()
 		case "f", "q":
 			m.cleanup()
@@ -1549,9 +1573,9 @@ func (m *model) handleModalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				err := m.manager.ClearHistory()
 				m.refreshQueueSnapshots()
 				if err != nil {
-					m.statusToast = err.Error()
+					m.setToastError(err.Error())
 				} else {
-					m.statusToast = "已清空历史记录"
+					m.setToast("已清空历史记录")
 				}
 			}
 		}
@@ -1749,7 +1773,7 @@ func (m *model) handleQueueKey(k string) (tea.Model, tea.Cmd) {
 	case "n":
 		if t := m.selectedTask(); t != nil {
 			if t.State != queue.Paused && t.State != queue.Pending {
-				m.statusToast = "仅已暂停或待处理任务可改名另存重传"
+				m.setToast("仅已暂停或待处理任务可改名另存重传")
 				return m, nil
 			}
 			m.renameTask = t
@@ -1758,7 +1782,7 @@ func (m *model) handleQueueKey(k string) (tea.Model, tea.Cmd) {
 			} else {
 				m.renameInput.SetValue(filepath.Base(t.Path))
 			}
-			m.statusToast = ""
+			m.clearToast()
 			m.renameInput.Focus()
 			m.renameInput.CursorEnd()
 			m.modal = modalRename
@@ -1930,9 +1954,9 @@ func (m *model) evaluateBatches() {
 			m.batchHistory = m.batchHistory[:20]
 		}
 		if s.Failed > 0 {
-			m.statusToast = fmt.Sprintf("批次完成：成功 %d · 失败 %d · 跳过 %d（按 B 查摘要 / R 重失败）", s.Succeeded, s.Failed, s.Skipped)
+			m.setToastError(fmt.Sprintf("批次完成：成功 %d · 失败 %d · 跳过 %d（按 B 查摘要 / R 重失败）", s.Succeeded, s.Failed, s.Skipped))
 		} else {
-			m.statusToast = fmt.Sprintf("批次完成：成功 %d · 跳过 %d（按 B 查看摘要）", s.Succeeded, s.Skipped)
+			m.setToast(fmt.Sprintf("批次完成：成功 %d · 跳过 %d（按 B 查看摘要）", s.Succeeded, s.Skipped))
 		}
 	}
 }
@@ -1949,11 +1973,11 @@ func (m *model) failedTaskCount() int {
 
 func (m *model) retryFailedTasksCmd() tea.Cmd {
 	if m.manager == nil {
-		m.statusToast = "请先配置或导入身份（按 i）"
+		m.setToast("请先配置或导入身份（按 i）")
 		return nil
 	}
 	if m.opBusy {
-		m.statusToast = "已有队列控制操作正在执行，请稍候…"
+		m.setToast("已有队列控制操作正在执行，请稍候…")
 		return nil
 	}
 	var ids []string
@@ -1963,7 +1987,7 @@ func (m *model) retryFailedTasksCmd() tea.Cmd {
 		}
 	}
 	if len(ids) == 0 {
-		m.statusToast = "当前队列没有失败或报错待处理的任务"
+		m.setToast("当前队列没有失败或报错待处理的任务")
 		return nil
 	}
 	mgr := m.manager
@@ -2156,7 +2180,7 @@ func (m *model) clearSelectionForDir(dir protocol.Direction) {
 
 func (m *model) prepareUpload() tea.Cmd {
 	if m.manager == nil {
-		m.statusToast = "请先配置或导入身份（按 i）"
+		m.setToast("请先配置或导入身份（按 i）")
 		return nil
 	}
 	var chosen []localEntry
@@ -2172,7 +2196,7 @@ func (m *model) prepareUpload() tea.Cmd {
 		}
 	}
 	if len(chosen) == 0 {
-		m.statusToast = "请先选中至少一个普通文件"
+		m.setToast("请先选中至少一个普通文件")
 		return nil
 	}
 
@@ -2190,7 +2214,7 @@ func (m *model) prepareUpload() tea.Cmd {
 
 func (m *model) prepareDownload() tea.Cmd {
 	if m.manager == nil {
-		m.statusToast = "请先配置或导入身份（按 i）"
+		m.setToast("请先配置或导入身份（按 i）")
 		return nil
 	}
 	var chosen []protocol.FileEntry
@@ -2204,7 +2228,7 @@ func (m *model) prepareDownload() tea.Cmd {
 		chosen = append(chosen, m.visibleRemote[m.remoteCursor])
 	}
 	if len(chosen) == 0 {
-		m.statusToast = "请先选中至少一个远端文件"
+		m.setToast("请先选中至少一个远端文件")
 		return nil
 	}
 
@@ -2243,7 +2267,7 @@ func (m *model) prepareBatch(dir protocol.Direction, specs []queue.Spec, clearSe
 		m.pendingBatchDir = dir
 		m.pendingSpecs = specs
 		m.conflictNames = conflicts
-		m.statusToast = ""
+		m.clearToast()
 		m.modal = modalConflict
 		return nil
 	}
@@ -2429,12 +2453,12 @@ func (m *model) toggleSelectedTaskCmd() tea.Cmd {
 // resumeOrRetrySelectedCmd 在队列/历史区按 F5 时根据选中任务状态执行恢复、重试或重传。
 func (m *model) resumeOrRetrySelectedCmd() tea.Cmd {
 	if m.manager == nil {
-		m.statusToast = "请先配置或导入身份（按 i）"
+		m.setToast("请先配置或导入身份（按 i）")
 		return nil
 	}
 	t := m.selectedTask()
 	if t == nil {
-		m.statusToast = "当前队列无选中任务"
+		m.setToast("当前队列无选中任务")
 		return nil
 	}
 	task := *t
@@ -2451,7 +2475,7 @@ func (m *model) resumeOrRetrySelectedCmd() tea.Cmd {
 			return resumePendingOrPausedTask(mgr, task)
 		}
 	}
-	m.statusToast = fmt.Sprintf("任务当前正在进行（%s），无需恢复或重试", task.State)
+	m.setToast(fmt.Sprintf("任务当前正在进行（%s），无需恢复或重试", task.State))
 	return nil
 }
 
@@ -2492,7 +2516,7 @@ func (m *model) toggleAllCmd() tea.Cmd {
 		return nil
 	}
 	if m.opBusy {
-		m.statusToast = "已有队列控制操作正在执行，请稍候…"
+		m.setToast("已有队列控制操作正在执行，请稍候…")
 		return nil
 	}
 	hasActive := false

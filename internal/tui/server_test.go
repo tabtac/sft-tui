@@ -947,3 +947,86 @@ func TestServerAdvancedLogFiltersAndJumpFromUsersAndTransfers(t *testing.T) {
 		t.Fatalf("expected C to clear all log filters, got query=%+v level=%q sinceIdx=%d", m.logQuery, m.logMinLevel, m.logSinceIdx)
 	}
 }
+
+func TestServerManualRefreshCompletionAndToastAutoExpiry(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "configs", "server.local.json")
+	if _, err := certmanage.Execute("init", certmanage.Options{
+		ServerConfig:    cfgPath,
+		Dir:             filepath.Join(dir, "certs"),
+		ClientConfigDir: filepath.Dir(cfgPath),
+		Name:            "alice",
+		Hosts:           "localhost,127.0.0.1",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	m := newServerModel(ServerOptions{ExecutableDir: dir, ConfigPath: cfgPath})
+	m.Update(tea.WindowSizeMsg{Width: 110, Height: 30})
+	m.Update(m.loadConfigCmd()())
+
+	// 1. 按 r 手动刷新：进行中保持提示，后台轮询不抢先覆盖，双路完成后显示结果并在 2-3 秒后自动清除
+	_, cmd := m.Update(keyRune('r'))
+	if cmd == nil {
+		t.Fatal("expected batch cmd on pressing r")
+	}
+	if m.statusToast != "正在刷新配置与运行状态…" || !m.toastUntil.IsZero() {
+		t.Fatalf("expected sticky refreshing toast, got toast=%q until=%v", m.statusToast, m.toastUntil)
+	}
+	// 无关后台轮询消息 (seq=0) 不得提前覆盖或结束手动刷新状态
+	m.Update(m.pollRuntimeCmd()())
+	if m.statusToast != "正在刷新配置与运行状态…" {
+		t.Fatalf("stale background poll overwrote manual refresh toast: %q", m.statusToast)
+	}
+
+	batchMsg, ok := cmd().(tea.BatchMsg)
+	if !ok || len(batchMsg) != 2 {
+		t.Fatalf("expected 2 sub-cmds in manual refresh batch, got %T", cmd())
+	}
+	m.Update(batchMsg[0]())
+	if m.statusToast != "正在刷新配置与运行状态…" {
+		t.Fatalf("refresh toast cleared before both config and poll completed: %q", m.statusToast)
+	}
+	m.Update(batchMsg[1]())
+	if !strings.Contains(m.statusToast, "已刷新配置") {
+		t.Fatalf("expected refresh completion notice, got %q", m.statusToast)
+	}
+	ttl := time.Until(m.toastUntil)
+	if ttl < 2*time.Second || ttl > 3*time.Second {
+		t.Fatalf("expected toast TTL between 2s and 3s, got %v", ttl)
+	}
+	m.Update(serverTickMsg(time.Now().Add(1 * time.Second)))
+	if m.statusToast == "" {
+		t.Fatal("toast cleared too early (<2s)")
+	}
+	m.Update(serverTickMsg(time.Now().Add(3 * time.Second)))
+	if m.statusToast != "" {
+		t.Fatalf("expected manual refresh toast to auto-dismiss after 2-3s, still %q", m.statusToast)
+	}
+
+	// 2. 新建/修改用户等动作完成后显示结果并在 2-3 秒后自动消失
+	m.Update(serverActionResultMsg{notice: "已新建用户 bob（已热加载到运行中的服务端）"})
+	if !strings.Contains(m.statusToast, "已新建用户 bob") {
+		t.Fatalf("expected action result toast, got %q", m.statusToast)
+	}
+	m.Update(serverTickMsg(time.Now().Add(3 * time.Second)))
+	if m.statusToast != "" {
+		t.Fatalf("expected action result toast to auto-dismiss, still %q", m.statusToast)
+	}
+
+	// 3. 弹窗内校验错误在弹窗打开期间不得自动消失，按 Esc 取消弹窗后自动清理以免泄漏到主栏
+	m.openNewUserModal()
+	m.formInputs[0].SetValue("bad user!")
+	m.triggerPrimaryButton()
+	if m.modal != srvModalNewUser || m.statusToast == "" {
+		t.Fatalf("expected modal validation error, modal=%v toast=%q", m.modal, m.statusToast)
+	}
+	m.Update(serverTickMsg(time.Now().Add(10 * time.Second)))
+	if m.statusToast == "" {
+		t.Fatal("validation error inside open modal expired prematurely")
+	}
+	m.Update(keyType(tea.KeyEsc))
+	if m.modal != srvModalNone || m.statusToast != "" {
+		t.Fatalf("expected Esc to clear modal validation error, modal=%v toast=%q", m.modal, m.statusToast)
+	}
+}

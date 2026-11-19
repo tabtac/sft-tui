@@ -650,3 +650,37 @@ func TestClientRecoveryNoticeBatchSummaryAndRetryFailed(t *testing.T) {
 		t.Fatalf("expected retried failed task to complete, active=%+v hist=%+v", m.activeTasks, m.historyTasks)
 	}
 }
+
+func TestClientToastAutoExpiryAndModalValidationPersistence(t *testing.T) {
+	m := newModel(Options{ExecutableDir: t.TempDir(), Directory: t.TempDir()})
+	m.Update(tea.WindowSizeMsg{Width: 100, Height: 28})
+
+	m.Update(keyType(tea.KeyF6))
+	if m.statusToast == "" {
+		t.Fatal("expected theme toast after F6")
+	}
+	m.Update(tickMsg(time.Now().Add(1 * time.Second)))
+	if m.statusToast == "" {
+		t.Fatal("client toast cleared too early")
+	}
+	m.Update(tickMsg(time.Now().Add(3 * time.Second)))
+	if m.statusToast != "" {
+		t.Fatalf("expected client toast to auto-dismiss after 2-3s, got %q", m.statusToast)
+	}
+
+	m.modal = modalRename
+	m.renameTask = &queue.Task{ID: "t1", Direction: protocol.DirectionUpload, Remote: "a.bin", Path: "/tmp/a.bin", State: queue.Paused}
+	m.renameInput.SetValue("bad/name")
+	m.Update(keyType(tea.KeyEnter))
+	if m.modal != modalRename || m.statusToast == "" {
+		t.Fatalf("expected rename validation error inside modal, modal=%v toast=%q", m.modal, m.statusToast)
+	}
+	m.Update(tickMsg(time.Now().Add(10 * time.Second)))
+	if m.statusToast == "" {
+		t.Fatal("validation error inside open client modal expired prematurely")
+	}
+	m.Update(keyType(tea.KeyEsc))
+	if m.modal != modalNone || m.statusToast != "" {
+		t.Fatalf("expected Esc to close modal and clear validation toast, modal=%v toast=%q", m.modal, m.statusToast)
+	}
+}
