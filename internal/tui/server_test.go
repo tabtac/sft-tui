@@ -406,14 +406,19 @@ func TestServerSettingsEditAllFieldsAndPolicyRateDropdowns(t *testing.T) {
 		t.Fatalf("saved settings lost fields: bw=%+v gb=%+v limits=%+v", saved.Bandwidth, saved.GlobalBandwidth, saved.Limits)
 	}
 
-	// 3. 测试用户策略编辑器支持速率单位下拉选择 (MB/s)
+	// 3. 测试用户策略编辑器支持动态展开自定义速率与单位下拉选择 (MB/s)
 	m.Update(m.loadConfigCmd()())
 	m.Update(keyRune('2'))
 	m.Update(keyRune('p'))
-	if m.modal != srvModalEditPolicy || len(m.formUnits) < 3 {
-		t.Fatalf("policy modal missing unit dropdowns: modal=%v", m.modal)
+	if m.modal != srvModalEditPolicy || len(m.formInputs) != 0 {
+		t.Fatalf("policy modal should hide custom bandwidth inputs while inherit=true: modal=%v inputs=%d", m.modal, len(m.formInputs))
 	}
-	m.formToggles[3] = false // 取消继承默认带宽
+	// 聚焦到“继承默认带宽”并按 Enter（不再误提交，而是切换勾选并展开自定义限速框）
+	m.setRowFocus(3, 0)
+	m.Update(keyType(tea.KeyEnter))
+	if m.modal != srvModalEditPolicy || len(m.formUnits) < 3 {
+		t.Fatalf("Enter on inherit-bandwidth toggle should expand custom unit dropdowns without submitting: modal=%v units=%d", m.modal, len(m.formUnits))
+	}
 	m.formInputs[0].SetValue("4")
 	m.formUnits[0].selected = 2 // MB/s
 	_, pCmd := m.submitModalForm()
@@ -604,7 +609,8 @@ func TestServerFormsRejectInvalidInputKeepValuesAndFocusErrorField(t *testing.T)
 	// 4. 用户策略编辑器：非法自定义带宽保持弹窗、保留 targetUser 并定位到错误框
 	m.Update(keyRune('2'))
 	m.openEditPolicyModal(m.cfg.AuthorizedClients[0])
-	m.formToggles[3] = false
+	m.setRowFocus(3, 0)
+	m.Update(keyRune(' ')) // 取消继承默认带宽以展开自定义带宽输入框
 	m.formInputs[1].SetValue("bad-num")
 	m.formFocus = len(m.formRows)
 	m.formBtnIdx = 1
@@ -1255,5 +1261,40 @@ func TestServerNarrowWidthSearchInputAndToastFallbackVisible(t *testing.T) {
 	}
 	if lipgloss.Height(v) > 18 {
 		t.Fatalf("52x18 view exceeded height: %d", lipgloss.Height(v))
+	}
+}
+
+func TestServerFormToggleEnterDynamicBandwidthAndWizardEscCapture(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "configs", "missing.json")
+
+	// 1. 部署向导第 1 步修改地址后按 Esc，应自动暂存当前输入，重新按 I 恢复保留原值
+	wm := newServerModel(ServerOptions{ExecutableDir: dir, ConfigPath: cfgPath})
+	wm.Update(tea.WindowSizeMsg{Width: 110, Height: 32})
+	wm.beginDeployWizard()
+	wm.formInputs[0].SetValue("127.0.0.1:8443")
+	wm.Update(keyType(tea.KeyEsc))
+	if wm.modal != srvModalNone || wm.deploy == nil || wm.deploy.d.Address != "127.0.0.1:8443" {
+		t.Fatalf("expected Esc to capture wizard step 1 draft, modal=%v deploy=%+v", wm.modal, wm.deploy)
+	}
+	wm.Update(keyRune('I'))
+	if wm.modal != srvModalDeployWizard || wm.formInputs[0].Value() != "127.0.0.1:8443" {
+		t.Fatalf("expected reopened wizard to restore captured address, modal=%v val=%q", wm.modal, wm.formInputs[0].Value())
+	}
+	if !strings.Contains(ansi.Strip(wm.View()), "① 网络") {
+		t.Fatalf("expected wizard step bar visible:\n%s", ansi.Strip(wm.View()))
+	}
+
+	// 2. 新建用户弹窗默认折叠自定义带宽；聚焦复选框按 Enter 切换勾选而非误提交
+	m := regressionServer(t, 110, 32)
+	m.openNewUserModal()
+	if len(m.formInputs) != 2 {
+		t.Fatalf("expected custom bandwidth inputs hidden when inheritBW=true, got %d inputs", len(m.formInputs))
+	}
+	m.formInputs[0].SetValue("dave")
+	m.setRowFocus(4, 0) // "继承默认带宽"
+	m.Update(keyType(tea.KeyEnter))
+	if m.modal != srvModalNewUser || len(m.formInputs) != 5 || m.formInputs[0].Value() != "dave" {
+		t.Fatalf("expected Enter on inheritBW toggle to expand 3 custom bandwidth rows preserving name, modal=%v inputs=%d", m.modal, len(m.formInputs))
 	}
 }

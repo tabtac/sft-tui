@@ -72,6 +72,7 @@ type formState struct {
 	dropdownRow    int
 	dropdownCursor int
 	formKeyIdx     map[string]int
+	formOnEsc      func()
 }
 
 type deployWizardDraft struct {
@@ -138,6 +139,7 @@ func (f *formState) resetForm() {
 	f.dropdownRow = -1
 	f.dropdownCursor = 0
 	f.formKeyIdx = make(map[string]int)
+	f.formOnEsc = nil
 }
 
 func makeModalInput(val string) textinput.Model {
@@ -696,12 +698,49 @@ func (m *serverModel) handleFormKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		if m.formFocus >= 0 && m.formFocus < nRows {
 			r := m.formRows[m.formFocus]
-			if r.kind == formRowSelect || (r.kind == formRowSizeUnit && m.formSubFocus == 1) {
+			switch r.kind {
+			case formRowToggle:
+				val := !m.formToggles[r.toggleIdx]
+				m.formToggles[r.toggleIdx] = val
+				if r.onToggle != nil {
+					r.onToggle(val)
+				}
+				return m, nil
+			case formRowSelect:
 				m.openDropdownAt(m.formFocus)
 				return m, nil
+			case formRowSizeUnit:
+				if m.formSubFocus == 1 {
+					m.openDropdownAt(m.formFocus)
+					return m, nil
+				}
 			}
 		}
 		return m.triggerPrimaryButton()
+
+	case "j", "k":
+		// 焦点不在文本输入态时允许 j/k 上下切项，提升键盘操作一致性。
+		inTextInput := false
+		if m.formFocus >= 0 && m.formFocus < nRows {
+			r := m.formRows[m.formFocus]
+			inTextInput = (r.kind == formRowText || r.kind == formRowSizeUnit) && m.formSubFocus == 0
+		}
+		if !inTextInput {
+			dir := 1
+			if k == "k" {
+				dir = -1
+			}
+			if !m.hasFocusableInputRow() {
+				m.scrollFormBy(dir)
+				return m, nil
+			}
+			if next, ok := m.stepFocusableRow(m.formFocus, dir); ok {
+				m.setRowFocus(next, 0)
+				return m, textinput.Blink
+			}
+			m.scrollFormBy(dir)
+			return m, nil
+		}
 	}
 
 	if m.formFocus >= 0 && m.formFocus < nRows {
@@ -1049,7 +1088,7 @@ func (m *serverModel) buildFormViewAndHits(innerW int) ([]string, string, []form
 		hits = append(hits, btnHits...)
 	}
 
-	footer := "Tab/↑↓ 切项 · Space 勾选/下拉 · ←→ 切换单位 · Enter 确认 · Esc 返回"
+	footer := "Tab/↑↓ 切项 · Space/Enter 勾选或下拉 · ←→ 切单位 · Esc 返回"
 	if m.dropdownOpen {
 		footer = "下拉选择：↑↓ 选择项 · Enter / Space 确认 · Esc 收起"
 	}

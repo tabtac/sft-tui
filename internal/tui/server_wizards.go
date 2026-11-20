@@ -85,6 +85,39 @@ func (m *serverModel) beginDeployWizard() {
 	m.openDeployStep(m.deploy.step)
 }
 
+func wizardStepBar(step int) string {
+	type item struct {
+		num   int
+		label string
+	}
+	steps := []item{
+		{1, "① 网络"},
+		{2, "② 存储"},
+		{3, "③ 用户"},
+		{4, "④ 确认"},
+	}
+	cur := step
+	if step == 35 {
+		cur = 3
+	}
+	parts := make([]string, 0, len(steps))
+	for _, s := range steps {
+		switch {
+		case s.num < cur || step == 5:
+			parts = append(parts, "✔ "+s.label)
+		case s.num == cur:
+			lbl := s.label
+			if step == 35 {
+				lbl += "(高级)"
+			}
+			parts = append(parts, "["+lbl+"]")
+		default:
+			parts = append(parts, s.label)
+		}
+	}
+	return strings.Join(parts, " ── ")
+}
+
 func (m *serverModel) openDeployStep(step int) {
 	w := m.deploy
 	if w == nil {
@@ -98,8 +131,8 @@ func (m *serverModel) openDeployStep(step int) {
 	switch step {
 	case 1:
 		m.addNoteRow([]string{
-			"第 1 步 / 4：本机演示使用回环地址；局域网部署选择网卡 IP 或填写实际 DNS，",
-			"监听地址、证书 SAN 和客户端连接地址会自动联动。目标配置：" + truncPlainCell(w.d.Config, 50),
+			wizardStepBar(1),
+			"本机演示使用回环地址；局域网部署选择网卡 IP 或填写实际 DNS，目标配置：" + truncPlainCell(w.d.Config, 44),
 		}, false)
 		nicOpts := []string{"手动输入 DNS/IP"}
 		nicOpts = append(nicOpts, w.addresses...)
@@ -153,6 +186,10 @@ func (m *serverModel) openDeployStep(step int) {
 			w.d.Address = strings.TrimSpace(m.formInputs[addrIdx].Value())
 			w.d.Listen = strings.TrimSpace(m.formInputs[listenIdx].Value())
 		}
+		m.formOnEsc = func() {
+			capture1()
+			m.setToast("部署向导输入已暂存，按 [I] 可继续")
+		}
 		m.formButtons = []formButton{
 			{label: "返回面板", onClick: func() (tea.Model, tea.Cmd) {
 				capture1()
@@ -204,12 +241,16 @@ func (m *serverModel) openDeployStep(step int) {
 
 	case 2:
 		m.addNoteRow([]string{
-			"第 2 步 / 4：配置服务端文件根目录；默认使用独立子目录，确认时转为绝对路径。",
-			"目标配置：" + truncPlainCell(w.d.Config, 56),
+			wizardStepBar(2),
+			"配置服务端文件根目录（确认时转为绝对路径）；目标配置：" + truncPlainCell(w.d.Config, 46),
 		}, false)
 		stIdx := m.addTextRow("文件存储根目录", w.d.Storage)
 		capture2 := func() {
 			w.d.Storage = strings.TrimSpace(m.formInputs[stIdx].Value())
+		}
+		m.formOnEsc = func() {
+			capture2()
+			m.setToast("部署向导输入已暂存，按 [I] 可继续")
 		}
 		m.formButtons = []formButton{
 			{label: "◀ 上一步", onClick: func() (tea.Model, tea.Cmd) {
@@ -240,7 +281,8 @@ func (m *serverModel) openDeployStep(step int) {
 
 	case 3:
 		m.addNoteRow([]string{
-			"第 3 步 / 4：配置初始授权用户、默认速率与配额；速率/大小可按数字加右侧下拉单位选择。",
+			wizardStepBar(3),
+			"配置初始授权用户、默认速率与配额；速率/大小可按数字加右侧下拉单位选择。",
 		}, false)
 		userIdx := m.addTextRow("初始授权用户名", w.d.User)
 		upIdx := m.addSizeUnitRow("默认上传带宽", w.d.Upload, true)
@@ -344,6 +386,10 @@ func (m *serverModel) openDeployStep(step int) {
 		})
 		_ = tuneToggle
 
+		m.formOnEsc = func() {
+			_, _ = capture3(false)
+			m.setToast("部署向导输入已暂存，按 [I] 可继续")
+		}
 		m.formButtons = []formButton{
 			{label: "◀ 上一步", onClick: func() (tea.Model, tea.Cmd) {
 				_, _ = capture3(false)
@@ -375,7 +421,8 @@ func (m *serverModel) openDeployStep(step int) {
 	case 35:
 		// 3.5 步：协议流控、全局总带宽与资源并发高级参数（向导内完整涵盖每项配置）
 		m.addNoteRow([]string{
-			"高级协议与资源参数：可调整全局总带宽、日志上限、分块/窗口、超时与并发限额。",
+			wizardStepBar(35),
+			"可调整全局总带宽、日志上限、分块/窗口、超时与并发限额。",
 		}, false)
 		def := config.DefaultServer()
 		if w.d.Limits == nil {
@@ -505,6 +552,10 @@ func (m *serverModel) openDeployStep(step int) {
 			m.setRowFocus(min(focusRow, len(m.formRows)-1), 0)
 		})
 
+		m.formOnEsc = func() {
+			_, _ = capture35(false)
+			m.setToast("部署向导输入已暂存，按 [I] 可继续")
+		}
 		m.formButtons = []formButton{
 			{label: "◀ 返回第 3 步", onClick: func() (tea.Model, tea.Cmd) {
 				_, _ = capture35(false)
@@ -526,6 +577,7 @@ func (m *serverModel) openDeployStep(step int) {
 	case 4:
 		d := w.d
 		summary := []string{
+			wizardStepBar(4),
 			fmt.Sprintf("配置文件：%s", d.Config),
 			fmt.Sprintf("监听地址：%s   ·   客户端连接：%s", d.Listen, d.Address),
 			fmt.Sprintf("证书 SAN：%s   (校验名称：%s)", d.Hosts, d.ServerName),
@@ -591,6 +643,9 @@ func (m *serverModel) openDeployStep(step int) {
 				}
 				return deployInitDoneMsg{d: d, started: started, notice: msg}
 			}
+		}
+		m.formOnEsc = func() {
+			m.setToast("部署向导输入已暂存，按 [I] 可继续")
 		}
 		m.formButtons = []formButton{
 			{label: "◀ 上一步", onClick: func() (tea.Model, tea.Cmd) {

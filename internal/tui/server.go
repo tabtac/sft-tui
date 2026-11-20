@@ -149,10 +149,26 @@ type serverModel struct {
 	// 多字段表单输入与向导状态
 	formState
 	targetUser         *config.AuthorizedClient
+	userDraft          *userFormDraft
 	deployAutoPrompted bool
 	deploy             *deployWizardDraft
 	settingsExpected   config.Server
 	settingsDraft      *config.Server
+}
+
+type userFormDraft struct {
+	name      string
+	days      string
+	enabled   bool
+	allowUp   bool
+	allowDown bool
+	inheritBW bool
+	upNum     string
+	upUnit    int
+	dnNum     string
+	dnUnit    int
+	burstNum  string
+	burstUnit int
 }
 
 // RunServer 启动服务端 Bubble Tea 管理面板并阻塞直至管理员按 q/Esc/F10 退出。
@@ -1171,24 +1187,89 @@ func (m *serverModel) initForm(labels, defaults, toggleLabels []string, toggles 
 }
 
 func (m *serverModel) openNewUserModal() {
-	m.resetForm()
-	m.clearToast()
-	m.targetUser = nil
-	m.modal = srvModalNewUser
-	m.addTextRow("用户名", "")
-	m.addTextRow("有效期(天)", "30")
-	m.addToggleRow("允许上传", true, nil)
-	m.addToggleRow("允许下载", true, nil)
-	m.addToggleRow("继承默认带宽(关闭后下方自定义限速生效)", true, nil)
 	bw := config.DefaultServer().Bandwidth
 	if m.cfgErr == nil {
 		bw = m.cfg.Bandwidth
 	}
-	m.addSizeUnitRow("自定义上传速率", bw.UploadBytesPerSecond, true)
-	m.addSizeUnitRow("自定义下载速率", bw.DownloadBytesPerSecond, true)
-	m.addSizeUnitRow("自定义突发配额", bw.BurstBytes, false)
+	upNum, _, upUnit := decomposeBytes(bw.UploadBytesPerSecond, true)
+	dnNum, _, dnUnit := decomposeBytes(bw.DownloadBytesPerSecond, true)
+	buNum, _, buUnit := decomposeBytes(bw.BurstBytes, false)
+	m.targetUser = nil
+	m.userDraft = &userFormDraft{
+		days:      "30",
+		enabled:   true,
+		allowUp:   true,
+		allowDown: true,
+		inheritBW: true,
+		upNum:     upNum,
+		upUnit:    upUnit,
+		dnNum:     dnNum,
+		dnUnit:    dnUnit,
+		burstNum:  buNum,
+		burstUnit: buUnit,
+	}
+	m.rebuildNewUserForm()
+}
+
+func (m *serverModel) rebuildNewUserForm() {
+	d := m.userDraft
+	if d == nil {
+		return
+	}
+	m.resetForm()
+	m.clearToast()
+	m.modal = srvModalNewUser
+	m.addTextRow("用户名", d.name)
+	m.addTextRow("有效期(天)", d.days)
+	m.addToggleRow("允许上传", d.allowUp, func(v bool) { d.allowUp = v })
+	m.addToggleRow("允许下载", d.allowDown, func(v bool) { d.allowDown = v })
+
+	capture := func() {
+		if len(m.formInputs) >= 2 {
+			d.name = m.formInputs[0].Value()
+			d.days = m.formInputs[1].Value()
+		}
+		if len(m.formToggles) >= 3 {
+			d.allowUp = m.formToggles[0]
+			d.allowDown = m.formToggles[1]
+			d.inheritBW = m.formToggles[2]
+		}
+		if !d.inheritBW && len(m.formInputs) >= 5 {
+			d.upNum = m.formInputs[2].Value()
+			d.dnNum = m.formInputs[3].Value()
+			d.burstNum = m.formInputs[4].Value()
+			if m.formUnits[2] != nil {
+				d.upUnit = m.formUnits[2].selected
+			}
+			if m.formUnits[3] != nil {
+				d.dnUnit = m.formUnits[3].selected
+			}
+			if m.formUnits[4] != nil {
+				d.burstUnit = m.formUnits[4].selected
+			}
+		}
+	}
+
+	m.addToggleRow("继承默认带宽（取消勾选可自定义限速）", d.inheritBW, func(v bool) {
+		capture()
+		d.inheritBW = v
+		focusRow := m.formFocus
+		m.rebuildNewUserForm()
+		m.setRowFocus(min(focusRow, len(m.formRows)-1), 0)
+	})
+	if !d.inheritBW {
+		upIdx := m.addSizeUnitRow("自定义上传速率", 0, true)
+		m.formInputs[upIdx].SetValue(d.upNum)
+		m.formUnits[upIdx].selected = d.upUnit
+		dnIdx := m.addSizeUnitRow("自定义下载速率", 0, true)
+		m.formInputs[dnIdx].SetValue(d.dnNum)
+		m.formUnits[dnIdx].selected = d.dnUnit
+		buIdx := m.addSizeUnitRow("自定义突发配额", 0, false)
+		m.formInputs[buIdx].SetValue(d.burstNum)
+		m.formUnits[buIdx].selected = d.burstUnit
+	}
 	m.formButtons = []formButton{
-		{label: "取消", onClick: func() (tea.Model, tea.Cmd) { m.modal = srvModalNone; m.clearToast(); return m, nil }},
+		{label: "取消", onClick: func() (tea.Model, tea.Cmd) { m.modal = srvModalNone; m.userDraft = nil; m.clearToast(); return m, nil }},
 		{label: "创建用户 ★", primary: true, onClick: func() (tea.Model, tea.Cmd) { return m.submitModalForm() }},
 	}
 	m.finalizeFormFocus(true)
@@ -1221,24 +1302,84 @@ func (m *serverModel) openEditPolicyModal(u config.AuthorizedClient) {
 	if u.Bandwidth != nil {
 		bw = *u.Bandwidth
 	}
+	upNum, _, upUnit := decomposeBytes(bw.UploadBytesPerSecond, true)
+	dnNum, _, dnUnit := decomposeBytes(bw.DownloadBytesPerSecond, true)
+	buNum, _, buUnit := decomposeBytes(bw.BurstBytes, false)
 	uCopy := u
 	m.targetUser = &uCopy
+	m.userDraft = &userFormDraft{
+		enabled:   !u.Disabled,
+		allowUp:   hasUp,
+		allowDown: hasDown,
+		inheritBW: inherit,
+		upNum:     upNum,
+		upUnit:    upUnit,
+		dnNum:     dnNum,
+		dnUnit:    dnUnit,
+		burstNum:  buNum,
+		burstUnit: buUnit,
+	}
+	m.rebuildEditPolicyForm()
+}
 
+func (m *serverModel) rebuildEditPolicyForm() {
+	d := m.userDraft
+	if d == nil {
+		return
+	}
 	m.resetForm()
 	m.clearToast()
 	m.modal = srvModalEditPolicy
-	m.addToggleRow("启用该用户", !u.Disabled, nil)
-	m.addToggleRow("允许上传", hasUp, nil)
-	m.addToggleRow("允许下载", hasDown, nil)
-	m.addToggleRow("继承默认带宽(关闭后使用下方自定义速率)", inherit, nil)
-	m.addSizeUnitRow("上传速率", bw.UploadBytesPerSecond, true)
-	m.addSizeUnitRow("下载速率", bw.DownloadBytesPerSecond, true)
-	m.addSizeUnitRow("突发配额", bw.BurstBytes, false)
+	m.addToggleRow("启用该用户", d.enabled, func(v bool) { d.enabled = v })
+	m.addToggleRow("允许上传", d.allowUp, func(v bool) { d.allowUp = v })
+	m.addToggleRow("允许下载", d.allowDown, func(v bool) { d.allowDown = v })
+
+	capture := func() {
+		if len(m.formToggles) >= 4 {
+			d.enabled = m.formToggles[0]
+			d.allowUp = m.formToggles[1]
+			d.allowDown = m.formToggles[2]
+			d.inheritBW = m.formToggles[3]
+		}
+		if !d.inheritBW && len(m.formInputs) >= 3 {
+			d.upNum = m.formInputs[0].Value()
+			d.dnNum = m.formInputs[1].Value()
+			d.burstNum = m.formInputs[2].Value()
+			if m.formUnits[0] != nil {
+				d.upUnit = m.formUnits[0].selected
+			}
+			if m.formUnits[1] != nil {
+				d.dnUnit = m.formUnits[1].selected
+			}
+			if m.formUnits[2] != nil {
+				d.burstUnit = m.formUnits[2].selected
+			}
+		}
+	}
+
+	m.addToggleRow("继承默认带宽（取消勾选可自定义速率）", d.inheritBW, func(v bool) {
+		capture()
+		d.inheritBW = v
+		focusRow := m.formFocus
+		m.rebuildEditPolicyForm()
+		m.setRowFocus(min(focusRow, len(m.formRows)-1), 0)
+	})
+	if !d.inheritBW {
+		upIdx := m.addSizeUnitRow("上传速率", 0, true)
+		m.formInputs[upIdx].SetValue(d.upNum)
+		m.formUnits[upIdx].selected = d.upUnit
+		dnIdx := m.addSizeUnitRow("下载速率", 0, true)
+		m.formInputs[dnIdx].SetValue(d.dnNum)
+		m.formUnits[dnIdx].selected = d.dnUnit
+		buIdx := m.addSizeUnitRow("突发配额", 0, false)
+		m.formInputs[buIdx].SetValue(d.burstNum)
+		m.formUnits[buIdx].selected = d.burstUnit
+	}
 	m.formButtons = []formButton{
-		{label: "取消", onClick: func() (tea.Model, tea.Cmd) { m.modal = srvModalNone; m.targetUser = nil; m.clearToast(); return m, nil }},
+		{label: "取消", onClick: func() (tea.Model, tea.Cmd) { m.modal = srvModalNone; m.targetUser = nil; m.userDraft = nil; m.clearToast(); return m, nil }},
 		{label: "保存策略 ★", primary: true, onClick: func() (tea.Model, tea.Cmd) { return m.submitModalForm() }},
 	}
-	m.finalizeFormFocus(false)
+	m.finalizeFormFocus(true)
 }
 
 func (m *serverModel) openExportUserModal(u config.AuthorizedClient) {
@@ -1358,11 +1499,17 @@ func (m *serverModel) scrollServerInfoModal(k string) {
 func (m *serverModel) handleModalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	k := msg.String()
 	if k == "esc" && !m.dropdownOpen {
+		onEsc := m.formOnEsc
+		m.formOnEsc = nil
 		if m.modal != srvModalHelp && m.modal != srvModalDetail && m.modal != srvModalStop {
 			m.clearToast()
 		}
+		if onEsc != nil {
+			onEsc()
+		}
 		m.modal = srvModalNone
 		m.targetUser = nil
+		m.userDraft = nil
 		m.settingsDraft = nil
 		return m, nil
 	}
@@ -1544,6 +1691,7 @@ func (m *serverModel) submitModalForm() (tea.Model, tea.Cmd) {
 		}
 		m.clearToast()
 		m.modal = srvModalNone
+		m.userDraft = nil
 		o := m.certBaseOptions(name)
 		o.Days = days
 		o.Policy = &certmanage.UserPolicy{Permissions: perms, Bandwidth: bw}
@@ -1625,6 +1773,7 @@ func (m *serverModel) submitModalForm() (tea.Model, tea.Cmd) {
 		m.clearToast()
 		m.modal = srvModalNone
 		m.targetUser = nil
+		m.userDraft = nil
 		o := m.certBaseOptions(u.UserID)
 		o.ExpectedUser = &u
 		o.Policy = &certmanage.UserPolicy{
@@ -1651,6 +1800,7 @@ func (m *serverModel) submitModalForm() (tea.Model, tea.Cmd) {
 		m.clearToast()
 		m.modal = srvModalNone
 		m.targetUser = nil
+		m.userDraft = nil
 		o := m.certBaseOptions(u.UserID)
 		o.Out = out
 		o.CertificateOnly = m.formToggles[0]
