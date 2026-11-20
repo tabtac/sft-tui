@@ -125,7 +125,7 @@ func (m *model) renderSubHeader() string {
 	case m.activatingID:
 		msg = formatBusyBadge(m.th, m.spinIdx, "身份切换中", m.opStart)
 	case m.statusToast != "":
-		msg = m.th.toast.Render("· " + sanitizeInline(m.statusToast))
+		msg = renderToastInline(m.th, m.toastLevel, m.statusToast, 0)
 	}
 
 	searchView := m.th.badgeMuted.Render("筛选(/): ")
@@ -215,8 +215,8 @@ func (m *model) renderFooter() string {
 		}
 		return renderActionFooter(m.th, m.width, "本地:", []footerChip{
 			{key: "u/F5", label: upLabel, reason: upReason, essential: true},
-			{key: "a", label: "全暂停", reason: "仅队列区", essential: true},
 			{key: "Spc", label: "多选", essential: true},
+			{key: "A", label: "全选", essential: true},
 			{key: "Enter", label: "开/详"},
 			{key: "Bksp", label: "上级", reason: parentReason},
 			{key: "r", label: "刷新", reason: refreshReason},
@@ -224,7 +224,7 @@ func (m *model) renderFooter() string {
 			{key: "o", label: "排序"},
 			{key: "p", label: "路径"},
 			{key: "i", label: "身份", essential: true},
-			{key: "?", label: "帮助"},
+			{key: "?", label: "帮助", essential: true},
 			{key: "q", label: "退出"},
 		})
 	case m.focus == areaRemote:
@@ -251,14 +251,14 @@ func (m *model) renderFooter() string {
 		}
 		return renderActionFooter(m.th, m.width, "远端:", []footerChip{
 			{key: "d/F5", label: dnLabel, reason: dnReason, essential: true},
-			{key: "a", label: "全暂停", reason: "仅队列区", essential: true},
 			{key: "Spc", label: "多选", essential: true},
+			{key: "A", label: "全选", essential: true},
 			{key: "Enter", label: "详情"},
 			{key: "r", label: "刷新", reason: refreshReason, essential: true},
 			{key: "/", label: "筛选"},
 			{key: "o", label: "排序"},
 			{key: "i", label: "身份", essential: true},
-			{key: "?", label: "帮助"},
+			{key: "?", label: "帮助", essential: true},
 			{key: "q", label: "退出"},
 		})
 	default:
@@ -278,14 +278,14 @@ func (m *model) renderFooter() string {
 				emptyReason = "无历史"
 			}
 			return renderActionFooter(m.th, m.width, "历史:", []footerChip{
-				{key: "r/F5", label: "重传", reason: emptyReason, essential: true},
-				{key: "R", label: "重失败", reason: retryReason, essential: true},
-				{key: "B", label: "批次", reason: batchReason, essential: true},
-				{key: "Enter", label: "详情", reason: emptyReason, essential: true},
+				{key: "r/F5", label: "重传", reason: emptyReason, essential: len(m.historyTasks) > 0},
+				{key: "R", label: "重失败", reason: retryReason, essential: failCount > 0},
+				{key: "B", label: "批次", reason: batchReason, essential: m.lastBatch != nil},
+				{key: "Enter", label: "详情", reason: emptyReason, essential: len(m.historyTasks) > 0},
 				{key: "X", label: "清空", reason: emptyReason},
 				{key: "v", label: "活动队列", essential: true},
-				{key: "?", label: "帮助"},
-				{key: "q", label: "退出"},
+				{key: "?", label: "帮助", essential: true},
+				{key: "q", label: "退出", essential: true},
 			})
 		}
 		spaceLabel, spaceReason := "暂停/恢复", ""
@@ -312,16 +312,17 @@ func (m *model) renderFooter() string {
 		} else if m.opBusy {
 			allReason = "执行中"
 		}
+		hasTasks := len(m.activeTasks) > 0
 		return renderActionFooter(m.th, m.width, "队列:", []footerChip{
 			{key: "Spc", label: spaceLabel, reason: spaceReason, essential: true},
-			{key: "F5", label: "恢复/试", reason: f5Reason, essential: true},
-			{key: "R", label: "重失败", reason: retryReason, essential: true},
-			{key: "B", label: "批次", reason: batchReason, essential: true},
+			{key: "F5", label: "恢复/试", reason: f5Reason, essential: hasTasks && f5Reason == ""},
+			{key: "R", label: "重失败", reason: retryReason, essential: failCount > 0},
+			{key: "B", label: "批次", reason: batchReason, essential: m.lastBatch != nil},
 			{key: "n", label: "改名", reason: renameReason},
 			{key: "c", label: "取消", reason: cancelReason},
-			{key: "a", label: "全暂/恢", reason: allReason, essential: true},
-			{key: "v", label: "历史"},
-			{key: "?", label: "帮助"},
+			{key: "a", label: "全暂/恢", reason: allReason, essential: hasTasks},
+			{key: "v", label: "历史", essential: true},
+			{key: "?", label: "帮助", essential: true},
 		})
 	}
 }
@@ -402,6 +403,10 @@ func panelNameSizeWidths(innerW, fixedOverhead int) (nameW, sizeW int) {
 	return nameW, sizeW
 }
 
+func hasTableHeader(visRows, itemCount int) bool {
+	return visRows >= 4 && itemCount > 0
+}
+
 func (m *model) renderLocalPanel(outerW, outerH int) string {
 	innerW := max(10, outerW-4)
 	visRows := max(1, outerH-3)
@@ -411,16 +416,21 @@ func (m *model) renderLocalPanel(outerW, outerH int) string {
 	if m.loadingLocal {
 		title += " " + formatBusyBadge(m.th, m.spinIdx, "读取中", m.localLoadStarted)
 	}
-	title = truncCell(title, innerW)
 
 	var lines []string
+	dataRows := visRows
 	if len(m.visibleLocal) == 0 {
 		lines = append(lines, m.th.badgeMuted.Render(truncCell("（当前目录无可匹配文件）", innerW)))
 	} else {
-		start := scrollOffset(m.localCursor, len(m.visibleLocal), visRows)
 		// 行模板: mark(3) + ' '(1) + icon(2) + name(nameW) + ' '(1) + sz(sizeW) => 固定开销 7 列
 		nameW, sizeW := panelNameSizeWidths(innerW, 7)
-		for i := start; i < min(len(m.visibleLocal), start+visRows); i++ {
+		if hasTableHeader(visRows, len(m.visibleLocal)) {
+			hdr := fmt.Sprintf("      %s %s", padPlainRightCell("名称", nameW), padLeftCell("大小", sizeW))
+			lines = append(lines, m.th.badgeMuted.Render(truncCell(hdr, innerW)))
+			dataRows--
+		}
+		start := scrollOffset(m.localCursor, len(m.visibleLocal), dataRows)
+		for i := start; i < min(len(m.visibleLocal), start+dataRows); i++ {
 			e := m.visibleLocal[i]
 			mark := "   "
 			if e.regular {
@@ -448,6 +458,11 @@ func (m *model) renderLocalPanel(outerW, outerH int) string {
 			}
 		}
 	}
+	if pos := scrollPosBadge(m.th, m.localCursor, len(m.visibleLocal), dataRows); pos != "" {
+		title = spreadRow(title, pos, innerW)
+	} else {
+		title = truncCell(title, innerW)
+	}
 	return m.renderBox(title, lines, m.focus == areaLocal, outerW, outerH)
 }
 
@@ -459,9 +474,9 @@ func (m *model) renderRemotePanel(outerW, outerH int) string {
 	if m.loadingRemote {
 		title += " " + formatBusyBadge(m.th, m.spinIdx, "同步中", m.remoteLoadStarted)
 	}
-	title = truncCell(title, innerW)
 
 	var lines []string
+	dataRows := visRows
 	switch {
 	case m.cfg == nil:
 		lines = append(lines, m.th.badgeMuted.Render(truncCell("尚未配置或导入身份，按 i 打开身份配置", innerW)))
@@ -475,10 +490,15 @@ func (m *model) renderRemotePanel(outerW, outerH int) string {
 	case len(m.visibleRemote) == 0:
 		lines = append(lines, m.th.badgeMuted.Render(truncCell("（远端暂无匹配文件，选中本地文件后按 u/F5 上传）", innerW)))
 	default:
-		start := scrollOffset(m.remoteCursor, len(m.visibleRemote), visRows)
 		// 行模板: mark(3) + ' '(1) + name(nameW) + ' '(1) + sz(sizeW) => 固定开销 5 列
 		nameW, sizeW := panelNameSizeWidths(innerW, 5)
-		for i := start; i < min(len(m.visibleRemote), start+visRows); i++ {
+		if hasTableHeader(visRows, len(m.visibleRemote)) {
+			hdr := fmt.Sprintf("    %s %s", padPlainRightCell("文件名", nameW), padLeftCell("大小", sizeW))
+			lines = append(lines, m.th.badgeMuted.Render(truncCell(hdr, innerW)))
+			dataRows--
+		}
+		start := scrollOffset(m.remoteCursor, len(m.visibleRemote), dataRows)
+		for i := start; i < min(len(m.visibleRemote), start+dataRows); i++ {
 			f := m.visibleRemote[i]
 			mark := "[ ]"
 			if m.remoteSelected[f.FileName] {
@@ -493,6 +513,11 @@ func (m *model) renderRemotePanel(outerW, outerH int) string {
 				lines = append(lines, m.th.rowNormal.Render(row))
 			}
 		}
+	}
+	if pos := scrollPosBadge(m.th, m.remoteCursor, len(m.visibleRemote), dataRows); pos != "" {
+		title = spreadRow(title, pos, innerW)
+	} else {
+		title = truncCell(title, innerW)
 	}
 	return m.renderBox(title, lines, m.focus == areaRemote, outerW, outerH)
 }
@@ -509,7 +534,7 @@ func (m *model) renderQueuePanel(outerW, outerH int) string {
 		activeTab = m.th.tabInactive.Render(fmt.Sprintf("活动队列 (%d)", len(m.activeTasks)))
 		histTab = m.th.tabActive.Render(fmt.Sprintf("历史归档 (%d)", len(m.historyTasks)))
 	}
-	title := truncCell(activeTab+" "+histTab, innerW)
+	title := activeTab + " " + histTab
 
 	tasks := m.currentQueueTasks()
 	var lines []string
@@ -517,6 +542,7 @@ func (m *model) renderQueuePanel(outerW, outerH int) string {
 		lines = append(lines, m.th.badgeWarn.Render(truncPlainCell("↻ "+m.recoveryNotice, innerW)))
 		visRows--
 	}
+	dataRows := visRows
 	if len(tasks) == 0 {
 		if m.historyView {
 			lines = append(lines, m.th.badgeMuted.Render(truncCell("（历史归档为空）", innerW)))
@@ -524,7 +550,6 @@ func (m *model) renderQueuePanel(outerW, outerH int) string {
 			lines = append(lines, m.th.badgeMuted.Render(truncCell("（活动队列为空：在本地或远端选择文件并按 u / d / F5 开始传输）", innerW)))
 		}
 	} else {
-		start := scrollOffset(m.queueCursor, len(tasks), visRows)
 		barW := 16
 		if innerW < 82 {
 			barW = 10
@@ -534,9 +559,13 @@ func (m *model) renderQueuePanel(outerW, outerH int) string {
 		// 固定列开销: pointer(2) + dir(6) + sep(2) + sep(2) + badge(10) + sep(2) + bar(barW+5) + sep(2) = barW + 31
 		fixedW := barW + 31
 		remain := max(16, innerW-fixedW)
+		if hasTableHeader(visRows, len(tasks)) {
+			dataRows--
+		}
+		start := scrollOffset(m.queueCursor, len(tasks), dataRows)
 		// 动态检测可见行中是否存在传输速率/错误，决定右侧 metrics 预算与文件名预算
 		needWideMetrics := false
-		for i := start; i < min(len(tasks), start+visRows); i++ {
+		for i := start; i < min(len(tasks), start+dataRows); i++ {
 			if tasks[i].State == queue.Transferring || tasks[i].Error != "" {
 				needWideMetrics = true
 				break
@@ -547,7 +576,17 @@ func (m *model) renderQueuePanel(outerW, outerH int) string {
 			metricsW = min(max(24, remain/2), remain-10)
 		}
 		nameW := max(10, remain-metricsW)
-		for i := start; i < min(len(tasks), start+visRows); i++ {
+		if hasTableHeader(visRows, len(tasks)) {
+			hdr := fmt.Sprintf("  %s  %s  %s  %s  %s",
+				padPlainRightCell("方向", dirW),
+				padPlainRightCell("文件名", nameW),
+				padPlainRightCell("状态", badgeW),
+				padPlainRightCell("进度", barW+5),
+				padPlainRightCell("大小 / 速率", max(8, metricsW)),
+			)
+			lines = append(lines, m.th.badgeMuted.Render(truncCell(hdr, innerW)))
+		}
+		for i := start; i < min(len(tasks), start+dataRows); i++ {
 			t := tasks[i]
 			pointer := "  "
 			if i == m.queueCursor && m.focus == areaQueue {
@@ -570,6 +609,11 @@ func (m *model) renderQueuePanel(outerW, outerH int) string {
 				lines = append(lines, rowText)
 			}
 		}
+	}
+	if pos := scrollPosBadge(m.th, m.queueCursor, len(tasks), dataRows); pos != "" {
+		title = spreadRow(title, pos, innerW)
+	} else {
+		title = truncCell(title, innerW)
 	}
 	return m.renderBox(title, lines, m.focus == areaQueue, outerW, outerH)
 }

@@ -168,3 +168,32 @@ func makeTheme() theme {
 	t.hintKey = lipgloss.NewStyle().Foreground(t.primary).Bold(true)
 	return t
 }
+
+// makeServerTheme 为服务端管理面板（SFTD-UI）提供翡翠绿强调色，与客户端晴空蓝主题清晰区分。
+func makeServerTheme() theme {
+	t := makeTheme()
+	t.primary = lipgloss.AdaptiveColor{Dark: "#10B981", Light: "#047857"}
+	t.accent = lipgloss.AdaptiveColor{Dark: "#34D399", Light: "#065F46"}
+	t.highlightBg = lipgloss.AdaptiveColor{Dark: "#064E3B", Light: "#D1FAE5"}
+	badgeAppFg := lipgloss.AdaptiveColor{Dark: "#0F172A", Light: "#FFFFFF"}
+
+	t.badgeApp = lipgloss.NewStyle().Background(t.primary).Foreground(badgeAppFg).Bold(true).Padding(0, 1)
+	t.badgeID = lipgloss.NewStyle().Background(t.highlightBg).Foreground(t.text).Bold(true).Padding(0, 1)
+	t.panelActive = lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(t.accent).
+		Padding(0, 1)
+	t.tabActive = lipgloss.NewStyle().
+		Background(t.primary).
+		Foreground(badgeAppFg).
+		Bold(true).
+		Padding(0, 1)
+	t.rowCursor = lipgloss.NewStyle().Background(t.highlightBg).Foreground(t.accent).Bold(true)
+	t.modalBox = lipgloss.NewStyle().
+		Border(lipgloss.DoubleBorder()).
+		BorderForeground(t.accent).
+		Padding(1, 2)
+	t.modalTitle = lipgloss.NewStyle().Foreground(t.accent).Bold(true)
+	t.hintKey = lipgloss.NewStyle().Foreground(t.primary).Bold(true)
+	return t
+}

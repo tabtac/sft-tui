@@ -325,6 +325,64 @@ const (
 	toastErrorDuration = 3000 * time.Millisecond
 )
 
+type toastLevel uint8
+
+const (
+	toastInfo toastLevel = iota
+	toastSuccess
+	toastWarn
+	toastError
+)
+
+func inferToastLevel(msg string) toastLevel {
+	switch {
+	case strings.Contains(msg, "失败") || strings.Contains(msg, "错误") || strings.Contains(msg, "无法") || strings.Contains(msg, "无效"):
+		return toastError
+	case strings.Contains(msg, "请先") || strings.Contains(msg, "请稍候") || strings.Contains(msg, "仅") || strings.Contains(msg, "暂无") || strings.Contains(msg, "未运行") || strings.Contains(msg, "检测到"):
+		return toastWarn
+	case strings.HasPrefix(msg, "已") || strings.Contains(msg, "成功") || strings.Contains(msg, "完成"):
+		return toastSuccess
+	default:
+		return toastInfo
+	}
+}
+
+func renderToastInline(th theme, level toastLevel, msg string, maxW int) string {
+	clean := sanitizeInline(msg)
+	if clean == "" {
+		return ""
+	}
+	var icon string
+	var style lipgloss.Style
+	switch level {
+	case toastSuccess:
+		icon = "✔ "
+		style = th.badgeOk
+	case toastError:
+		icon = "✕ "
+		style = th.badgeErr
+	case toastWarn:
+		icon = "⚠ "
+		style = th.toast
+	default:
+		icon = "· "
+		style = th.hintKey
+	}
+	txt := icon + clean
+	if maxW > 0 {
+		txt = truncPlainCell(txt, maxW)
+	}
+	return style.Render(txt)
+}
+
+func scrollPosBadge(th theme, cursor, total, visRows int) string {
+	if total <= 0 || total <= visRows {
+		return ""
+	}
+	pos := max(1, min(total, cursor+1))
+	return th.badgeMuted.Render(fmt.Sprintf("%d/%d", pos, total))
+}
+
 func applyToast(dst *string, until *time.Time, msg string, ttl time.Duration) {
 	*dst = msg
 	if msg == "" || ttl <= 0 {

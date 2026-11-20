@@ -210,7 +210,8 @@ func TestServerMouseInteractionAndNoF6Toggle(t *testing.T) {
 		t.Fatalf("tab click did not switch to users page: got page=%d", m.page)
 	}
 	m.cfg.AuthorizedClients = []config.AuthorizedClient{{UserID: "alice"}, {UserID: "bob"}, {UserID: "carol"}}
-	m.Update(tea.MouseMsg{X: 10, Y: 5, Button: tea.MouseButtonLeft, Action: tea.MouseActionPress})
+	// 表头占 Y=4，第 2 行 (bob) 在 Y=6
+	m.Update(tea.MouseMsg{X: 10, Y: 6, Button: tea.MouseButtonLeft, Action: tea.MouseActionPress})
 	if m.cursors[1] != 1 {
 		t.Fatalf("mouse click row on users page failed: cursor=%d", m.cursors[1])
 	}
@@ -1387,5 +1388,39 @@ func TestServerConfirmModalCancelAndSettingsRowEnterNavigation(t *testing.T) {
 	hsIdx, ok := m.inputByKey("timeouts.handshake_seconds")
 	if m.modal != srvModalEditAdvancedSettings || !ok || !m.formInputs[hsIdx].Focused() {
 		t.Fatalf("expected Enter on timeouts row to open advanced settings focusing handshake_seconds, modal=%v", m.modal)
+	}
+}
+
+func TestServerThemeDistinctionTableHeadersAndScrollIndicators(t *testing.T) {
+	cliTh := makeTheme()
+	srvTh := makeServerTheme()
+	if cliTh.primary == srvTh.primary {
+		t.Fatal("expected server theme primary color to be visually distinct from client theme")
+	}
+
+	m := regressionServer(t, 110, 20)
+	// 生成超出一页的用户列表，验证表头与右上角滚动位置指示
+	m.cfg.AuthorizedClients = nil
+	for i := 0; i < 25; i++ {
+		m.cfg.AuthorizedClients = append(m.cfg.AuthorizedClients, config.AuthorizedClient{
+			UserID:      fmt.Sprintf("user-%02d", i),
+			Permissions: []string{"upload", "download"},
+		})
+	}
+	m.page = 1
+	m.cursors[1] = 11
+	v := ansi.Strip(m.View())
+	if !strings.Contains(v, "12/25") || !strings.Contains(v, "证书状态") {
+		t.Fatalf("expected scroll position indicator 12/25 and column header in users view:\n%s", v)
+	}
+
+	// 验证分级语义 Toast 图标区分成功与错误
+	m.setToast("已刷新配置")
+	if !strings.Contains(ansi.Strip(m.renderTabBar()), "✔ 已刷新配置") {
+		t.Fatalf("expected success icon for success toast: %q", ansi.Strip(m.renderTabBar()))
+	}
+	m.setToastError("操作失败：连接超时")
+	if !strings.Contains(ansi.Strip(m.renderTabBar()), "✕ 操作失败") {
+		t.Fatalf("expected error icon for error toast: %q", ansi.Strip(m.renderTabBar()))
 	}
 }

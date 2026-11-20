@@ -227,6 +227,7 @@ type model struct {
 	queueCursor   int
 	completedSeen map[string]bool
 	statusToast   string
+	toastLevel    toastLevel
 	toastUntil    time.Time
 
 	// 弹窗辅助数据
@@ -322,14 +323,17 @@ func (m *model) Init() tea.Cmd {
 }
 
 func (m *model) setToast(msg string) {
+	m.toastLevel = inferToastLevel(msg)
 	applyToast(&m.statusToast, &m.toastUntil, msg, toastDuration)
 }
 
 func (m *model) setToastError(msg string) {
+	m.toastLevel = toastError
 	applyToast(&m.statusToast, &m.toastUntil, msg, toastErrorDuration)
 }
 
 func (m *model) setToastSticky(msg string) {
+	m.toastLevel = inferToastLevel(msg)
 	applyToast(&m.statusToast, &m.toastUntil, msg, 0)
 }
 
@@ -1434,11 +1438,24 @@ func (m *model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 		}
 		switch m.focus {
 		case areaLocal:
+			if hasTableHeader(visRows, len(m.visibleLocal)) {
+				visRows--
+				relY--
+			}
 			moveList(&m.localCursor, len(m.visibleLocal), visRows, relY)
 		case areaRemote:
+			if hasTableHeader(visRows, len(m.visibleRemote)) {
+				visRows--
+				relY--
+			}
 			moveList(&m.remoteCursor, len(m.visibleRemote), visRows, relY)
 		default:
-			moveList(&m.queueCursor, len(m.currentQueueTasks()), visRows, relY)
+			tasks := m.currentQueueTasks()
+			if hasTableHeader(visRows, len(tasks)) {
+				visRows--
+				relY--
+			}
+			moveList(&m.queueCursor, len(tasks), visRows, relY)
 		}
 		return m, nil
 	}
@@ -1456,6 +1473,10 @@ func (m *model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 			wasLocal := m.focus == areaLocal
 			prevIdx := m.localCursor
 			m.focus = areaLocal
+			if hasTableHeader(visRows, len(m.visibleLocal)) {
+				visRows--
+				relY--
+			}
 			moveList(&m.localCursor, len(m.visibleLocal), visRows, relY)
 			// 再次单击已聚焦的目录项直接进入目录，与身份弹窗双击确认保持一致
 			if msg.Button == tea.MouseButtonLeft && wasLocal && relY >= 0 && relY < visRows && m.localCursor == prevIdx && m.localCursor < len(m.visibleLocal) {
@@ -1470,6 +1491,10 @@ func (m *model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 			}
 		} else {
 			m.focus = areaRemote
+			if hasTableHeader(visRows, len(m.visibleRemote)) {
+				visRows--
+				relY--
+			}
 			moveList(&m.remoteCursor, len(m.visibleRemote), visRows, relY)
 		}
 		return m, nil
@@ -1495,7 +1520,12 @@ func (m *model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 		visRows--
 		queueRelY--
 	}
-	moveList(&m.queueCursor, len(m.currentQueueTasks()), visRows, queueRelY)
+	tasks := m.currentQueueTasks()
+	if hasTableHeader(visRows, len(tasks)) {
+		visRows--
+		queueRelY--
+	}
+	moveList(&m.queueCursor, len(tasks), visRows, queueRelY)
 	return m, nil
 }
 

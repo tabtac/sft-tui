@@ -803,7 +803,7 @@ func (m *serverModel) modalFormNoticeLines(innerW int) []string {
 	wrapped := wrapModalLines([]string{"! " + toast}, innerW)
 	out := make([]string, 0, len(wrapped))
 	for _, ln := range wrapped {
-		out = append(out, m.th.toast.Render(ln))
+		out = append(out, m.th.badgeErr.Render(ln))
 	}
 	return out
 }

@@ -471,8 +471,8 @@ func TestClientMouseClickAndWheelInteraction(t *testing.T) {
 	m.activeTasks = []queue.Task{{ID: "t1", Remote: "a.bin", State: queue.Waiting}}
 	m.historyTasks = []queue.Task{{ID: "h1", Remote: "old.bin", State: queue.Completed}}
 
-	// 1. 点击远端面板第 2 行 (bodyY=2, topH=14, rowStart=4 => row1 at Y=5, X>=55)
-	m.Update(tea.MouseMsg{X: 70, Y: 5, Button: tea.MouseButtonLeft, Action: tea.MouseActionPress})
+	// 1. 点击远端面板第 2 行 (bodyY=2, topH=14, 表头在 Y=4, row0 在 Y=5, row1 在 Y=6, X>=55)
+	m.Update(tea.MouseMsg{X: 70, Y: 6, Button: tea.MouseButtonLeft, Action: tea.MouseActionPress})
 	if m.focus != areaRemote || m.remoteCursor != 1 {
 		t.Fatalf("remote click failed: focus=%v cursor=%d", m.focus, m.remoteCursor)
 	}

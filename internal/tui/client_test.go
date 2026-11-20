@@ -303,10 +303,13 @@ func TestClientContextualFooterAndAsyncDoubleSubmitGuard(t *testing.T) {
 	m.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
 	m.focus = areaLocal
 
-	// 80x24 下未选文件且无身份时，Footer 单行渲染并明示不可用原因
+	// 80x24 下未选文件且无身份时，Footer 单行渲染并明示核心动作不可用原因，同时保留常用快捷键（不再用非当前区禁按键挤占空间）
 	footer := ansi.Strip(m.renderFooter())
-	if lipgloss.Height(footer) != 1 || !strings.Contains(footer, "需先选身份") || !strings.Contains(footer, "仅队列区") {
+	if lipgloss.Height(footer) != 1 || !strings.Contains(footer, "需先选身份") || !strings.Contains(footer, "[A]全选") || !strings.Contains(footer, "[?]帮助") {
 		t.Fatalf("unexpected client contextual footer at 80x24:\n%s", footer)
+	}
+	if strings.Contains(footer, "仅队列区") {
+		t.Fatalf("file area footer should not be cluttered with queue-only hint:\n%s", footer)
 	}
 
 	// 验证身份切换/批量操作执行期间防重入保护

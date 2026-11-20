@@ -141,6 +141,7 @@ type serverModel struct {
 	detailTitle    string
 	detailLines    []string
 	statusToast    string
+	toastLevel     toastLevel
 	toastUntil     time.Time
 	refreshSeq     uint64
 	refreshCfgSeq  uint64
@@ -207,7 +208,7 @@ func newServerModel(opts ServerOptions) *serverModel {
 	qi.Width = 40
 	return &serverModel{
 		opts:         opts,
-		th:           makeTheme(),
+		th:           makeServerTheme(),
 		page:         max(0, min(5, opts.Page)),
 		runtimeState: "正在连接本机控制端点…",
 		queryInput:   qi,
@@ -238,18 +239,21 @@ func (m *serverModel) tickCmd() tea.Cmd {
 func (m *serverModel) setToast(msg string) {
 	m.refreshCfgSeq = 0
 	m.refreshPollSeq = 0
+	m.toastLevel = inferToastLevel(msg)
 	applyToast(&m.statusToast, &m.toastUntil, msg, toastDuration)
 }
 
 func (m *serverModel) setToastError(msg string) {
 	m.refreshCfgSeq = 0
 	m.refreshPollSeq = 0
+	m.toastLevel = toastError
 	applyToast(&m.statusToast, &m.toastUntil, msg, toastErrorDuration)
 }
 
 func (m *serverModel) setToastSticky(msg string) {
 	m.refreshCfgSeq = 0
 	m.refreshPollSeq = 0
+	m.toastLevel = inferToastLevel(msg)
 	applyToast(&m.statusToast, &m.toastUntil, msg, 0)
 }
 
@@ -1647,6 +1651,15 @@ func (m *serverModel) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 			_, _, topTotalH, botH := overviewLayout(m.width, bodyH)
 			rowStartY = bodyY + topTotalH + 2
 			visRows = max(1, botH-3)
+			if hasTableHeader(visRows, total) {
+				rowStartY++
+				visRows--
+			}
+		} else if m.page >= 1 && m.page <= 3 {
+			if hasTableHeader(visRows, total) {
+				rowStartY++
+				visRows--
+			}
 		} else if m.page == 5 {
 			m.logPaused = true
 			if m.hasLogFilters() {

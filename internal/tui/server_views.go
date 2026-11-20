@@ -153,7 +153,7 @@ func (m *serverModel) renderTabBar() string {
 		}
 		row += sep + formatBusyBadge(m.th, m.busySpin, op, m.busyStart)
 	} else if m.statusToast != "" && avail >= 6 {
-		row += sep + m.th.toast.Render("· "+truncPlainCell(m.statusToast, max(4, avail-2)))
+		row += sep + renderToastInline(m.th, m.toastLevel, m.statusToast, max(4, avail))
 	}
 	return lipgloss.NewStyle().Padding(0, 1).Width(m.width).Render(truncCell(row, budget))
 }
@@ -178,7 +178,7 @@ func (m *serverModel) renderFooter() string {
 			return m.th.footerBar.Width(m.width).Render(truncCell(formatBusyBadge(m.th, m.busySpin, op, m.busyStart), max(1, m.width-2)))
 		}
 		if m.statusToast != "" {
-			return m.th.footerBar.Width(m.width).Render(truncCell(m.th.toast.Render("· "+sanitizeInline(m.statusToast)), max(1, m.width-2)))
+			return m.th.footerBar.Width(m.width).Render(truncCell(renderToastInline(m.th, m.toastLevel, m.statusToast, max(1, m.width-2)), max(1, m.width-2)))
 		}
 	}
 	busyReason := ""
@@ -563,7 +563,7 @@ func (m *serverModel) renderOverviewPage(bodyH int) string {
 	if leftInner >= 26 {
 		leftTitle = spreadRow(leftTitle, leftBadge, leftInner)
 	}
-	leftCard := renderPanelBox(m.th, leftTitle, cfgLines, true, leftW, topH)
+	leftCard := renderPanelBox(m.th, leftTitle, cfgLines, false, leftW, topH)
 
 	// 右侧：自适应全宽实时运行监控卡片
 	rightCard := m.renderRuntimeMonitorCard(rightW, topH)
@@ -575,20 +575,30 @@ func (m *serverModel) renderOverviewPage(bodyH int) string {
 	// 底部：活跃连接列表
 	innerW := max(16, m.width-4)
 	visRows := max(1, botH-3)
+	dataRows := visRows
 	var peerLines []string
+	var peerTotal int
 	if m.runtime == nil || len(m.runtime.Peers) == 0 {
 		peerLines = append(peerLines, m.th.badgeMuted.Render("（当前无在线客户端连接）"))
 	} else {
 		peers := m.runtime.Peers
-		start := scrollOffset(m.cursors[0], len(peers), visRows)
-		for i := start; i < min(len(peers), start+visRows); i++ {
+		peerTotal = len(peers)
+		userW := min(16, max(8, innerW/5))
+		remW := min(24, max(12, innerW/3))
+		if hasTableHeader(visRows, len(peers)) {
+			hdr := fmt.Sprintf("  %-5s  %s  %s  %s", "ID", padPlainRightCell("用户", userW), padPlainRightCell("远端地址", remW), "在线时长")
+			peerLines = append(peerLines, m.th.badgeMuted.Render(truncCell(hdr, innerW)))
+			dataRows--
+		}
+		start := scrollOffset(m.cursors[0], len(peers), dataRows)
+		for i := start; i < min(len(peers), start+dataRows); i++ {
 			p := peers[i]
 			mark := "  "
 			if i == m.cursors[0] {
 				mark = "▶ "
 			}
 			line := fmt.Sprintf("%s#%-4d  %s  %s  在线 %s",
-				mark, p.ID, padPlainRightCell(p.User, min(16, max(8, innerW/5))), padPlainRightCell(p.Remote, min(24, max(12, innerW/3))),
+				mark, p.ID, padPlainRightCell(p.User, userW), padPlainRightCell(p.Remote, remW),
 				time.Since(p.Since).Round(time.Second))
 			if i == m.cursors[0] {
 				peerLines = append(peerLines, highlightRow(m.th, line, innerW))
@@ -597,7 +607,11 @@ func (m *serverModel) renderOverviewPage(bodyH int) string {
 			}
 		}
 	}
-	botCard := renderPanelBox(m.th, m.th.hintKey.Render("活跃 mTLS 会话"), peerLines, true, m.width, botH)
+	botTitle := m.th.hintKey.Render("活跃 mTLS 会话")
+	if pos := scrollPosBadge(m.th, m.cursors[0], peerTotal, dataRows); pos != "" {
+		botTitle = spreadRow(botTitle, pos, innerW)
+	}
+	botCard := renderPanelBox(m.th, botTitle, peerLines, true, m.width, botH)
 	return lipgloss.JoinVertical(lipgloss.Left, topArea, botCard)
 }
 
@@ -647,7 +661,7 @@ func (m *serverModel) renderRuntimeMonitorCard(outerW, outerH int) string {
 		if dataH >= 5 && m.cfgErr == nil {
 			statLines = append(statLines, truncCell(m.th.badgeMuted.Render("运行后将自适应全宽展示吞吐速率、趋势曲线与存储统计。"), innerW))
 		}
-		return renderPanelBox(m.th, title, statLines, true, outerW, outerH)
+		return renderPanelBox(m.th, title, statLines, false, outerW, outerH)
 	}
 
 	r := m.runtime
@@ -724,7 +738,7 @@ func (m *serverModel) renderRuntimeMonitorCard(outerW, outerH int) string {
 			sparkRow("下载趋势：", 1, m.th.hintKey),
 		)
 	}
-	return renderPanelBox(m.th, title, statLines, true, outerW, outerH)
+	return renderPanelBox(m.th, title, statLines, false, outerW, outerH)
 }
 
 func spreadRow(left, right string, innerW int) string {
@@ -788,6 +802,7 @@ func renderSparkline(th theme, samples [][2]float64, dir, width int, barStyle li
 func (m *serverModel) renderUsersPage(bodyH int) string {
 	innerW := max(20, m.width-4)
 	visRows := max(1, bodyH-3)
+	dataRows := visRows
 	users := m.filteredUsers()
 
 	var lines []string
@@ -798,8 +813,26 @@ func (m *serverModel) renderUsersPage(bodyH int) string {
 		for _, cr := range m.certs {
 			certStateByUser[cr.Name] = cr.State
 		}
-		start := scrollOffset(m.cursors[1], len(users), visRows)
-		for i := start; i < min(len(users), start+visRows); i++ {
+		userW := 14
+		permW := 16
+		bwW := 20
+		if innerW < 78 {
+			userW = 10
+			permW = 10
+			bwW = max(10, innerW-userW-permW-26)
+		}
+		if hasTableHeader(visRows, len(users)) {
+			hdr := fmt.Sprintf("  %s  %s  %s  %s  %s",
+				padPlainRightCell("用户", userW),
+				padPlainRightCell("状态", 6),
+				padPlainRightCell("权限", permW),
+				padPlainRightCell("带宽", bwW),
+				"证书状态")
+			lines = append(lines, m.th.badgeMuted.Render(truncCell(hdr, innerW)))
+			dataRows--
+		}
+		start := scrollOffset(m.cursors[1], len(users), dataRows)
+		for i := start; i < min(len(users), start+dataRows); i++ {
 			u := users[i]
 			mark := "  "
 			if i == m.cursors[1] {
@@ -826,14 +859,6 @@ func (m *serverModel) renderUsersPage(bodyH int) string {
 			if certSt == "" {
 				certSt = "未知"
 			}
-			userW := 14
-			permW := 16
-			bwW := 20
-			if innerW < 78 {
-				userW = 10
-				permW = 10
-				bwW = max(10, innerW-userW-permW-26)
-			}
 			row := fmt.Sprintf("%s%s  %s  %s  %s  证书:%s",
 				mark, padPlainRightCell(u.UserID, userW), padRightCell(st, 6), padPlainRightCell(perms, permW), padPlainRightCell(bwStr, bwW), sanitizeInline(certSt))
 			if i == m.cursors[1] {
@@ -844,12 +869,16 @@ func (m *serverModel) renderUsersPage(bodyH int) string {
 		}
 	}
 	title := m.th.hintKey.Render(fmt.Sprintf("授权用户列表 (%d 项)", len(users)))
+	if pos := scrollPosBadge(m.th, m.cursors[1], len(users), dataRows); pos != "" {
+		title = spreadRow(title, pos, innerW)
+	}
 	return renderPanelBox(m.th, title, lines, true, m.width, bodyH)
 }
 
 func (m *serverModel) renderTransfersPage(bodyH int) string {
 	innerW := max(20, m.width-4)
 	visRows := max(1, bodyH-3)
+	dataRows := visRows
 	tasks := m.filteredTasks()
 
 	var lines []string
@@ -858,7 +887,6 @@ func (m *serverModel) renderTransfersPage(bodyH int) string {
 	} else if len(tasks) == 0 {
 		lines = append(lines, m.th.badgeMuted.Render("（当前无活动或最近传输记录）"))
 	} else {
-		start := scrollOffset(m.cursors[2], len(tasks), visRows)
 		userW := min(12, max(8, innerW/7))
 		const (
 			dirW   = 6
@@ -868,7 +896,19 @@ func (m *serverModel) renderTransfersPage(bodyH int) string {
 		)
 		// 固定开销: mark(2) + userW + 2 + dirW + 2 + fileW + 2 + stateW + 2 + sizeW + 2 + rateW
 		fileW := max(10, innerW-userW-dirW-stateW-sizeW-rateW-12)
-		for i := start; i < min(len(tasks), start+visRows); i++ {
+		if hasTableHeader(visRows, len(tasks)) {
+			hdr := fmt.Sprintf("  %s  %s  %s  %s  %s  %s",
+				padPlainRightCell("用户", userW),
+				padPlainRightCell("方向", dirW),
+				padPlainRightCell("文件名", fileW),
+				padPlainRightCell("状态", stateW),
+				padLeftCell("已传 / 总大小", sizeW),
+				padLeftCell("速率", rateW))
+			lines = append(lines, m.th.badgeMuted.Render(truncCell(hdr, innerW)))
+			dataRows--
+		}
+		start := scrollOffset(m.cursors[2], len(tasks), dataRows)
+		for i := start; i < min(len(tasks), start+dataRows); i++ {
 			t := tasks[i]
 			mark := "  "
 			if i == m.cursors[2] {
@@ -891,18 +931,21 @@ func (m *serverModel) renderTransfersPage(bodyH int) string {
 		}
 	}
 	title := m.th.hintKey.Render(fmt.Sprintf("服务端传输监控 (%d 项)", len(tasks)))
+	if pos := scrollPosBadge(m.th, m.cursors[2], len(tasks), dataRows); pos != "" {
+		title = spreadRow(title, pos, innerW)
+	}
 	return renderPanelBox(m.th, title, lines, true, m.width, bodyH)
 }
 
 func (m *serverModel) renderCertsPage(bodyH int) string {
 	innerW := max(20, m.width-4)
 	visRows := max(1, bodyH-3)
+	dataRows := visRows
 
 	var lines []string
 	if len(m.certs) == 0 {
 		lines = append(lines, m.th.badgeMuted.Render("（暂无可检查的证书配置）"))
 	} else {
-		start := scrollOffset(m.cursors[3], len(m.certs), visRows)
 		nameW := 12
 		roleW := 12
 		const stateW = 10
@@ -913,7 +956,22 @@ func (m *serverModel) renderCertsPage(bodyH int) string {
 			expW = 16
 		}
 		fpBudget := innerW - (2 + nameW + 2 + roleW + 2 + stateW + 2 + 5 + expW + 5)
-		for i := start; i < min(len(m.certs), start+visRows); i++ {
+		if hasTableHeader(visRows, len(m.certs)) {
+			fpHdr := ""
+			if fpBudget >= 8 {
+				fpHdr = "  指纹"
+			}
+			hdr := fmt.Sprintf("  %s  %s  %s  %s%s",
+				padPlainRightCell("主体", nameW),
+				padPlainRightCell("角色", roleW),
+				padPlainRightCell("状态", stateW),
+				padPlainRightCell("有效期", expW+5),
+				fpHdr)
+			lines = append(lines, m.th.badgeMuted.Render(truncCell(hdr, innerW)))
+			dataRows--
+		}
+		start := scrollOffset(m.cursors[3], len(m.certs), dataRows)
+		for i := start; i < min(len(m.certs), start+dataRows); i++ {
 			c := m.certs[i]
 			mark := "  "
 			if i == m.cursors[3] {
@@ -935,7 +993,11 @@ func (m *serverModel) renderCertsPage(bodyH int) string {
 			}
 		}
 	}
-	return renderPanelBox(m.th, m.th.hintKey.Render("证书信任链与有效期体检"), lines, true, m.width, bodyH)
+	title := m.th.hintKey.Render("证书信任链与有效期体检")
+	if pos := scrollPosBadge(m.th, m.cursors[3], len(m.certs), dataRows); pos != "" {
+		title = spreadRow(title, pos, innerW)
+	}
+	return renderPanelBox(m.th, title, lines, true, m.width, bodyH)
 }
 
 func formatBandwidthSummary(bw config.Bandwidth) string {
@@ -1115,7 +1177,13 @@ func (m *serverModel) renderSettingsPage(bodyH int) string {
 			}
 		}
 	}
-	return renderPanelBox(m.th, m.th.hintKey.Render("服务端配置与运行参数"), lines, true, m.width, bodyH)
+	title := m.th.hintKey.Render("服务端配置与运行参数")
+	if m.cfgErr == nil {
+		if pos := scrollPosBadge(m.th, m.cursors[4], len(m.settingsRows()), visRows); pos != "" {
+			title = spreadRow(title, pos, innerW)
+		}
+	}
+	return renderPanelBox(m.th, title, lines, true, m.width, bodyH)
 }
 
 func (m *serverModel) renderLogsPage(bodyH int) string {
@@ -1197,6 +1265,13 @@ func (m *serverModel) renderLogsPage(bodyH int) string {
 				lines = append(lines, truncCell(row, innerW))
 			}
 		}
+	}
+	logTotal := len(m.logEvents)
+	if m.logFallback != "" {
+		logTotal = len(m.filteredLogFallbackLines())
+	}
+	if pos := scrollPosBadge(m.th, m.cursors[5], logTotal, visRows); pos != "" {
+		title = spreadRow(title, pos, innerW)
 	}
 	return renderPanelBox(m.th, title, lines, true, m.width, bodyH)
 }
