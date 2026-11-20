@@ -1133,6 +1133,26 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	// 3. 全局导航与视图快捷键
 	switch k {
+	case "esc":
+		if m.query != "" {
+			m.query = ""
+			m.searchInput.SetValue("")
+			m.rebuildLocalVisible()
+			m.rebuildRemoteVisible()
+			m.setToast("已清空筛选条件")
+			return m, nil
+		}
+		if m.focus == areaLocal && len(m.localSelected) > 0 {
+			m.localSelected = make(map[string]bool)
+			m.setToast("已清空本地多选")
+			return m, nil
+		}
+		if m.focus == areaRemote && len(m.remoteSelected) > 0 {
+			m.remoteSelected = make(map[string]bool)
+			m.setToast("已清空远端多选")
+			return m, nil
+		}
+		return m, nil
 	case "q", "f10":
 		return m.requestExit()
 	case "?":
@@ -1161,9 +1181,18 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.historyView = true
 		m.clampQueueCursor()
 		return m, nil
-	case "v", "h":
+	case "v":
 		m.focus = areaQueue
 		m.historyView = !m.historyView
+		m.clampQueueCursor()
+		return m, nil
+	case "h":
+		if m.focus == areaQueue && m.historyView {
+			m.historyView = false
+		} else {
+			m.focus = areaQueue
+			m.historyView = true
+		}
 		m.clampQueueCursor()
 		return m, nil
 	case "/":
@@ -1184,16 +1213,20 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, textinput.Blink
 	case "o":
 		switch m.focus {
+		case areaLocal:
+			m.localSort = (m.localSort + 1) % 4
+			m.rebuildLocalVisible()
+			m.setToast("本地排序：" + m.sortLabel(m.localSort))
+			return m, saveUIPrefsCmd(m.prefsPath, m.currentPrefs())
 		case areaRemote:
 			m.remoteSort = (m.remoteSort + 1) % 4
 			m.rebuildRemoteVisible()
 			m.setToast("远端排序：" + m.sortLabel(m.remoteSort))
+			return m, saveUIPrefsCmd(m.prefsPath, m.currentPrefs())
 		default:
-			m.localSort = (m.localSort + 1) % 4
-			m.rebuildLocalVisible()
-			m.setToast("本地排序：" + m.sortLabel(m.localSort))
+			m.setToast("排序仅适用于本地或远端文件列表")
+			return m, nil
 		}
-		return m, saveUIPrefsCmd(m.prefsPath, m.currentPrefs())
 	case "r":
 		if m.focus == areaQueue && m.historyView {
 			return m, m.retryHistoryCmd()
@@ -1290,7 +1323,7 @@ func (m *model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 			}
 		case tea.MouseButtonLeft:
 			_, listStartRelY, maxShow, inputRelY := m.identityModalMetrics()
-			boxW := min(max(44, m.width-4), 86)
+			boxW, _ := modalBoxDimensions(m.width)
 			_, footer, lines := m.buildIdentityModalContent()
 			boxH := lipgloss.Height(renderModalRawBox(m.width, m.th, "客户端 mTLS 身份管理", lines, footer))
 			boxY := max(0, (m.height-boxH)/2)
@@ -1420,8 +1453,21 @@ func (m *model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 		visRows := max(1, topH-3)
 		relY := msg.Y - (bodyY + 2)
 		if msg.X < leftW {
+			wasLocal := m.focus == areaLocal
+			prevIdx := m.localCursor
 			m.focus = areaLocal
 			moveList(&m.localCursor, len(m.visibleLocal), visRows, relY)
+			// 再次单击已聚焦的目录项直接进入目录，与身份弹窗双击确认保持一致
+			if msg.Button == tea.MouseButtonLeft && wasLocal && relY >= 0 && relY < visRows && m.localCursor == prevIdx && m.localCursor < len(m.visibleLocal) {
+				if e := m.visibleLocal[m.localCursor]; e.dir {
+					if e.name == "../" {
+						m.pendingLocalFocusPath = m.localDir
+					} else {
+						m.pendingLocalFocusPath = ""
+					}
+					return m, m.loadLocalCmd(e.path)
+				}
+			}
 		} else {
 			m.focus = areaRemote
 			moveList(&m.remoteCursor, len(m.visibleRemote), visRows, relY)
@@ -1833,6 +1879,36 @@ func (m *model) handleLocalKey(k string) (tea.Model, tea.Cmd) {
 			m.pendingLocalFocusPath = m.localDir
 			return m, m.loadLocalCmd(parent)
 		}
+	case "ctrl+a", "A":
+		selectable := 0
+		selected := 0
+		for _, e := range m.visibleLocal {
+			if e.regular {
+				selectable++
+				if m.localSelected[e.path] {
+					selected++
+				}
+			}
+		}
+		if selectable == 0 {
+			m.setToast("当前列表无可勾选的普通文件")
+			return m, nil
+		}
+		if selected == selectable {
+			for _, e := range m.visibleLocal {
+				if e.regular {
+					delete(m.localSelected, e.path)
+				}
+			}
+			m.setToast("已取消全选本地文件")
+		} else {
+			for _, e := range m.visibleLocal {
+				if e.regular {
+					m.localSelected[e.path] = true
+				}
+			}
+			m.setToast(fmt.Sprintf("已全选 %d 个本地文件", selectable))
+		}
 	case " ":
 		if m.localCursor >= 0 && m.localCursor < n {
 			e := m.visibleLocal[m.localCursor]
@@ -1896,6 +1972,28 @@ func (m *model) handleRemoteKey(k string) (tea.Model, tea.Cmd) {
 		if n > 0 {
 			m.remoteCursor = n - 1
 		}
+	case "ctrl+a", "A":
+		if n == 0 {
+			m.setToast("当前远端列表为空")
+			return m, nil
+		}
+		selected := 0
+		for _, f := range m.visibleRemote {
+			if m.remoteSelected[f.FileName] {
+				selected++
+			}
+		}
+		if selected == n {
+			for _, f := range m.visibleRemote {
+				delete(m.remoteSelected, f.FileName)
+			}
+			m.setToast("已取消全选远端文件")
+		} else {
+			for _, f := range m.visibleRemote {
+				m.remoteSelected[f.FileName] = true
+			}
+			m.setToast(fmt.Sprintf("已全选 %d 个远端文件", n))
+		}
 	case " ":
 		if m.remoteCursor >= 0 && m.remoteCursor < n {
 			name := m.visibleRemote[m.remoteCursor].FileName
@@ -1909,6 +2007,20 @@ func (m *model) handleRemoteKey(k string) (tea.Model, tea.Cmd) {
 			}
 		}
 	case "enter":
+		if n == 0 && m.remoteErr != "" {
+			m.detailTitle = "远端连接错误详情"
+			m.detailLines = []string{
+				"错误说明：",
+				"  " + sanitizeInline(m.remoteErr),
+				"",
+				"排查建议：",
+				"  • 按 r 重新刷新远端连接",
+				"  • 按 i 打开身份管理并按 t 测试 mTLS 握手",
+			}
+			m.infoScroll = 0
+			m.modal = modalDetail
+			return m, nil
+		}
 		if m.remoteCursor >= 0 && m.remoteCursor < n {
 			f := m.visibleRemote[m.remoteCursor]
 			m.detailTitle = "远端文件信息"
@@ -1943,6 +2055,12 @@ func (m *model) handleQueueKey(k string) (tea.Model, tea.Cmd) {
 	case "pgdown":
 		if n > 0 {
 			m.queueCursor = min(n-1, m.queueCursor+8)
+		}
+	case "home", "g":
+		m.queueCursor = 0
+	case "end", "G":
+		if n > 0 {
+			m.queueCursor = n - 1
 		}
 	case " ":
 		if !m.historyView {

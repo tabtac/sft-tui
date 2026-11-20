@@ -1107,7 +1107,7 @@ func (m *serverModel) renderLogsPage(bodyH int) string {
 
 	status := m.th.badgeOk.Render("[实时跟随]")
 	if m.logPaused {
-		status = m.th.badgeWarn.Render("[已暂停]")
+		status = m.th.badgeWarn.Render("[已暂停 · p/G 恢复]")
 	}
 	if m.logLost {
 		status += " " + m.th.badgeWarn.Render("(部分旧日志已滚动覆盖)")
@@ -1209,8 +1209,9 @@ func (m *serverModel) infoModalData() (title string, lines []string, footer stri
 		return "服务端管理快捷键", []string{
 			m.th.hintKey.Render("全局快捷键"),
 			helpKeyRow(m.th, "  ", "[1-6] / [Tab]", "在 概览/用户/传输/证书/设置/日志 间切换", kW),
-			helpKeyRow(m.th, "  ", "[↑↓] / [PgUp]", "移动光标或翻页（日志上翻自动暂停跟随）", kW),
-			helpKeyRow(m.th, "  ", "[/] / [r]", "过滤当前列表 / 手动刷新配置与状态", kW),
+			helpKeyRow(m.th, "  ", "[↑↓] / [Home/G]", "移动光标/首尾跳转（日志置底自动恢复跟随）", kW),
+			helpKeyRow(m.th, "  ", "[/] / [Esc]", "过滤当前列表 / 一键清空当前页筛选条件", kW),
+			helpKeyRow(m.th, "  ", "[r]", "手动刷新配置与运行状态", kW),
 			helpKeyRow(m.th, "  ", "[s] / [x]", "后台启动 sftd / 停止运行中的 sftd", kW),
 			helpKeyRow(m.th, "  ", "[R]", "热加载 TLS 证书、用户 ACL 与全局总带宽", kW),
 			helpKeyRow(m.th, "  ", "[?] / [q]", "开关本帮助 / 退出管理界面（服务保持运行）", kW),

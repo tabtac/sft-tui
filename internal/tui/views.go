@@ -466,8 +466,12 @@ func (m *model) renderRemotePanel(outerW, outerH int) string {
 	case m.cfg == nil:
 		lines = append(lines, m.th.badgeMuted.Render(truncCell("尚未配置或导入身份，按 i 打开身份配置", innerW)))
 	case m.remoteErr != "":
-		lines = append(lines, m.th.badgeErr.Render(truncPlainCell("远端列表暂不可用："+m.remoteErr, innerW)))
-		lines = append(lines, m.th.badgeMuted.Render(truncCell("按 r 重新刷新连接，本地队列与断点继续可用", innerW)))
+		errLines := wrapModalLines([]string{"远端列表暂不可用：" + sanitizeInline(m.remoteErr)}, innerW)
+		maxErr := max(1, visRows-1)
+		for i := 0; i < min(len(errLines), maxErr); i++ {
+			lines = append(lines, m.th.badgeErr.Render(errLines[i]))
+		}
+		lines = append(lines, m.th.badgeMuted.Render(truncCell("按 r 刷新连接 · Enter 查看完整错误，本地队列与断点继续可用", innerW)))
 	case len(m.visibleRemote) == 0:
 		lines = append(lines, m.th.badgeMuted.Render(truncCell("（远端暂无匹配文件，选中本地文件后按 u/F5 上传）", innerW)))
 	default:

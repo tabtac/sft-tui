@@ -959,3 +959,67 @@ func TestClientNarrowSubHeaderToastAndScrollableConflictModal(t *testing.T) {
 		t.Fatalf("expected conflict action options reachable at bottom of scrollable modal:\n%s", vEnd)
 	}
 }
+
+func TestClientEscClearSelectAllKeyScopesAndRemoteErrorDetail(t *testing.T) {
+	dir := t.TempDir()
+	m := newModel(Options{ExecutableDir: dir, Directory: dir})
+	m.Update(tea.WindowSizeMsg{Width: 100, Height: 28})
+	m.localEntries = []localEntry{
+		{name: "sub", path: filepath.Join(dir, "sub"), dir: true},
+		{name: "alpha.bin", path: filepath.Join(dir, "alpha.bin"), regular: true},
+		{name: "beta.bin", path: filepath.Join(dir, "beta.bin"), regular: true},
+	}
+	m.rebuildLocalVisible()
+
+	// 1. A 全选本地普通文件（不含目录），再按 A 取消全选
+	m.focus = areaLocal
+	m.Update(keyRune('A'))
+	if len(m.localSelected) != 2 {
+		t.Fatalf("expected A to select 2 regular files, got %d", len(m.localSelected))
+	}
+	// 普通模式下 Esc 清空筛选优先，其次清空当前区多选
+	m.query = "alpha"
+	m.searchInput.SetValue("alpha")
+	m.rebuildLocalVisible()
+	m.Update(keyType(tea.KeyEsc))
+	if m.query != "" || len(m.localSelected) != 2 {
+		t.Fatalf("first Esc should clear search query keeping selection: query=%q sel=%d", m.query, len(m.localSelected))
+	}
+	m.Update(keyType(tea.KeyEsc))
+	if len(m.localSelected) != 0 {
+		t.Fatalf("second Esc should clear local selection, got %d", len(m.localSelected))
+	}
+
+	// 2. 队列区按 o 不得修改本地排序；g/G 支持首尾跳转；h 从文件区直达历史归档
+	m.activeTasks = []queue.Task{{ID: "t1"}, {ID: "t2"}, {ID: "t3"}}
+	m.focus = areaQueue
+	origLocalSort := m.localSort
+	m.Update(keyRune('o'))
+	if m.localSort != origLocalSort {
+		t.Fatalf("o in queue unexpectedly mutated localSort: %v -> %v", origLocalSort, m.localSort)
+	}
+	m.Update(keyRune('G'))
+	if m.queueCursor != 2 {
+		t.Fatalf("G in queue did not jump to end: cursor=%d", m.queueCursor)
+	}
+	m.Update(keyRune('g'))
+	if m.queueCursor != 0 {
+		t.Fatalf("g in queue did not jump to start: cursor=%d", m.queueCursor)
+	}
+
+	m.focus = areaLocal
+	m.historyView = true
+	m.Update(keyRune('h'))
+	if m.focus != areaQueue || !m.historyView {
+		t.Fatalf("h from local pane should open history view, got focus=%v hist=%v", m.focus, m.historyView)
+	}
+
+	// 3. 远端离线报错时按 Enter 打开完整错误详情弹窗
+	m.focus = areaRemote
+	m.visibleRemote = nil
+	m.remoteErr = "x509: certificate signed by unknown authority (detailed diagnostic)"
+	m.Update(keyType(tea.KeyEnter))
+	if m.modal != modalDetail || !strings.Contains(ansi.Strip(m.View()), "unknown authority") {
+		t.Fatalf("expected Enter on remote error to open detail modal, modal=%v", m.modal)
+	}
+}

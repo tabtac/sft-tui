@@ -711,6 +711,30 @@ func (m *serverModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 
 	switch k {
+	case "esc":
+		switch m.page {
+		case 1:
+			if m.userFilter != "" {
+				m.userFilter = ""
+				m.clampCursors()
+				m.setToast("已清空用户筛选")
+			}
+		case 2:
+			if m.txFilter != "" {
+				m.txFilter = ""
+				m.clampCursors()
+				m.setToast("已清空传输筛选")
+			}
+		case 5:
+			if m.hasLogFilters() {
+				m.logQuery = monitor.LogQuery{}
+				m.logMinLevel = ""
+				m.logSinceIdx = 0
+				m.setToast("已清空全部日志筛选条件")
+				return m, m.resetLogsAndPollCmd()
+			}
+		}
+		return m, nil
 	case "q", "f10":
 		if m.rejectIfBusy() {
 			return m, nil
@@ -778,8 +802,12 @@ func (m *serverModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 	case "down", "j":
-		if m.cursors[m.page] < m.currentPageLen()-1 {
+		n := m.currentPageLen()
+		if m.cursors[m.page] < n-1 {
 			m.cursors[m.page]++
+		} else if m.page == 5 && m.logPaused {
+			m.logPaused = false
+			return m, m.pollRuntimeCmd()
 		}
 		return m, nil
 	case "pgup":
@@ -792,6 +820,28 @@ func (m *serverModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if n := m.currentPageLen(); n > 0 {
 			m.cursors[m.page] = min(n-1, m.cursors[m.page]+8)
 		}
+		return m, nil
+	case "home":
+		if m.page == 5 {
+			m.logPaused = true
+		}
+		m.cursors[m.page] = 0
+		return m, nil
+	case "end", "G":
+		if n := m.currentPageLen(); n > 0 {
+			m.cursors[m.page] = n - 1
+		}
+		if m.page == 5 && m.logPaused {
+			m.logPaused = false
+			return m, m.pollRuntimeCmd()
+		}
+		return m, nil
+	}
+	if k == "g" && m.page != 1 && m.page != 2 {
+		if m.page == 5 {
+			m.logPaused = true
+		}
+		m.cursors[m.page] = 0
 		return m, nil
 	}
 

@@ -1298,3 +1298,38 @@ func TestServerFormToggleEnterDynamicBandwidthAndWizardEscCapture(t *testing.T) 
 		t.Fatalf("expected Enter on inheritBW toggle to expand 3 custom bandwidth rows preserving name, modal=%v inputs=%d", m.modal, len(m.formInputs))
 	}
 }
+
+func TestServerEscFilterClearAndHomeEndLogResume(t *testing.T) {
+	m := regressionServer(t, 110, 30)
+
+	// 1. 用户页按 Esc 一键清空非编辑态筛选
+	m.page = 1
+	m.userFilter = "alice"
+	m.Update(keyType(tea.KeyEsc))
+	if m.userFilter != "" {
+		t.Fatalf("expected Esc to clear userFilter, got %q", m.userFilter)
+	}
+
+	// 2. 日志页支持 Home/g 置顶暂停，End/G 置底自动恢复实时跟随，Esc 清空筛选
+	m.page = 5
+	m.logEvents = []monitor.Event{
+		{Sequence: 1, Level: "INFO", Message: "m1"},
+		{Sequence: 2, Level: "WARN", Message: "m2"},
+		{Sequence: 3, Level: "ERROR", Message: "m3"},
+	}
+	m.cursors[5] = 2
+	m.logPaused = false
+	m.Update(keyRune('g'))
+	if m.cursors[5] != 0 || !m.logPaused {
+		t.Fatalf("expected g on logs page to jump to top and pause, cursor=%d paused=%v", m.cursors[5], m.logPaused)
+	}
+	m.Update(keyRune('G'))
+	if m.cursors[5] != 2 || m.logPaused {
+		t.Fatalf("expected G on logs page to jump to bottom and resume follow, cursor=%d paused=%v", m.cursors[5], m.logPaused)
+	}
+	m.logMinLevel = "WARN"
+	m.Update(keyType(tea.KeyEsc))
+	if m.hasLogFilters() {
+		t.Fatalf("expected Esc on logs page to clear filters, level=%q", m.logMinLevel)
+	}
+}
