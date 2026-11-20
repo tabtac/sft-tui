@@ -15,6 +15,7 @@ import (
 	"sft-tui/internal/progress"
 	"sft-tui/internal/protocol"
 	"sft-tui/internal/queue"
+	"sft-tui/internal/security"
 	"sft-tui/internal/testcert"
 	"sft-tui/internal/transfer"
 )
@@ -266,5 +267,75 @@ func TestRunTransfersRejectsWantCancelAndExitsOnPaused(t *testing.T) {
 	defer waitCancel()
 	if code := waitTrackedTransfers(waitCtx, mgr, []trackedJob{{idx: 0, id: tasks[0].ID, dir: "upload", label: "sample.bin"}}, disp); code != 1 {
 		t.Fatalf("expected non-zero exit when tracked task is Paused, got %d", code)
+	}
+}
+
+func TestCLIUploadSameBasenameDifferentPathRejectsWrongSourceResume(t *testing.T) {
+	cfgPath, cleanup := setupCLIFixture(t)
+	defer cleanup()
+
+	cfg, err := config.LoadClient(cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	idKey, err := security.ClientIdentityKey(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldPath := filepath.Join(t.TempDir(), "report.txt")
+	newPath := filepath.Join(t.TempDir(), "report.txt")
+	if err := os.WriteFile(oldPath, []byte("OLD PRIVATE CONTENT"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(newPath, []byte("NEW REQUESTED CONTENT"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	mgr, err := queue.Open(queue.Config{StateDir: cfg.StateDir, Identity: idKey, MaxFileBytes: cfg.MaxFileBytes, MaxStreams: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tasks, err := mgr.Enqueue([]queue.Spec{{Direction: protocol.DirectionUpload, Remote: "report.txt", Path: oldPath}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := mgr.Pause(tasks[0].ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := mgr.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	var out, errOut bytes.Buffer
+	code := runCommand([]string{"-config", cfgPath, "-progress", "never", "upload", newPath}, &out, &errOut)
+	if code == 0 {
+		t.Fatalf("expected conflict error when resuming same remote name from different path, got exit=0 out=%q", out.String())
+	}
+	if !strings.Contains(errOut.String(), "不同路径") {
+		t.Fatalf("expected path conflict explanation, got stderr=%q", errOut.String())
+	}
+
+	// 确认远端未收到旧文件内容
+	cli, err := transfer.Dial(context.Background(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cli.Close()
+	var remoteNames []string
+	if err := cli.ListFiles(context.Background(), func(f protocol.FileEntry) error {
+		remoteNames = append(remoteNames, f.FileName)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(remoteNames) != 0 {
+		t.Fatalf("unexpected remote files uploaded after conflict rejection: %v", remoteNames)
+	}
+
+	// 同路径再次上传时应正常续传并上传正确内容
+	out.Reset()
+	errOut.Reset()
+	if code := runCommand([]string{"-config", cfgPath, "-progress", "never", "upload", oldPath}, &out, &errOut); code != 0 {
+		t.Fatalf("same-path resume should succeed, code=%d err=%q", code, errOut.String())
 	}
 }

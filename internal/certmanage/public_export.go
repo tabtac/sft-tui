@@ -69,21 +69,23 @@ func exportAction(o Options, server config.Server, index int) (Result, error) {
 	if !os.SameFile(configured, authorized) {
 		return result, fmt.Errorf("客户端配置与当前授权证书不一致，请先执行 sync")
 	}
-	if _, err = tls.LoadX509KeyPair(c.TLS.Certificate, c.TLS.PrivateKey); err != nil {
-		return result, err
-	}
-	ca, err := pal.ReadSmall(server.TLS.CACertificate, security.MaxCertFileBytes)
+	pair, err := tls.LoadX509KeyPair(c.TLS.Certificate, c.TLS.PrivateKey)
 	if err != nil {
 		return result, err
 	}
-	cert, err := pal.ReadSmall(c.TLS.Certificate, security.MaxCertFileBytes)
+	ca, err := extractCertificatesOnly(server.TLS.CACertificate)
 	if err != nil {
 		return result, err
 	}
-	key, err := pal.ReadSmall(c.TLS.PrivateKey, security.MaxCertFileBytes)
+	cert, err := extractCertificatesOnly(c.TLS.Certificate)
 	if err != nil {
 		return result, err
 	}
+	keyDER, err := x509.MarshalPKCS8PrivateKey(pair.PrivateKey)
+	if err != nil {
+		return result, fmt.Errorf("编码客户端私钥失败：%w", err)
+	}
+	key := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER})
 	c.TLS = config.TLSFiles{
 		CACertificate: "certs/ca.pem",
 		Certificate:   "certs/" + u.UserID + ".pem",
@@ -142,6 +144,36 @@ func exportPublicCertificates(o Options, server config.Server, user config.Autho
 	ok = true
 	result.Messages = []string{"公开证书已导出：" + o.Out}
 	return result, nil
+}
+
+// extractCertificatesOnly 解析并仅重新编码 PEM 中的合法 CERTIFICATE 块，绝不带出任何混排私钥或杂项内容。
+func extractCertificatesOnly(path string) ([]byte, error) {
+	data, err := pal.ReadSmall(path, security.MaxCertFileBytes)
+	if err != nil {
+		return nil, err
+	}
+	var out bytes.Buffer
+	remaining := data
+	count := 0
+	for len(bytes.TrimSpace(remaining)) > 0 {
+		block, rest := pem.Decode(remaining)
+		if block == nil {
+			break
+		}
+		remaining = rest
+		if block.Type != "CERTIFICATE" {
+			continue
+		}
+		if _, err := x509.ParseCertificate(block.Bytes); err != nil {
+			return nil, fmt.Errorf("无效证书 %s：%w", path, err)
+		}
+		out.Write(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: block.Bytes}))
+		count++
+	}
+	if count == 0 {
+		return nil, fmt.Errorf("证书文件未包含有效 CERTIFICATE 块：%s", path)
+	}
+	return out.Bytes(), nil
 }
 
 func readPublicCertificates(path string) ([]byte, error) {

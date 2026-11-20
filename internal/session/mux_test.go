@@ -11,6 +11,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"sft-tui/internal/config"
 	"sft-tui/internal/protocol"
@@ -315,13 +316,13 @@ func TestMuxRejectTruncatesOversizedErrorMessage(t *testing.T) {
 		t.Fatalf("Open #1: %v", err)
 	}
 	defer st.Release()
-	if err := st.Send(protocol.TypePutReq, protocol.PutRequest{FileName: "a.bin"}); err != nil {
-		t.Fatalf("Send PutReq: %v", err)
+	err = st.Send(protocol.TypePutReq, protocol.PutRequest{FileName: "a.bin"})
+	if err == nil {
+		_, err = st.Receive()
 	}
-	_, err = st.Receive()
 	var remote *protocol.RemoteError
-	if !errors.As(err, &remote) || remote.Code != protocol.CodeBadState || len(remote.Message) > protocol.MaxErrorMessageBytes {
-		t.Fatalf("expected truncated RemoteError <= %d bytes, got %v", protocol.MaxErrorMessageBytes, err)
+	if !errors.As(err, &remote) || remote.Code != protocol.CodeBadState || len(remote.Message) > protocol.MaxErrorMessageBytes || !utf8.ValidString(remote.Message) {
+		t.Fatalf("expected truncated UTF-8 RemoteError <= %d bytes, got %v", protocol.MaxErrorMessageBytes, err)
 	}
 	if cli.Context().Err() != nil {
 		t.Fatalf("oversized mux.reject broke shared mux connection: %v", cli.Error())

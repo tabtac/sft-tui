@@ -319,3 +319,39 @@ func TestSyncSkipsExternalKeyAndInfersDirFromServerConfig(t *testing.T) {
 		t.Fatalf("expected alice client config synced: %v", err)
 	}
 }
+
+func TestFullExportStripsCombinedCAPrivateKey(t *testing.T) {
+	o := testOptions(t)
+	res, err := Execute("init", o)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ca, err := os.ReadFile(res.Server.TLS.CACertificate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	caKey, err := os.ReadFile(filepath.Join(o.Dir, "ca-key.pem"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(res.Server.TLS.CACertificate, append(ca, caKey...), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := security.ServerTLS(res.Server); err != nil {
+		t.Fatalf("combined CA file must remain accepted by ServerTLS: %v", err)
+	}
+	o.Out = filepath.Join(t.TempDir(), "alice-bundle")
+	if _, err := Execute("export", o); err != nil {
+		t.Fatalf("full export failed on combined CA PEM: %v", err)
+	}
+	exportedCA, err := os.ReadFile(filepath.Join(o.Out, "certs", "ca.pem"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(exportedCA, caKey) || bytes.Contains(exportedCA, []byte("PRIVATE KEY")) {
+		t.Fatalf("exported ca.pem leaked CA private key material")
+	}
+	if _, err := config.LoadClient(filepath.Join(o.Out, "client.alice.local.json")); err != nil {
+		t.Fatalf("exported bundle client config invalid: %v", err)
+	}
+}

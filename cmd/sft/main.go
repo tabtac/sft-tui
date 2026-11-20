@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"syscall"
 	"time"
@@ -438,6 +439,12 @@ func runTransfers(mgr *queue.Manager, cfg config.Client, jobs []cliJob, outDir, 
 		}
 		key := queue.TargetKey(dir, remote, localPath)
 		if old, ok := existingByKey[key]; ok {
+			if !sameTransferPath(old.Path, localPath) || old.Remote != remote {
+				shortID := old.ID[:min(12, len(old.ID))]
+				fmt.Fprintf(errOut, "sft：目标 %s 已有来自不同路径的未完成任务（旧路径：%s，新路径：%s，任务：%s）；请先执行 abort %s 取消旧任务或改名后再试\n",
+					remote, old.Path, localPath, shortID, shortID)
+				return 1
+			}
 			if old.WantCancel {
 				fmt.Fprintf(errOut, "sft：任务 %s 正在等待取消确认，请先完成取消或执行 status 查看状态\n", remote)
 				return 1
@@ -526,6 +533,14 @@ func waitTrackedTransfers(ctx context.Context, mgr *queue.Manager, tracked []tra
 		return 1
 	}
 	return 0
+}
+
+func sameTransferPath(a, b string) bool {
+	ca, cb := filepath.Clean(a), filepath.Clean(b)
+	if runtime.GOOS == "windows" {
+		return strings.EqualFold(ca, cb)
+	}
+	return ca == cb
 }
 
 func parseJobs(action string, args []string) ([]cliJob, error) {
