@@ -174,3 +174,24 @@ func TestUploadCheckpointBudgetSurvivesPolicyChangesAndCancellation(t *testing.T
 		t.Fatalf("other user checkpoint consumed: %v", err)
 	}
 }
+
+func TestWaitChunkedHandlesConcurrentBurstShrink(t *testing.T) {
+	b := config.Bandwidth{UploadBytesPerSecond: 10 << 20, DownloadBytesPerSecond: 10 << 20, BurstBytes: 1 << 20}
+	u := New(4, 10, 8)
+	u.SetGlobal(&b)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	// Shrink burst concurrently while Wait processes a 64 KiB chunk.
+	done := make(chan error, 1)
+	go func() {
+		done <- u.Wait(ctx, "alice", b, protocol.DirectionUpload, 64*1024)
+	}()
+	shrunk := b
+	shrunk.BurstBytes = 4096
+	u.SetGlobal(&shrunk)
+
+	if err := <-done; err != nil {
+		t.Fatalf("Wait failed across concurrent burst shrink: %v", err)
+	}
+}

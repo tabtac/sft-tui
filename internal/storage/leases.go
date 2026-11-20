@@ -44,6 +44,9 @@ func (s *Store) nextLeaseLocked(idHex string) uint64 {
 }
 
 func (s *Store) checkLeaseLocked(idHex string, lease uint64) error {
+	if s.closed || s.db == nil || s.root == nil {
+		return ErrStoreClosed
+	}
 	if lease == 0 || s.leases[idHex] != lease {
 		return ErrTaskNotActive
 	}
@@ -224,6 +227,9 @@ func (s *Store) BeginUploadSession(ctx context.Context, userID string, req proto
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.closed || s.db == nil || s.root == nil {
+		return Task{}, 0, ErrStoreClosed
+	}
 
 	if err := s.expireUserLocked(ctx, userID, time.Now()); err != nil {
 		return Task{}, 0, err
@@ -247,6 +253,9 @@ func (s *Store) ResumeUploadSession(ctx context.Context, userID string, req prot
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.closed || s.db == nil || s.root == nil {
+		return Task{}, 0, ErrStoreClosed
+	}
 
 	if err := s.expireUserLocked(ctx, userID, time.Now()); err != nil {
 		return Task{}, 0, err
@@ -374,13 +383,15 @@ func (s *Store) StageUploadChunk(ctx context.Context, taskID protocol.TransferID
 	}
 	for rem := data; len(rem) > 0; {
 		n, err := sw.file.Write(rem)
+		if n > 0 {
+			sw.offset += uint64(n)
+			sw.dirty = true
+		}
 		if err != nil {
 			return 0, err
 		}
 		rem = rem[n:]
 	}
-	sw.offset += uint64(len(data))
-	sw.dirty = true
 	return sw.offset, nil
 }
 
@@ -430,6 +441,14 @@ func (s *Store) FlushUploadCheckpoint(ctx context.Context, taskID protocol.Trans
 	defer s.mu.Unlock()
 	if err := s.checkLeaseLocked(idHex, lease); err != nil {
 		return 0, err
+	}
+	if cur := s.stageHandles[idHex]; cur == sw {
+		sw.mu.Lock()
+		committed := sw.committed
+		sw.mu.Unlock()
+		if committed >= targetOffset {
+			return committed, nil
+		}
 	}
 	now := time.Now().Unix()
 	expires := now + int64(s.retention.Seconds())
@@ -531,6 +550,9 @@ func (s *Store) BeginDownloadSession(ctx context.Context, userID string, req pro
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.closed || s.db == nil || s.root == nil {
+		return Task{}, nil, 0, ErrStoreClosed
+	}
 
 	if err := s.expireUserLocked(ctx, userID, time.Now()); err != nil {
 		return Task{}, nil, 0, err
@@ -557,6 +579,9 @@ func (s *Store) ResumeDownloadSession(ctx context.Context, userID string, req pr
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.closed || s.db == nil || s.root == nil {
+		return Task{}, nil, 0, ErrStoreClosed
+	}
 
 	if err := s.expireUserLocked(ctx, userID, time.Now()); err != nil {
 		return Task{}, nil, 0, err
@@ -617,21 +642,25 @@ func (s *Store) ReleaseTask(ctx context.Context, taskID protocol.TransferID, lea
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	if s.closed || s.db == nil || s.root == nil {
+		return ErrStoreClosed
+	}
 	idHex := IDToHex(taskID)
 	if lease == 0 || s.leases[idHex] != lease {
 		return nil
 	}
 	_ = s.closeStageHandleLocked(idHex)
-	delete(s.leases, idHex)
 
 	task, err := s.getTaskLocked(ctx, taskID)
 	if err != nil {
 		if errors.Is(err, ErrTaskNotFound) {
+			delete(s.leases, idHex)
 			return nil
 		}
 		return err
 	}
 	if task.Status.IsTerminal() || finalStatus == "" || !finalStatus.IsValid() {
+		delete(s.leases, idHex)
 		return nil
 	}
 
@@ -642,6 +671,7 @@ func (s *Store) ReleaseTask(ctx context.Context, taskID protocol.TransferID, lea
 	`, string(finalStatus), now, expires, idHex); err != nil {
 		return err
 	}
+	delete(s.leases, idHex)
 
 	if task.Direction == protocol.DirectionUpload && (finalStatus == TaskCancelled || finalStatus == TaskFailed) {
 		_ = s.root.Remove(stagingRelPath(taskID))

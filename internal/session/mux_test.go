@@ -7,6 +7,7 @@ import (
 	"io"
 	"math"
 	"net"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -290,5 +291,39 @@ func TestStreamInboxCoalescesDataAndBoundsControls(t *testing.T) {
 	}
 	if err := stream.enqueue(protocol.Frame{Header: protocol.Header{Type: protocol.TypeAck}, Payload: ack}); err == nil {
 		t.Error("control inbox exceeded bound")
+	}
+}
+
+func TestMuxRejectTruncatesOversizedErrorMessage(t *testing.T) {
+	c1, c2 := net.Pipe()
+	defer c1.Close()
+	defer c2.Close()
+
+	timeouts := testTimeouts()
+	cli := NewMux(&Conn{Net: c1, Chunk: 4096, Timeouts: timeouts}, 2, 16384, nil)
+	defer cli.Close(io.EOF)
+
+	var srv *Mux
+	srv = NewMux(&Conn{Net: c2, Chunk: 4096, Timeouts: timeouts}, 2, 16384, func(st *Stream, _ protocol.Frame) {
+		srv.reject(st.ID, protocol.CodeBadState, strings.Repeat("超长错误信息", 100))
+		st.Release()
+	})
+	defer srv.Close(io.EOF)
+
+	st, err := cli.Open(protocol.DirectionUpload)
+	if err != nil {
+		t.Fatalf("Open #1: %v", err)
+	}
+	defer st.Release()
+	if err := st.Send(protocol.TypePutReq, protocol.PutRequest{FileName: "a.bin"}); err != nil {
+		t.Fatalf("Send PutReq: %v", err)
+	}
+	_, err = st.Receive()
+	var remote *protocol.RemoteError
+	if !errors.As(err, &remote) || remote.Code != protocol.CodeBadState || len(remote.Message) > protocol.MaxErrorMessageBytes {
+		t.Fatalf("expected truncated RemoteError <= %d bytes, got %v", protocol.MaxErrorMessageBytes, err)
+	}
+	if cli.Context().Err() != nil {
+		t.Fatalf("oversized mux.reject broke shared mux connection: %v", cli.Error())
 	}
 }

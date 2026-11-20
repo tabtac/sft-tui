@@ -796,9 +796,13 @@ func (c *Client) executeDownload(ctx context.Context, task *queue.Task, op *queu
 		partFile = f
 		dev, ino, _, err := pal.FileIdentity(f)
 		if err != nil {
+			closePart()
+			_ = root.Remove(tempName)
 			return result, err
 		}
 		if err = f.Sync(); err != nil {
+			closePart()
+			_ = root.Remove(tempName)
 			return result, err
 		}
 		_ = pal.SyncParentDir(filepath.Join(parent, tempName))
@@ -807,6 +811,8 @@ func (c *Client) executeDownload(ctx context.Context, task *queue.Task, op *queu
 			cur.TempDevice = dev
 			cur.TempInode = ino
 		}); err != nil {
+			closePart()
+			_ = root.Remove(tempName)
 			return result, err
 		}
 		task.TempName, task.TempDevice, task.TempInode = tempName, dev, ino
@@ -1087,7 +1093,7 @@ func (c *Client) executeDownload(ctx context.Context, task *queue.Task, op *queu
 
 func (c *Client) finishUnstartedControl(ctx context.Context, task *queue.Task, mode protocol.CancelMode, update CheckpointUpdater) error {
 	if mode == protocol.CancelAbort && task.HasCheckpoint() {
-		if err := c.abortCheckpoint(ctx, task, update); err != nil {
+		if err := c.abortCheckpoint(context.WithoutCancel(ctx), task, update); err != nil {
 			return fmt.Errorf("取消尚未确认，保留检查点：%w", err)
 		}
 		return ErrCancelled
@@ -1177,6 +1183,8 @@ func (c *Client) abortCheckpoint(parent context.Context, task *queue.Task, updat
 		if err == nil {
 			dlRoot = r
 			defer dlRoot.Close()
+		} else if !os.IsNotExist(err) && task.TempName != "" {
+			return err
 		}
 	}
 
@@ -1204,11 +1212,24 @@ func (c *Client) abortCheckpoint(parent context.Context, task *queue.Task, updat
 
 	var handleRemoteCleanup = func(e error) error {
 		var remote *protocol.RemoteError
-		if errors.As(e, &remote) && (remote.Code == protocol.CodeNotFound ||
-			remote.Code == protocol.CodeTransferExpired ||
-			remote.Code == protocol.CodeHashMismatch ||
-			remote.Code == protocol.CodeTransferCancelled) {
-			return discardLocal()
+		if errors.As(e, &remote) {
+			switch remote.Code {
+			case protocol.CodeNotFound,
+				protocol.CodeTransferExpired,
+				protocol.CodeHashMismatch,
+				protocol.CodeTransferCancelled:
+				return discardLocal()
+			case protocol.CodeUnauthorized,
+				protocol.CodeQuotaExceeded,
+				protocol.CodeAlreadyExists,
+				protocol.CodeInvalidName,
+				protocol.CodeMetadataMismatch,
+				protocol.CodeBadState,
+				protocol.CodeBadFrame:
+				if task.TransferID == "" {
+					return discardLocal()
+				}
+			}
 		}
 		return e
 	}

@@ -342,7 +342,7 @@ func (s *Server) runStream(user string, st *session.Stream, initial protocol.Fra
 	if err != nil {
 		return err
 	}
-	release, err := s.acquireList(user, principal.Bandwidth)
+	release, err := s.acquireStream(user, principal.Bandwidth)
 	if err != nil {
 		return err
 	}
@@ -754,7 +754,7 @@ func (s *Server) handleDownload(user string, bw config.Bandwidth, st *session.St
 			curAck := startOffset
 			persisted := startOffset
 			for curAck < task.FileSize {
-				frame, rErr := st.Receive()
+				frame, rErr := st.ReceiveContext(dlCtx)
 				if rErr != nil {
 					stopDL()
 					ackDone <- dlAckOutcome{out: "paused", err: rErr}
@@ -871,7 +871,6 @@ func (s *Server) handleDownload(user string, bw config.Bandwidth, st *session.St
 
 		if sendErr != nil {
 			stopDL()
-			st.Report(sendErr)
 		}
 		res := <-ackDone
 		if res.cancelled {

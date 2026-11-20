@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"errors"
+	"os"
 	"testing"
 	"time"
 
@@ -161,5 +162,37 @@ func TestStageAndFlushUploadCheckpointClosesHandleBeforeCommit(t *testing.T) {
 	}
 	if len(s.stageHandles) != 0 {
 		t.Fatalf("expected stageHandles to be cleaned up, got %d", len(s.stageHandles))
+	}
+}
+
+func TestReleaseTaskPreservesLeaseOnCancelledContext(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	s := reviewOpenStore(t, root)
+	req := protocol.PutRequest{
+		RequestID:  protocol.RequestID{42},
+		FileName:   "cancel-retry.bin",
+		FileSize:   16,
+		FileSHA256: sha256.Sum256([]byte("0123456789abcdef")),
+	}
+	task, lease, err := s.BeginUploadSession(ctx, "alice", req)
+	if err != nil {
+		t.Fatalf("BeginUploadSession: %v", err)
+	}
+	canceled, stop := context.WithCancel(ctx)
+	stop()
+	if err := s.ReleaseTask(canceled, task.ID, lease, TaskCancelled); !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context.Canceled on cancelled ReleaseTask, got %v", err)
+	}
+	// Lease must remain valid so fallback cleanup with context.Background() succeeds.
+	if err := s.ReleaseTask(ctx, task.ID, lease, TaskCancelled); err != nil {
+		t.Fatalf("fallback ReleaseTask failed: %v", err)
+	}
+	got, err := s.GetTask(ctx, task.ID)
+	if err != nil || got.Status != TaskCancelled {
+		t.Fatalf("expected CANCELLED task after fallback ReleaseTask, got %+v err=%v", got, err)
+	}
+	if _, statErr := os.Stat(reviewPartPath(root, task.ID)); !os.IsNotExist(statErr) {
+		t.Fatalf("expected .part removed after fallback ReleaseTask, statErr=%v", statErr)
 	}
 }

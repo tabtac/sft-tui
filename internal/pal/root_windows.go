@@ -56,40 +56,16 @@ func applyPrivateDACL(h windows.Handle) error {
 
 // EnsurePrivateDir 在 Windows 下确保私有目录安全：
 // 1. 若已存在，强制校验不是重解析点/符号链接，并应用私有安全描述符。
-// 2. 若不存在，在创建时即应用私有安全描述符（ACL）。
+// 2. 若不存在，逐级以私有安全描述符创建缺失祖先及目标目录。
 func EnsurePrivateDir(path string) error {
+	path = filepath.Clean(path)
 	p, err := windows.UTF16PtrFromString(path)
 	if err != nil {
 		return err
 	}
 
-	h, err := windows.CreateFile(
-		p,
-		windows.GENERIC_READ|windows.WRITE_DAC,
-		windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE,
-		nil,
-		windows.OPEN_EXISTING,
-		windows.FILE_FLAG_BACKUP_SEMANTICS|windows.FILE_FLAG_OPEN_REPARSE_POINT,
-		0,
-	)
-	if err == nil {
-		defer windows.CloseHandle(h)
-		var info windows.ByHandleFileInformation
-		if err := windows.GetFileInformationByHandle(h, &info); err != nil {
-			return err
-		}
-		if info.FileAttributes&windows.FILE_ATTRIBUTE_DIRECTORY == 0 {
-			return fmt.Errorf("security violation: %q is not a directory", path)
-		}
-		if info.FileAttributes&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-			return fmt.Errorf("security violation: %q is a reparse point/symlink", path)
-		}
-		return applyPrivateDACL(h)
-	}
-
-	// 不存在，创建父目录并设置 ACL
-	parent := filepath.Dir(path)
-	if err := os.MkdirAll(parent, 0700); err != nil {
+	opened, err := openAndHardenPrivateDir(p, path)
+	if opened || err != nil {
 		return err
 	}
 
@@ -102,11 +78,77 @@ func EnsurePrivateDir(path string) error {
 		SecurityDescriptor: sd,
 	}
 
+	if parent := filepath.Dir(path); parent != path {
+		if err := createMissingPrivateParents(parent, secAttr); err != nil {
+			return err
+		}
+	}
+
 	if err := windows.CreateDirectory(p, secAttr); err != nil {
 		if os.IsExist(err) {
-			return EnsurePrivateDir(path)
+			opened, openErr := openAndHardenPrivateDir(p, path)
+			if openErr != nil {
+				return openErr
+			}
+			if opened {
+				return nil
+			}
 		}
 		return &os.PathError{Op: "CreateDirectory", Path: path, Err: err}
+	}
+	return nil
+}
+
+func openAndHardenPrivateDir(p *uint16, path string) (bool, error) {
+	h, err := windows.CreateFile(
+		p,
+		windows.GENERIC_READ|windows.WRITE_DAC,
+		windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE,
+		nil,
+		windows.OPEN_EXISTING,
+		windows.FILE_FLAG_BACKUP_SEMANTICS|windows.FILE_FLAG_OPEN_REPARSE_POINT,
+		0,
+	)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, &os.PathError{Op: "CreateFile", Path: path, Err: err}
+	}
+	defer windows.CloseHandle(h)
+
+	var info windows.ByHandleFileInformation
+	if err := windows.GetFileInformationByHandle(h, &info); err != nil {
+		return false, err
+	}
+	if info.FileAttributes&windows.FILE_ATTRIBUTE_DIRECTORY == 0 {
+		return false, fmt.Errorf("security violation: %q is not a directory", path)
+	}
+	if info.FileAttributes&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+		return false, fmt.Errorf("security violation: %q is a reparse point/symlink", path)
+	}
+	return true, applyPrivateDACL(h)
+}
+
+func createMissingPrivateParents(dir string, secAttr *windows.SecurityAttributes) error {
+	dir = filepath.Clean(dir)
+	if _, err := os.Lstat(dir); err == nil {
+		return nil
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+	parent := filepath.Dir(dir)
+	if parent != dir {
+		if err := createMissingPrivateParents(parent, secAttr); err != nil {
+			return err
+		}
+	}
+	p, err := windows.UTF16PtrFromString(dir)
+	if err != nil {
+		return err
+	}
+	if err := windows.CreateDirectory(p, secAttr); err != nil && !os.IsExist(err) {
+		return &os.PathError{Op: "CreateDirectory", Path: dir, Err: err}
 	}
 	return nil
 }

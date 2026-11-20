@@ -88,6 +88,7 @@ var (
 	ErrStoreLocked    = errors.New("storage root is locked by another instance")
 	ErrTaskBusy       = errors.New("task is already active on another stream")
 	ErrTaskCancelled  = errors.New("task is cancelled")
+	ErrStoreClosed    = errors.New("storage store is closed")
 )
 
 // IDToHex 将 16 字节 ID 转为 Hex 字符串

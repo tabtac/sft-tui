@@ -7,9 +7,11 @@ import (
 	"errors"
 	"io"
 	"math"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"golang.org/x/time/rate"
 
@@ -272,12 +274,15 @@ func decodeStreamError(f protocol.Frame) (protocol.Frame, error) {
 	return f, &e
 }
 
-func (s *Stream) ReceiveContext(ctx context.Context) (protocol.Frame, error) {
-	idleSec := s.mux.conn.Timeouts.IdleSeconds
-	if idleSec == 0 {
-		idleSec = 120
+func (m *Mux) idleSeconds() uint16 {
+	if m.conn != nil && m.conn.Timeouts.IdleSeconds > 0 {
+		return m.conn.Timeouts.IdleSeconds
 	}
-	interval := time.Duration(idleSec) * time.Second
+	return 120
+}
+
+func (s *Stream) ReceiveContext(ctx context.Context) (protocol.Frame, error) {
+	interval := time.Duration(s.mux.idleSeconds()) * time.Second
 	timer := time.NewTimer(interval)
 	defer timer.Stop()
 	for {
@@ -380,6 +385,8 @@ func (m *Mux) send(ctx context.Context, typ protocol.Type, id protocol.StreamID,
 	}
 	select {
 	case q <- job:
+	case <-m.ctx.Done():
+		return m.Error()
 	case <-ctx.Done():
 		if m.ctx.Err() != nil {
 			return m.Error()
@@ -392,6 +399,8 @@ func (m *Mux) send(ctx context.Context, typ protocol.Type, id protocol.StreamID,
 			return ctx.Err()
 		}
 		return err
+	case <-m.ctx.Done():
+		return m.Error()
 	case <-ctx.Done():
 		if m.ctx.Err() != nil {
 			return m.Error()
@@ -462,8 +471,32 @@ func (m *Mux) writer() {
 	}
 }
 
+func truncateErrorText(s string, maxBytes int) string {
+	s = strings.ToValidUTF8(s, "?")
+	if len(s) <= maxBytes {
+		return s
+	}
+	const ellipsis = "…"
+	if maxBytes <= len(ellipsis) {
+		limit := maxBytes
+		for limit > 0 && !utf8.RuneStart(s[limit]) {
+			limit--
+		}
+		return s[:limit]
+	}
+	limit := maxBytes - len(ellipsis)
+	for limit > 0 && !utf8.RuneStart(s[limit]) {
+		limit--
+	}
+	return s[:limit] + ellipsis
+}
+
 func (m *Mux) reject(id protocol.StreamID, code protocol.ErrorCode, message string) {
-	p, _ := protocol.Marshal(protocol.RemoteError{Code: code, Message: message})
+	msg := truncateErrorText(message, protocol.MaxErrorMessageBytes)
+	p, err := protocol.Marshal(protocol.RemoteError{Code: code, Message: msg})
+	if err != nil {
+		return
+	}
 	_ = m.send(m.ctx, protocol.TypeError, id, p, true)
 }
 
@@ -471,7 +504,7 @@ func (m *Mux) reader() {
 	defer m.wg.Done()
 	controls := rate.NewLimiter(32, 64)
 	for {
-		f, err := m.conn.Read(m.conn.Timeouts.IdleSeconds)
+		f, err := m.conn.Read(m.idleSeconds())
 		if err != nil {
 			var p *protocol.RemoteError
 			if errors.As(err, &p) && p.Code != protocol.CodeBadMagic {
@@ -548,9 +581,12 @@ func (m *Mux) reader() {
 				continue
 			}
 			if len(m.seen) >= 65536 {
+				alreadyDraining := m.draining
 				m.mu.Unlock()
 				m.reject(id, protocol.CodeTempUnavailable, "连接流历史已满，请重新连接")
-				_ = m.GoAway(protocol.CodeTempUnavailable, 0)
+				if !alreadyDraining {
+					_ = m.GoAway(protocol.CodeTempUnavailable, 0)
+				}
 				continue
 			}
 			if m.seen == nil {
@@ -650,10 +686,7 @@ func (m *Mux) reader() {
 
 func (m *Mux) heartbeat() {
 	defer m.wg.Done()
-	idle := m.conn.Timeouts.IdleSeconds
-	if idle == 0 {
-		idle = 120
-	}
+	idle := m.idleSeconds()
 	interval := min(30*time.Second, time.Duration(idle)*time.Second/3)
 	if interval < time.Second {
 		interval = time.Second

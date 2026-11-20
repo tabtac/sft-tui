@@ -190,4 +190,7 @@ func TestDaemonListDoesNotConsumeNewTaskQuota(t *testing.T) {
 	if _, err := cli.UploadFile(opCtx, src, "ok.bin", nil); err != nil {
 		t.Fatalf("UploadFile after repeated LIST failed: %v", err)
 	}
+	if _, err := cli.UploadFile(opCtx, src, "ok2.bin", nil); err == nil {
+		t.Fatal("expected second UploadFile to hit MaxNewTasksPerMinute=1 quota")
+	}
 }

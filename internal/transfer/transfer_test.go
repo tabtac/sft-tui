@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"os"
@@ -786,5 +787,14 @@ func TestDownloadCrashAfterLinkPublishRecoversWithoutOverwriteError(t *testing.T
 	okEvil, err := recoverCrashPublished(ctx, evilRoot, "pub.bin", evilInfo, tempName, &evilTask, func(func(*queue.Task)) error { return nil })
 	if err != nil || okEvil || evilTask.Published {
 		t.Fatalf("unrelated pre-existing target must not be accepted: ok=%v err=%v", okEvil, err)
+	}
+}
+
+func TestIsTransientRejectsDeadlineExceeded(t *testing.T) {
+	if IsTransient(context.DeadlineExceeded) {
+		t.Fatal("context.DeadlineExceeded must not trigger shared client close as transient net.Error")
+	}
+	if IsTransient(fmt.Errorf("wrapped: %w", context.DeadlineExceeded)) {
+		t.Fatal("wrapped context.DeadlineExceeded must not be treated as transient")
 	}
 }

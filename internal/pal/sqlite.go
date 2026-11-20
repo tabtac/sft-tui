@@ -23,35 +23,45 @@ func sqliteDSNWithSep(dbPath, query string, sep rune, absFn func(string) (string
 		return "", fmt.Errorf("sqlite database path contains null byte")
 	}
 
-	// Preserve Windows Win32 extended-length prefix (\\?\...) expected by SQLite winFullPathname.
-	if hasWindowsLongPathPrefix(dbPath) {
-		u := url.URL{
-			Scheme:   "file",
-			Path:     "/" + dbPath,
-			RawQuery: query,
-		}
-		return u.String(), nil
-	}
-
-	normalized := dbPath
 	if sep == '\\' {
-		normalized = strings.ReplaceAll(dbPath, `\`, "/")
+		// Preserve Windows Win32 extended-length prefix (\\?\...) expected by SQLite winFullPathname.
+		if hasWindowsLongPathPrefix(dbPath) {
+			u := url.URL{
+				Scheme:   "file",
+				Path:     "/" + dbPath,
+				RawQuery: query,
+			}
+			return u.String(), nil
+		}
+		normalized := strings.ReplaceAll(dbPath, `\`, "/")
+		switch {
+		case hasWindowsDrivePrefix(normalized):
+			if len(normalized) < 3 || normalized[2] != '/' {
+				return "", fmt.Errorf("sqlite drive path %q must be absolute", dbPath)
+			}
+			uriPath := "/" + normalized
+			u := url.URL{Scheme: "file", Path: uriPath, RawQuery: query}
+			return u.String(), nil
+		case strings.HasPrefix(normalized, "///"):
+			uriPath := "/" + strings.TrimLeft(normalized, "/")
+			u := url.URL{Scheme: "file", Path: uriPath, RawQuery: query}
+			return u.String(), nil
+		case strings.HasPrefix(normalized, "//"):
+			// Emit file:////server/share/... so SQLite sees an empty authority and UNC path //server/share/...
+			u := url.URL{Scheme: "file", Path: normalized, RawQuery: query}
+			return u.String(), nil
+		}
+		dbPath = normalized
 	}
 
 	var uriPath string
 	switch {
-	case hasWindowsDrivePrefix(normalized):
-		if len(normalized) < 3 || normalized[2] != '/' {
-			return "", fmt.Errorf("sqlite drive path %q must be absolute", dbPath)
-		}
-		uriPath = "/" + normalized
-	case strings.HasPrefix(normalized, "///"):
-		uriPath = "/" + strings.TrimLeft(normalized, "/")
-	case strings.HasPrefix(normalized, "//"):
-		// Emit file:////server/share/... so SQLite sees an empty authority and UNC path //server/share/...
-		uriPath = normalized
-	case strings.HasPrefix(normalized, "/"):
-		uriPath = normalized
+	case strings.HasPrefix(dbPath, "///"):
+		uriPath = "/" + strings.TrimLeft(dbPath, "/")
+	case strings.HasPrefix(dbPath, "//"):
+		uriPath = dbPath
+	case strings.HasPrefix(dbPath, "/"):
+		uriPath = dbPath
 	default:
 		if absFn == nil {
 			return "", fmt.Errorf("sqlite path %q must be absolute", dbPath)

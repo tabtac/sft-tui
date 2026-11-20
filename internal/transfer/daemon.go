@@ -303,6 +303,9 @@ func (d *Daemon) reload(c config.Server, allowPending bool) error {
 		return errors.New("热更新仅支持 TLS 证书、authorized_clients 与 global_bandwidth；其余配置需重启")
 	}
 	merged := config.MergeHot(d.cfg, c)
+	if err := merged.Validate(); err != nil {
+		return err
+	}
 	tlsCfg, ca, err := security.PrepareServerTLS(merged)
 	if err != nil {
 		return err

@@ -25,6 +25,7 @@ type Store struct {
 	db           *sql.DB
 	lockFile     *os.File
 	mu           sync.RWMutex
+	closed       bool
 	retention    time.Duration
 	limits       Limits
 	leases       map[string]uint64
@@ -179,10 +180,8 @@ func reconcileStaging(root *pal.Root, db *sql.DB) error {
 		info, err := root.Lstat(partRel)
 		if err != nil {
 			if os.IsNotExist(err) {
-				if item.offset > 0 {
-					if _, err := db.Exec("UPDATE tasks SET status='FAILED', updated_at=? WHERE id=?", time.Now().Unix(), item.idHex); err != nil {
-						return err
-					}
+				if _, err := db.Exec("UPDATE tasks SET status='FAILED', updated_at=? WHERE id=?", time.Now().Unix(), item.idHex); err != nil {
+					return err
 				}
 				continue
 			}
@@ -227,6 +226,9 @@ func reconcileStaging(root *pal.Root, db *sql.DB) error {
 func (s *Store) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	s.closed = true
+	clear(s.leases)
 
 	var errs []error
 	for idHex := range s.stageHandles {
@@ -741,6 +743,9 @@ func (s *Store) openPublishedLocked(ctx context.Context, userID, fileName string
 func (s *Store) OpenPublishedFile(ctx context.Context, userID, fileName string) (*os.File, PublishedFile, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	if s.closed || s.db == nil || s.root == nil {
+		return nil, PublishedFile{}, ErrStoreClosed
+	}
 	return s.openPublishedLocked(ctx, userID, fileName)
 }
 
@@ -752,6 +757,9 @@ func (s *Store) GetTask(ctx context.Context, taskID protocol.TransferID) (Task, 
 }
 
 func (s *Store) getTaskLocked(ctx context.Context, taskID protocol.TransferID) (Task, error) {
+	if s.closed || s.db == nil {
+		return Task{}, ErrStoreClosed
+	}
 	row := s.db.QueryRowContext(ctx, "SELECT "+taskColumns+" FROM tasks WHERE id=?", IDToHex(taskID))
 	t, err := scanTask(row)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -790,8 +798,11 @@ func (s *Store) createDownloadLocked(ctx context.Context, userID string, req pro
 		if existing.Status == TaskExpired {
 			return Task{}, nil, false, ErrTaskExpired
 		}
-		if existing.Status == TaskCancelled || existing.Status == TaskFailed {
-			return Task{}, nil, false, ErrTaskConflict
+		if existing.Status == TaskCancelled {
+			return Task{}, nil, false, ErrTaskCancelled
+		}
+		if existing.Status == TaskFailed {
+			return Task{}, nil, false, ErrHashMismatch
 		}
 		objRel := objectRelPath(existing.ObjectID)
 		info, err := s.root.Lstat(objRel)
@@ -868,6 +879,11 @@ func (s *Store) ReadChunkAt(ctx context.Context, taskID protocol.TransferID, off
 	}
 
 	s.mu.RLock()
+	if s.closed || s.root == nil {
+		s.mu.RUnlock()
+		return nil, ErrStoreClosed
+	}
+	root := s.root
 	task, err := s.getTaskLocked(ctx, taskID)
 	s.mu.RUnlock()
 	if err != nil {
@@ -891,14 +907,14 @@ func (s *Store) ReadChunkAt(ctx context.Context, taskID protocol.TransferID, off
 	}
 
 	objRel := objectRelPath(task.ObjectID)
-	f, err := s.root.OpenFile(objRel, os.O_RDONLY, 0)
+	f, err := root.OpenFile(objRel, os.O_RDONLY, 0)
 	if err != nil {
 		return nil, err
 	}
 	defer f.Close()
 
 	buf := make([]byte, length)
-	if _, err := f.ReadAt(buf, int64(offset)); err != nil && !errors.Is(err, io.EOF) {
+	if _, err := f.ReadAt(buf, int64(offset)); err != nil {
 		return nil, err
 	}
 

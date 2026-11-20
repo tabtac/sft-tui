@@ -166,13 +166,16 @@ func (u *Users) Wait(ctx context.Context, user string, b config.Bandwidth, direc
 }
 
 func waitChunked(ctx context.Context, lim *rate.Limiter, n int) error {
-	burst := lim.Burst()
-	if burst <= 0 || n <= burst {
-		return lim.WaitN(ctx, n)
-	}
 	for rem := n; rem > 0; {
+		burst := lim.Burst()
+		if burst <= 0 {
+			return lim.WaitN(ctx, rem)
+		}
 		step := min(rem, burst)
 		if err := lim.WaitN(ctx, step); err != nil {
+			if ctx.Err() == nil && lim.Burst() < step {
+				continue
+			}
 			return err
 		}
 		rem -= step

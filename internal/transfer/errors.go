@@ -2,6 +2,7 @@
 package transfer
 
 import (
+	"context"
 	"errors"
 	"io"
 	"net"
@@ -30,6 +31,9 @@ func IsTransient(err error) bool {
 	}
 	msg := strings.ToLower(err.Error())
 	if strings.Contains(msg, "tls:") || strings.Contains(msg, "x509:") {
+		return false
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return false
 	}
 	var remote *protocol.RemoteError

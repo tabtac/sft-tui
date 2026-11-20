@@ -114,5 +114,13 @@ func TestSQLiteDSN(t *testing.T) {
 		if !strings.HasPrefix(relDSN, "file:///") {
 			t.Fatalf("expected relative path resolved to file:/// URI, got %q", relDSN)
 		}
+
+		colonDSN, err := sqliteDSNWithSep("c:local.db", query, '/', filepath.Abs)
+		if err != nil {
+			t.Fatalf("sqliteDSNWithSep(posix colon) error: %v", err)
+		}
+		if !strings.HasPrefix(colonDSN, "file:///") || !strings.Contains(colonDSN, "c:local.db") {
+			t.Fatalf("expected POSIX colon filename resolved cleanly, got %q", colonDSN)
+		}
 	})
 }
