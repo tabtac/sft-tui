@@ -284,18 +284,21 @@ func (m *model) viewModal(base string) string {
 }
 
 func buildTaskDetailLines(dirLabel, stateText, remote, localPath string, done, size uint64, shaHex, tid, errMsg string, updated time.Time) []string {
+	kv := func(label, val string) string {
+		return padPlainRightCell(label, 12) + " " + sanitizeInline(val)
+	}
 	lines := []string{
-		fmt.Sprintf("方向与状态：%s · %s", sanitizeInline(dirLabel), sanitizeInline(stateText)),
-		fmt.Sprintf("远端文件名：%s", sanitizeInline(remote)),
-		fmt.Sprintf("本地路径：  %s", sanitizeInline(localPath)),
-		fmt.Sprintf("进度与大小：%s / %s", progress.FormatBytes(done), progress.FormatBytes(size)),
-		fmt.Sprintf("最近更新：  %s", updated.Format("2006-01-02 15:04:05")),
+		kv("方向与状态：", fmt.Sprintf("%s · %s", sanitizeInline(dirLabel), sanitizeInline(stateText))),
+		kv("远端文件名：", remote),
+		kv("本地路径：", localPath),
+		kv("进度与大小：", fmt.Sprintf("%s / %s", progress.FormatBytes(done), progress.FormatBytes(size))),
+		kv("最近更新：", updated.Format("2006-01-02 15:04:05")),
 	}
 	if tid != "" {
-		lines = append(lines, "TransferID："+sanitizeInline(tid))
+		lines = append(lines, kv("TransferID：", tid))
 	}
 	if shaHex != "" {
-		lines = append(lines, "SHA-256：   "+sanitizeInline(shaHex))
+		lines = append(lines, kv("SHA-256：", shaHex))
 	}
 	if errMsg != "" {
 		lines = append(lines, "", "错误/提示说明：", "  "+sanitizeInline(errMsg))

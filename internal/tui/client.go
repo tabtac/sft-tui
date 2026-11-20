@@ -1984,7 +1984,7 @@ func (m *model) openTaskDetail(t queue.Task) {
 	m.detailTitle = "任务详情"
 	m.detailLines = buildTaskDetailLines(
 		directionIcon(t.Direction),
-		string(t.State),
+		taskStateText(t),
 		t.Remote,
 		t.Path,
 		t.Done,

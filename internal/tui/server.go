@@ -22,6 +22,7 @@ import (
 	"sft-tui/internal/config"
 	"sft-tui/internal/control"
 	"sft-tui/internal/monitor"
+	"sft-tui/internal/progress"
 	"sft-tui/internal/security"
 	"sft-tui/internal/service"
 )
@@ -56,6 +57,7 @@ type certRow struct {
 	Path        string
 	State       string
 	Expiry      string
+	NotAfter    time.Time
 	Fingerprint string
 }
 
@@ -292,6 +294,7 @@ func (m *serverModel) loadConfigSeqCmd(seq uint64) tea.Cmd {
 				if ins.Error != nil {
 					row.Expiry = ins.Error.Error()
 				} else {
+					row.NotAfter = ins.Certificate.NotAfter
 					row.Expiry = ins.Certificate.NotAfter.Local().Format("2006-01-02 15:04")
 				}
 				certs = append(certs, row)
@@ -895,10 +898,11 @@ func (m *serverModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.detailTitle = "服务端传输任务详情"
 				m.detailLines = []string{
 					fmt.Sprintf("任务 / 连接：%d  (连接 #%d · 流 #%d)", t.ID, t.Connection, t.Stream),
-					fmt.Sprintf("用户与方向：%s · %s", sanitizeInline(t.User), sanitizeInline(t.Direction)),
+					fmt.Sprintf("用户与方向：%s · %s", sanitizeInline(t.User), serverDirectionText(t.Direction)),
 					fmt.Sprintf("文件名：    %s", sanitizeInline(t.File)),
-					fmt.Sprintf("进度与速率：%d / %d B · %.1f B/s", t.Offset, t.Size, t.Rate),
-					fmt.Sprintf("当前状态：  %s", sanitizeInline(t.State)),
+					fmt.Sprintf("进度与速率：%s / %s (%d / %d B) · %s",
+						progress.FormatBytes(t.Offset), progress.FormatBytes(t.Size), t.Offset, t.Size, progress.FormatRate(t.Rate)),
+					fmt.Sprintf("当前状态：  %s", serverTaskStateText(t.State)),
 				}
 				if t.Error != "" {
 					m.detailLines = append(m.detailLines, "", "错误信息：", "  "+sanitizeInline(t.Error))
@@ -1091,7 +1095,8 @@ func (m *serverModel) filteredTasks() []monitor.Task {
 	}
 	var out []monitor.Task
 	for _, t := range all {
-		if strings.Contains(strings.ToLower(t.User+" "+t.File+" "+t.State), q) {
+		haystack := strings.ToLower(t.User + " " + t.File + " " + t.State + " " + serverTaskStateText(t.State) + " " + t.Direction + " " + serverDirectionText(t.Direction))
+		if strings.Contains(haystack, q) {
 			out = append(out, t)
 		}
 	}
@@ -1320,7 +1325,10 @@ func (m *serverModel) showUserDetailModal(u config.AuthorizedClient) {
 	}
 	bwText := "继承默认策略"
 	if u.Bandwidth != nil {
-		bwText = fmt.Sprintf("↑ %d B/s · ↓ %d B/s · Burst %d B", u.Bandwidth.UploadBytesPerSecond, u.Bandwidth.DownloadBytesPerSecond, u.Bandwidth.BurstBytes)
+		bwText = fmt.Sprintf("↑ %s · ↓ %s · 突发 %s",
+			progress.FormatRate(float64(u.Bandwidth.UploadBytesPerSecond)),
+			progress.FormatRate(float64(u.Bandwidth.DownloadBytesPerSecond)),
+			progress.FormatBytes(u.Bandwidth.BurstBytes))
 	}
 	ins := security.InspectCertificate(u.Certificate, time.Now())
 	m.detailTitle = "用户详情 · " + sanitizeInline(u.UserID)

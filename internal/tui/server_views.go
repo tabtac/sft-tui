@@ -553,7 +553,7 @@ func (m *serverModel) renderOverviewPage(bodyH int) string {
 				mark, p.ID, padPlainRightCell(p.User, min(16, max(8, innerW/5))), padPlainRightCell(p.Remote, min(24, max(12, innerW/3))),
 				time.Since(p.Since).Round(time.Second))
 			if i == m.cursors[0] {
-				peerLines = append(peerLines, m.th.rowCursor.Render(padRightCell(line, innerW)))
+				peerLines = append(peerLines, highlightRow(m.th, line, innerW))
 			} else {
 				peerLines = append(peerLines, truncCell(line, innerW))
 			}
@@ -797,9 +797,9 @@ func (m *serverModel) renderUsersPage(bodyH int) string {
 				bwW = max(10, innerW-userW-permW-26)
 			}
 			row := fmt.Sprintf("%s%s  %s  %s  %s  证书:%s",
-				mark, padPlainRightCell(u.UserID, userW), st, padPlainRightCell(perms, permW), padPlainRightCell(bwStr, bwW), sanitizeInline(certSt))
+				mark, padPlainRightCell(u.UserID, userW), padRightCell(st, 6), padPlainRightCell(perms, permW), padPlainRightCell(bwStr, bwW), sanitizeInline(certSt))
 			if i == m.cursors[1] {
-				lines = append(lines, m.th.rowCursor.Render(padRightCell(row, innerW)))
+				lines = append(lines, highlightRow(m.th, row, innerW))
 			} else {
 				lines = append(lines, truncCell(row, innerW))
 			}
@@ -822,19 +822,31 @@ func (m *serverModel) renderTransfersPage(bodyH int) string {
 	} else {
 		start := scrollOffset(m.cursors[2], len(tasks), visRows)
 		userW := min(12, max(8, innerW/7))
-		fileW := min(24, max(10, innerW-userW-46))
+		const (
+			dirW   = 6
+			stateW = 8
+			sizeW  = 19
+			rateW  = 11
+		)
+		// 固定开销: mark(2) + userW + 2 + dirW + 2 + fileW + 2 + stateW + 2 + sizeW + 2 + rateW
+		fileW := max(10, innerW-userW-dirW-stateW-sizeW-rateW-12)
 		for i := start; i < min(len(tasks), start+visRows); i++ {
 			t := tasks[i]
 			mark := "  "
 			if i == m.cursors[2] {
 				mark = "▶ "
 			}
-			row := fmt.Sprintf("%s%s  %s  %s  %s  %s/%s  %s",
-				mark, padPlainRightCell(t.User, userW), padPlainRightCell(t.Direction, 8), padPlainRightCell(t.File, fileW),
-				padPlainRightCell(t.State, 10), progress.FormatBytes(t.Offset), progress.FormatBytes(t.Size),
-				progress.FormatRate(t.Rate))
+			sizeStr := fmt.Sprintf("%s/%s", progress.FormatBytes(t.Offset), progress.FormatBytes(t.Size))
+			row := fmt.Sprintf("%s%s  %s  %s  %s  %s  %s",
+				mark,
+				padPlainRightCell(t.User, userW),
+				padPlainRightCell(serverDirectionText(t.Direction), dirW),
+				padPlainRightCell(t.File, fileW),
+				padRightCell(serverTaskStateBadge(m.th, t.State), stateW),
+				padLeftCell(sizeStr, sizeW),
+				padLeftCell(progress.FormatRate(t.Rate), rateW))
 			if i == m.cursors[2] {
-				lines = append(lines, m.th.rowCursor.Render(padRightCell(row, innerW)))
+				lines = append(lines, highlightRow(m.th, row, innerW))
 			} else {
 				lines = append(lines, truncCell(row, innerW))
 			}
@@ -855,31 +867,31 @@ func (m *serverModel) renderCertsPage(bodyH int) string {
 		start := scrollOffset(m.cursors[3], len(m.certs), visRows)
 		nameW := 12
 		roleW := 12
+		const stateW = 10
+		expW := 20
 		if innerW < 76 {
 			nameW = 10
 			roleW = 10
+			expW = 16
 		}
-		fpBudget := innerW - (2 + nameW + 2 + roleW + 2 + 8 + 2 + 21 + 5)
+		fpBudget := innerW - (2 + nameW + 2 + roleW + 2 + stateW + 2 + 5 + expW + 5)
 		for i := start; i < min(len(m.certs), start+visRows); i++ {
 			c := m.certs[i]
 			mark := "  "
 			if i == m.cursors[3] {
 				mark = "▶ "
 			}
-			stateText := sanitizeInline(c.State)
-			st := m.th.badgeOk.Render("✔ " + stateText)
-			if c.State != "有效" {
-				st = m.th.badgeWarn.Render("⚠ " + stateText)
-			}
+			st := padRightCell(certStateBadge(m.th, c.State), stateW)
+			expStr := formatCertExpiry(c.Expiry, c.NotAfter)
 			fpPart := ""
 			if fpBudget >= 8 {
 				fp := truncPlainCell(c.Fingerprint, fpBudget)
 				fpPart = "  FP:" + fp
 			}
 			row := fmt.Sprintf("%s%s  %s  %s  到期:%s%s",
-				mark, padPlainRightCell(c.Name, nameW), padPlainRightCell(c.Role, roleW), st, padPlainRightCell(c.Expiry, 16), fpPart)
+				mark, padPlainRightCell(c.Name, nameW), padPlainRightCell(c.Role, roleW), st, padPlainRightCell(expStr, expW), fpPart)
 			if i == m.cursors[3] {
-				lines = append(lines, m.th.rowCursor.Render(padRightCell(row, innerW)))
+				lines = append(lines, highlightRow(m.th, row, innerW))
 			} else {
 				lines = append(lines, truncCell(row, innerW))
 			}
@@ -1022,7 +1034,7 @@ func (m *serverModel) renderSettingsPage(bodyH int) string {
 		for i := start; i < end; i++ {
 			ln := all[i]
 			if i == m.cursors[4] {
-				lines = append(lines, m.th.rowCursor.Render(padRightCell("▸ "+ln, innerW)))
+				lines = append(lines, highlightRow(m.th, "▸ "+ln, innerW))
 			} else {
 				lines = append(lines, truncCell("  "+ln, innerW))
 			}
@@ -1093,17 +1105,19 @@ func (m *serverModel) renderLogsPage(bodyH int) string {
 			if i == m.cursors[5] {
 				mark = "▶ "
 			}
-			levelText := sanitizeInline(e.Level)
-			levelView := "[" + levelText + "]"
-			switch strings.ToUpper(strings.TrimSpace(levelText)) {
+			levelText := strings.ToUpper(strings.TrimSpace(sanitizeInline(e.Level)))
+			levelView := "[" + padPlainRightCell(levelText, 5) + "]"
+			switch levelText {
 			case "ERROR":
 				levelView = m.th.badgeErr.Render(levelView)
 			case "WARN":
 				levelView = m.th.badgeWarn.Render(levelView)
+			default:
+				levelView = m.th.badgeMuted.Render(levelView)
 			}
-			row := fmt.Sprintf("%s#%d %s %s %s %s", mark, e.Sequence, e.Time.Local().Format("15:04:05"), levelView, sanitizeInline(e.Message), sanitizeInline(e.Detail))
+			row := fmt.Sprintf("%s#%-4d %s %s %s %s", mark, e.Sequence, e.Time.Local().Format("15:04:05"), levelView, sanitizeInline(e.Message), sanitizeInline(e.Detail))
 			if i == m.cursors[5] {
-				lines = append(lines, m.th.rowCursor.Render(truncCell(row, innerW)))
+				lines = append(lines, highlightRow(m.th, row, innerW))
 			} else {
 				lines = append(lines, truncCell(row, innerW))
 			}

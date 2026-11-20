@@ -270,3 +270,34 @@ func TestRegressionANSITrueColorFullViewsAndUntrustedPayloads(t *testing.T) {
 		}
 	}
 }
+
+func TestRegressionHighlightRowPreservesBackgroundAcrossEmbeddedReset(t *testing.T) {
+	previous := lipgloss.DefaultRenderer()
+	renderer := lipgloss.NewRenderer(io.Discard)
+	renderer.SetColorProfile(termenv.TrueColor)
+	renderer.SetHasDarkBackground(true)
+	lipgloss.SetDefaultRenderer(renderer)
+	t.Cleanup(func() { lipgloss.SetDefaultRenderer(previous) })
+
+	th := makeTheme()
+	probe := th.rowCursor.Render("\x00")
+	open, _, ok := strings.Cut(probe, "\x00")
+	if !ok || open == "" {
+		t.Fatalf("expected non-empty cursor SGR prefix in TrueColor mode, got %q", probe)
+	}
+
+	styled := "▶ alice  " + th.badgeOk.Render("✔ 启用") + "  upload,download"
+	got := highlightRow(th, styled, 40)
+	if !strings.HasPrefix(got, open) {
+		t.Fatalf("highlighted row missing leading cursor SGR: %q", got)
+	}
+	if !strings.Contains(got, "\x1b[0m"+open) {
+		t.Fatalf("embedded SGR reset was not followed by restored cursor highlight: %q", got)
+	}
+	if lipgloss.Width(got) != 40 {
+		t.Fatalf("expected padded highlight width 40, got %d", lipgloss.Width(got))
+	}
+	if frag := regressionVisibleSGR.FindString(ansi.Strip(got)); frag != "" {
+		t.Fatalf("corrupted SGR fragment leaked: %q", frag)
+	}
+}

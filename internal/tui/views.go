@@ -8,6 +8,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 
 	"sft-tui/internal/progress"
+	"sft-tui/internal/queue"
 )
 
 func (m *model) View() string {
@@ -52,7 +53,7 @@ func (m *model) renderHeader() string {
 	case strings.Contains(m.connStatus, "已连接"):
 		connStyle = m.th.badgeOk
 		connIcon = "● "
-	case strings.Contains(m.connStatus, "重连") || strings.Contains(m.connStatus, "正在连接"):
+	case strings.Contains(m.connStatus, "重连") || strings.Contains(m.connStatus, "正在"):
 		connStyle = m.th.badgeWarn
 		connIcon = spinnerChar(m.spinIdx) + " "
 	case strings.Contains(m.connStatus, "失败") || strings.Contains(m.connStatus, "断开"):
@@ -68,7 +69,7 @@ func (m *model) renderHeader() string {
 		case t.State.Active():
 			runCount++
 			totalRate += t.Speed
-		case t.State == "paused" || t.State == "pending":
+		case t.State == queue.Paused || t.State == queue.Pending:
 			pauseCount++
 		}
 	}
@@ -233,7 +234,7 @@ func (m *model) renderFooter() string {
 			spaceLabel = "暂停"
 			f5Reason = "进行中"
 			renameReason = "需先暂停"
-		case t.State == "paused" || t.State == "pending":
+		case t.State == queue.Paused || t.State == queue.Pending:
 			spaceLabel = "恢复"
 		default:
 			spaceReason = "控制中"
@@ -372,7 +373,9 @@ func (m *model) renderLocalPanel(outerW, outerH int) string {
 			}
 			row := truncPlainCell(fmt.Sprintf("%s %s%s %s", mark, icon, padPlainRightCell(e.name, nameW), sz), innerW)
 			if i == m.localCursor && m.focus == areaLocal {
-				lines = append(lines, m.th.rowCursor.Render(padRightCell(row, innerW)))
+				lines = append(lines, highlightRow(m.th, row, innerW))
+			} else if e.dir {
+				lines = append(lines, m.th.hintKey.Render(row))
 			} else if e.regular && m.localSelected[e.path] {
 				lines = append(lines, m.th.rowSelected.Render(row))
 			} else {
@@ -414,7 +417,7 @@ func (m *model) renderRemotePanel(outerW, outerH int) string {
 			}
 			row := truncPlainCell(fmt.Sprintf("%s %s %s", mark, padPlainRightCell(f.FileName, nameW), padLeftCell(progress.FormatBytes(f.Size), sizeW)), innerW)
 			if i == m.remoteCursor && m.focus == areaRemote {
-				lines = append(lines, m.th.rowCursor.Render(padRightCell(row, innerW)))
+				lines = append(lines, highlightRow(m.th, row, innerW))
 			} else if m.remoteSelected[f.FileName] {
 				lines = append(lines, m.th.rowSelected.Render(row))
 			} else {
@@ -457,7 +460,24 @@ func (m *model) renderQueuePanel(outerW, outerH int) string {
 		if innerW < 82 {
 			barW = 10
 		}
-		nameW := max(10, (innerW-barW-44)/2)
+		const dirW = 6   // "↑ 上传" / "↓ 下载"
+		const badgeW = 10 // 统一对齐状态列宽，避免进度条左右抖动
+		// 固定列开销: pointer(2) + dir(6) + sep(2) + sep(2) + badge(10) + sep(2) + bar(barW+5) + sep(2) = barW + 31
+		fixedW := barW + 31
+		remain := max(16, innerW-fixedW)
+		// 动态检测可见行中是否存在传输速率/错误，决定右侧 metrics 预算与文件名预算
+		needWideMetrics := false
+		for i := start; i < min(len(tasks), start+visRows); i++ {
+			if tasks[i].State == queue.Transferring || tasks[i].Error != "" {
+				needWideMetrics = true
+				break
+			}
+		}
+		metricsW := min(22, remain/2)
+		if needWideMetrics {
+			metricsW = min(max(24, remain/2), remain-10)
+		}
+		nameW := max(10, remain-metricsW)
 		for i := start; i < min(len(tasks), start+visRows); i++ {
 			t := tasks[i]
 			pointer := "  "
@@ -465,18 +485,18 @@ func (m *model) renderQueuePanel(outerW, outerH int) string {
 				pointer = "▶ "
 			}
 			bar := renderProgressBar(m.th, t.Done, t.Size, t.State, barW)
-			badge := stateBadge(m.th, t)
+			badge := padRightCell(stateBadge(m.th, t), badgeW)
 			metrics := formatTaskMetrics(t)
 			rowText := truncCell(fmt.Sprintf("%s%s  %s  %s  %s  %s",
 				pointer,
-				directionIcon(t.Direction),
+				padPlainRightCell(directionIcon(t.Direction), dirW),
 				padPlainRightCell(t.Remote, nameW),
 				badge,
 				bar,
-				truncPlainCell(metrics, max(10, innerW-nameW-barW-26)),
+				truncPlainCell(metrics, max(8, metricsW)),
 			), innerW)
 			if i == m.queueCursor && m.focus == areaQueue {
-				lines = append(lines, m.th.rowCursor.Render(padRightCell(rowText, innerW)))
+				lines = append(lines, highlightRow(m.th, rowText, innerW))
 			} else {
 				lines = append(lines, rowText)
 			}

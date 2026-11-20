@@ -69,6 +69,22 @@ func padLeftCell(s string, width int) string {
 	return s
 }
 
+// highlightRow 用光标高亮样式渲染可能包含内嵌 ANSI 颜色序列的行，确保内嵌重置不会打断整行背景色。
+func highlightRow(th theme, styled string, width int) string {
+	padded := padRightCell(styled, width)
+	probe := th.rowCursor.Render("\x00")
+	open, closeSeq, ok := strings.Cut(probe, "\x00")
+	if !ok || open == "" {
+		return padded
+	}
+	replacer := strings.NewReplacer(
+		"\x1b[0m", "\x1b[0m"+open,
+		"\x1b[m", "\x1b[m"+open,
+	)
+	body := strings.TrimSuffix(replacer.Replace(padded), open)
+	return open + body + closeSeq
+}
+
 func formatETA(d time.Duration) string {
 	if d <= 0 {
 		return "估算中"
@@ -83,6 +99,42 @@ func formatETA(d time.Duration) string {
 	return fmt.Sprintf("%dh%02dm", sec/3600, (sec%3600)/60)
 }
 
+func taskStateText(task queue.Task) string {
+	if task.WantCancel && task.State == queue.Pending {
+		return "取消待重试"
+	}
+	switch task.State {
+	case queue.Transferring:
+		return "传输中"
+	case queue.Waiting:
+		return "等待中"
+	case queue.Preparing:
+		return "准备中"
+	case queue.Hashing:
+		return "摘要中"
+	case queue.Verifying:
+		return "校验中"
+	case queue.Pausing:
+		return "暂停中"
+	case queue.Paused:
+		return "已暂停"
+	case queue.Reconnecting:
+		return "重连中"
+	case queue.Pending:
+		return "待处理"
+	case queue.Cancelling:
+		return "取消中"
+	case queue.Completed:
+		return "已完成"
+	case queue.Cancelled:
+		return "已取消"
+	case queue.Skipped:
+		return "已跳过"
+	default:
+		return sanitizeInline(string(task.State))
+	}
+}
+
 func stateBadge(t theme, task queue.Task) string {
 	if task.WantCancel && task.State == queue.Pending {
 		return t.badgeWarn.Render("! 取消待重试")
@@ -91,7 +143,7 @@ func stateBadge(t theme, task queue.Task) string {
 	case queue.Transferring:
 		return t.badgeOk.Render("▶ 传输中")
 	case queue.Waiting:
-		return t.badgeMuted.Render("⏳ 等待中")
+		return t.badgeMuted.Render("◷ 等待中")
 	case queue.Preparing:
 		return t.badgeMuted.Render("◈ 准备中")
 	case queue.Hashing:
@@ -101,7 +153,7 @@ func stateBadge(t theme, task queue.Task) string {
 	case queue.Pausing:
 		return t.badgeWarn.Render("⏸ 暂停中")
 	case queue.Paused:
-		return t.badgeWarn.Render("▮▮ 已暂停")
+		return t.badgeWarn.Render("‖ 已暂停")
 	case queue.Reconnecting:
 		return t.badgeWarn.Render("↻ 重连中")
 	case queue.Pending:
@@ -115,8 +167,95 @@ func stateBadge(t theme, task queue.Task) string {
 	case queue.Skipped:
 		return t.badgeMuted.Render("↷ 已跳过")
 	default:
-		return t.badgeMuted.Render(string(task.State))
+		return t.badgeMuted.Render(sanitizeInline(string(task.State)))
 	}
+}
+
+func serverDirectionText(dir string) string {
+	switch strings.ToLower(strings.TrimSpace(dir)) {
+	case "upload":
+		return "↑ 上传"
+	case "download":
+		return "↓ 下载"
+	default:
+		return sanitizeInline(dir)
+	}
+}
+
+func serverTaskStateText(state string) string {
+	switch strings.ToLower(strings.TrimSpace(state)) {
+	case "transferring", "running", "active":
+		return "传输中"
+	case "waiting", "queued":
+		return "等待中"
+	case "preparing":
+		return "准备中"
+	case "verifying":
+		return "校验中"
+	case "paused":
+		return "已暂停"
+	case "completed", "done":
+		return "已完成"
+	case "cancelled", "canceled", "aborted":
+		return "已取消"
+	case "failed", "error":
+		return "失败"
+	default:
+		return sanitizeInline(state)
+	}
+}
+
+func serverTaskStateBadge(t theme, state string) string {
+	switch strings.ToLower(strings.TrimSpace(state)) {
+	case "transferring", "running", "active":
+		return t.badgeOk.Render("▶ 传输中")
+	case "waiting", "queued":
+		return t.badgeMuted.Render("◷ 等待中")
+	case "preparing":
+		return t.badgeMuted.Render("◈ 准备中")
+	case "verifying":
+		return t.badgeOk.Render("✓ 校验中")
+	case "paused":
+		return t.badgeWarn.Render("‖ 已暂停")
+	case "completed", "done":
+		return t.badgeOk.Render("✔ 已完成")
+	case "cancelled", "canceled", "aborted":
+		return t.badgeMuted.Render("⊘ 已取消")
+	case "failed", "error":
+		return t.badgeErr.Render("✕ 失败")
+	default:
+		return t.badgeMuted.Render(sanitizeInline(state))
+	}
+}
+
+func certStateBadge(t theme, state string) string {
+	text := sanitizeInline(state)
+	switch {
+	case state == "有效":
+		return t.badgeOk.Render("✔ " + text)
+	case strings.Contains(state, "即将"):
+		return t.badgeWarn.Render("⚠ " + text)
+	case strings.Contains(state, "过期") || strings.Contains(state, "缺失") || strings.Contains(state, "无效") || strings.Contains(state, "损坏") || strings.Contains(state, "错误") || strings.Contains(state, "失败"):
+		return t.badgeErr.Render("✕ " + text)
+	default:
+		return t.badgeWarn.Render("⚠ " + text)
+	}
+}
+
+func formatCertExpiry(expiry string, notAfter time.Time) string {
+	if notAfter.IsZero() {
+		return sanitizeInline(expiry)
+	}
+	dateStr := notAfter.Local().Format("2006-01-02")
+	rem := time.Until(notAfter)
+	if rem <= 0 {
+		return dateStr + " (已过期)"
+	}
+	days := int(rem.Hours() / 24)
+	if days < 1 {
+		return dateStr + " (<1天)"
+	}
+	return fmt.Sprintf("%s (剩%d天)", dateStr, days)
 }
 
 func directionIcon(d protocol.Direction) string {
