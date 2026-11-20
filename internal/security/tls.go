@@ -71,6 +71,9 @@ func PrepareServerTLS(c config.Server) (*tls.Config, *x509.CertPool, error) {
 	if err != nil {
 		return nil, nil, err
 	}
+	if leaf.IsCA {
+		return nil, nil, fmt.Errorf("服务端证书不能为 CA 证书")
+	}
 	if _, err = leaf.Verify(x509.VerifyOptions{
 		Roots:         ca,
 		Intermediates: intermediates,

@@ -407,3 +407,40 @@ func TestReturnedPrincipalCannotMutateAuthorization(t *testing.T) {
 		t.Errorf("BUG: returned principal mutation removed original permission: %v", err)
 	}
 }
+
+func TestValidationRejectsSingleWildcardAndInvalidConnectAddresses(t *testing.T) {
+	if _, _, err := ParseServerNames("*"); err == nil {
+		t.Fatal("expected bare '*' SAN to be rejected")
+	}
+	for _, addr := range []string{
+		"a.example,b.example:7443",
+		"*.example.com:7443",
+		"*:7443",
+		"[0:0:0:0:0:0:0:0]:7443",
+		"0.0.0.0:7443",
+		"[::]:7443",
+	} {
+		if _, _, err := ValidateConnectAddress(addr); err == nil {
+			t.Errorf("ValidateConnectAddress(%q) unexpectedly succeeded", addr)
+		}
+	}
+
+	dir := t.TempDir()
+	caMat, err := NewCA(30, "", "", "test-ca")
+	if err != nil {
+		t.Fatal(err)
+	}
+	caCert := filepath.Join(dir, "ca.pem")
+	caKey := filepath.Join(dir, "ca-key.pem")
+	if err := os.WriteFile(caCert, caMat.Certificate, 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(caKey, caMat.PrivateKey, 0600); err != nil {
+		t.Fatal(err)
+	}
+	c := config.DefaultServer()
+	c.TLS = config.TLSFiles{CACertificate: caCert, Certificate: caCert, PrivateKey: caKey}
+	if _, _, err := PrepareServerTLS(c); err == nil {
+		t.Fatal("PrepareServerTLS accepted CA certificate as server certificate")
+	}
+}

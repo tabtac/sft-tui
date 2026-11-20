@@ -228,11 +228,16 @@ func SaveSettings(path, dir string, expected, proposed config.Server) (config.Se
 }
 
 func Execute(action string, o Options) (Result, error) {
-	if o.Dir == "" {
-		o.Dir = "certs"
-	}
 	if o.ServerConfig == "" {
 		o.ServerConfig = filepath.Join("configs", "server.local.json")
+	}
+	if o.Dir == "" {
+		if draft, err := loadServerDraftOrDefault(o.ServerConfig); err == nil && draft.TLS.CACertificate != "" {
+			o.Dir = filepath.Dir(draft.TLS.CACertificate)
+		}
+		if o.Dir == "" {
+			o.Dir = "certs"
+		}
 	}
 	if o.ClientConfigDir == "" {
 		o.ClientConfigDir = filepath.Dir(o.ServerConfig)
@@ -328,6 +333,12 @@ func Execute(action string, o Options) (Result, error) {
 		if syncUsers {
 			for _, u := range c.AuthorizedClients {
 				if (action == "user" || action == "sync") && o.Name != "" && u.UserID != o.Name {
+					continue
+				}
+				if action == "sync" && u.ExternalKey {
+					if o.Name != "" {
+						result.Messages = append(result.Messages, "跳过外部密钥（CSR）用户（无服务端私钥）："+u.UserID)
+					}
 					continue
 				}
 				client, err := buildClientConfig(o, c, u, serverLeaf, changes)

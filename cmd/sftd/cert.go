@@ -37,9 +37,9 @@ func runCertWithInput(args []string, in io.Reader, out, errOut io.Writer) int {
 	flags := flag.NewFlagSet("sftd cert "+action, flag.ContinueOnError)
 	flags.SetOutput(errOut)
 	var o certmanage.Options
-	flags.StringVar(&o.Dir, "dir", "certs", "CA 与证书存储目录")
+	flags.StringVar(&o.Dir, "dir", "", "CA 与证书存储目录（默认从服务端配置推断或 ./certs）")
 	flags.StringVar(&o.ServerConfig, "server-config", "configs/server.local.json", "服务端 JSON 配置路径")
-	flags.StringVar(&o.ClientConfigDir, "client-config-dir", "configs", "客户端配置文件输出目录")
+	flags.StringVar(&o.ClientConfigDir, "client-config-dir", "", "客户端配置文件输出目录（默认与服务端配置同目录）")
 	flags.StringVar(&o.Name, "name", "", "用户名")
 	flags.StringVar(&o.Hosts, "hosts", "", "服务端 SAN，逗号分隔的 DNS 或 IP")
 	flags.StringVar(&o.Address, "server-address", "", "写入客户端配置的连接地址（主机:端口）")

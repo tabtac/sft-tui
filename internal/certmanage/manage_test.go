@@ -287,3 +287,35 @@ func TestRenewUserExpectedUserPreservesDisabledState(t *testing.T) {
 		t.Fatal("expected stale ExpectedUser to be rejected during renewal")
 	}
 }
+
+func TestSyncSkipsExternalKeyAndInfersDirFromServerConfig(t *testing.T) {
+	o := testOptions(t)
+	if _, err := Execute("init", o); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	csrDER, err := x509.CreateCertificateRequest(rand.Reader, &x509.CertificateRequest{Subject: pkix.Name{CommonName: "bob"}}, priv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	csrPath := filepath.Join(t.TempDir(), "bob.csr")
+	if err := os.WriteFile(csrPath, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE REQUEST", Bytes: csrDER}), 0600); err != nil {
+		t.Fatal(err)
+	}
+	ext := o
+	ext.Name = "bob"
+	ext.CSR = csrPath
+	if _, err := Execute("user", ext); err != nil {
+		t.Fatalf("csr user: %v", err)
+	}
+	syncOpts := Options{ServerConfig: o.ServerConfig} // omit Dir & ClientConfigDir; infer from ServerConfig
+	if _, err := Execute("sync", syncOpts); err != nil {
+		t.Fatalf("sync with ExternalKey user failed: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(o.ClientConfigDir, "client.alice.local.json")); err != nil {
+		t.Fatalf("expected alice client config synced: %v", err)
+	}
+}

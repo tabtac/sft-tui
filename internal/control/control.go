@@ -43,8 +43,11 @@ type location struct {
 }
 
 type Service struct {
-	listener net.Listener
-	wg       sync.WaitGroup
+	listener  net.Listener
+	wg        sync.WaitGroup
+	hintPath  string
+	absConfig string
+	absRoot   string
 }
 
 type Handlers struct {
@@ -76,23 +79,26 @@ func locationPath(configPath string) (hintPath, absConfig string, err error) {
 	return hintPath, absConfig, nil
 }
 
-func remember(absConfig, storageRoot string) error {
+func remember(absConfig, storageRoot string) (string, string, error) {
 	hintPath, _, err := locationPath(absConfig)
 	if err != nil {
-		return err
+		return "", "", err
 	}
 	absRoot, err := filepath.Abs(storageRoot)
 	if err != nil {
-		return err
+		return "", "", err
 	}
 	if err := pal.EnsurePrivateDir(filepath.Dir(hintPath)); err != nil {
-		return err
+		return "", "", err
 	}
 	data, err := json.MarshalIndent(location{Config: absConfig, Storage: absRoot}, "", "  ")
 	if err != nil {
-		return err
+		return "", "", err
 	}
-	return pal.StageAndReplace(hintPath, append(data, '\n'))
+	if err := pal.StageAndReplace(hintPath, append(data, '\n')); err != nil {
+		return "", "", err
+	}
+	return hintPath, absRoot, nil
 }
 
 // Start 仅注册重载回调，便于测试或轻量使用。
@@ -113,11 +119,17 @@ func StartManaged(configPath, storageRoot string, handlers Handlers) (*Service, 
 	if err != nil {
 		return nil, err
 	}
-	if err := remember(absConfig, storageRoot); err != nil {
+	hintPath, absRoot, err := remember(absConfig, storageRoot)
+	if err != nil {
 		_ = listener.Close()
 		return nil, err
 	}
-	s := &Service{listener: listener}
+	s := &Service{
+		listener:  listener,
+		hintPath:  hintPath,
+		absConfig: absConfig,
+		absRoot:   absRoot,
+	}
 	s.wg.Add(1)
 	go func() {
 		defer s.wg.Done()
@@ -228,6 +240,14 @@ func StartManaged(configPath, storageRoot string, handlers Handlers) (*Service, 
 func (s *Service) Close() error {
 	err := s.listener.Close()
 	s.wg.Wait()
+	if s.hintPath != "" {
+		if data, readErr := pal.ReadSmall(s.hintPath, 4096); readErr == nil {
+			var cur location
+			if json.Unmarshal(data, &cur) == nil && sameConfigPath(cur.Config, s.absConfig) && cur.Storage == s.absRoot {
+				_ = os.Remove(s.hintPath)
+			}
+		}
+	}
 	return err
 }
 
@@ -238,22 +258,18 @@ func Locate(configPath, fallback string) (string, error) {
 		return "", err
 	}
 	data, err := pal.ReadSmall(hintPath, 4096)
-	if os.IsNotExist(err) {
+	if err != nil {
 		return fallback, nil
 	}
-	if err != nil {
-		return "", err
-	}
 	var hint location
-	if err = json.Unmarshal(data, &hint); err != nil {
-		return "", err
-	}
-	if !sameConfigPath(hint.Config, absConfig) || !filepath.IsAbs(hint.Storage) {
-		return "", fmt.Errorf("运行端点记录与配置不匹配")
+	if err = json.Unmarshal(data, &hint); err != nil || !sameConfigPath(hint.Config, absConfig) || !filepath.IsAbs(hint.Storage) {
+		_ = os.Remove(hintPath)
+		return fallback, nil
 	}
 	_, running, err := call(configPath, hint.Storage, request{Action: "probe"}, 500*time.Millisecond)
 	if err != nil {
-		return "", err
+		// 若提示指向的存储目录当前由另一配置占用，仍清理过期提示并继续以 fallback 探测或启动校验
+		return fallback, nil
 	}
 	if running {
 		return hint.Storage, nil

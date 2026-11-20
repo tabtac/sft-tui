@@ -49,7 +49,11 @@ func runCommand(args []string, out, errOut io.Writer) int {
 func runCommandWithInput(args []string, in io.Reader, out, errOut io.Writer) int {
 	// 无参数且当前标准输入/输出为交互式终端时直接进入 TUI 界面
 	if len(args) == 0 {
-		if f, ok := out.(*os.File); ok && (isatty.IsTerminal(f.Fd()) || isatty.IsCygwinTerminal(f.Fd())) {
+		inTTY := in == nil && isTTYFile(os.Stdin)
+		if in != nil {
+			inTTY = isTTYFile(in)
+		}
+		if inTTY && isTTYFile(out) {
 			return runUI(nil, errOut)
 		}
 		printUsage(errOut)
@@ -81,7 +85,11 @@ func runCommandWithInput(args []string, in io.Reader, out, errOut io.Writer) int
 		}
 		return 2
 	}
-	if *version && flags.NArg() == 0 {
+	if *version {
+		if flags.NArg() != 0 {
+			flags.Usage()
+			return 2
+		}
 		fmt.Fprintf(out, "sft %s\n", buildinfo.Version)
 		return 0
 	}
@@ -207,6 +215,10 @@ func runUI(args []string, errOut io.Writer) int {
 		flags.Usage()
 		return 2
 	}
+	if *cfgPath != "" && *dirPath != "" {
+		fmt.Fprintln(errOut, "sft ui：-config 与 -dir 不能同时使用")
+		return 2
+	}
 	exeDir := "."
 	if exe, err := os.Executable(); err == nil {
 		exeDir = filepath.Dir(exe)
@@ -221,6 +233,11 @@ func runUI(args []string, errOut io.Writer) int {
 		return 1
 	}
 	return 0
+}
+
+func isTTYFile(v any) bool {
+	f, ok := v.(*os.File)
+	return ok && (isatty.IsTerminal(f.Fd()) || isatty.IsCygwinTerminal(f.Fd()))
 }
 
 func runInitWithInput(args []string, in io.Reader, out, errOut io.Writer) int {

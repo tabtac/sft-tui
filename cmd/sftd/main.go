@@ -13,6 +13,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"syscall"
 	"time"
 
@@ -87,7 +88,10 @@ func runUI(args []string, initialPage int, out, errOut io.Writer) int {
 		flags.Usage()
 		return 2
 	}
-	if f, ok := out.(*os.File); !ok || (!isatty.IsTerminal(f.Fd()) && !isatty.IsCygwinTerminal(f.Fd())) {
+	inFd := os.Stdin.Fd()
+	if outFile, ok := out.(*os.File); !ok ||
+		(!isatty.IsTerminal(outFile.Fd()) && !isatty.IsCygwinTerminal(outFile.Fd())) ||
+		(!isatty.IsTerminal(inFd) && !isatty.IsCygwinTerminal(inFd)) {
 		fmt.Fprintln(errOut, "sftd ui：需要在交互式终端中运行")
 		return 1
 	}
@@ -155,6 +159,13 @@ func runServe(args []string, out, errOut io.Writer) int {
 		slog.Error("加载服务端配置失败", "error", err)
 		return 1
 	}
+	var ctrl *control.Service
+	defer func() {
+		if ctrl != nil {
+			_ = ctrl.Close()
+		}
+	}()
+
 	if *logPath != "" {
 		w, err := logfile.Open(*logPath, int64(cfg.Logging.MaxFileBytes))
 		if err != nil {
@@ -206,7 +217,7 @@ func runServe(args []string, out, errOut io.Writer) int {
 	}
 	defer listener.Close()
 
-	ctrl, err := control.StartManaged(*cfgPath, cfg.StorageRoot, control.Handlers{
+	ctrl, err = control.StartManaged(*cfgPath, cfg.StorageRoot, control.Handlers{
 		Reload:   reloadConfig,
 		Snapshot: daemon.Snapshot,
 		Logs:     logs.Query,
@@ -216,7 +227,6 @@ func runServe(args []string, out, errOut io.Writer) int {
 		slog.Error("启动本地控制端点失败", "error", err)
 		return 1
 	}
-	defer ctrl.Close()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -349,6 +359,13 @@ func runInitWithInput(args []string, in io.Reader, out, errOut io.Writer) int {
 	return 0
 }
 
+func storageFallback(cfgPath string) string {
+	if cfg, err := config.LoadServerDraft(cfgPath); err == nil && cfg.StorageRoot != "" {
+		return cfg.StorageRoot
+	}
+	return "var/storage"
+}
+
 func runStart(args []string, out, errOut io.Writer) int {
 	flags := flag.NewFlagSet("sftd start", flag.ContinueOnError)
 	flags.SetOutput(errOut)
@@ -357,6 +374,10 @@ func runStart(args []string, out, errOut io.Writer) int {
 		if err == flag.ErrHelp {
 			return 0
 		}
+		return 2
+	}
+	if flags.NArg() != 0 {
+		flags.Usage()
 		return 2
 	}
 	exe, err := os.Executable()
@@ -393,10 +414,11 @@ func runControlAction(action string, args []string, out, errOut io.Writer) int {
 		}
 		return 2
 	}
-	fallback := "var/storage"
-	if cfg, err := config.LoadServerDraft(*cfgPath); err == nil {
-		fallback = cfg.StorageRoot
+	if flags.NArg() != 0 {
+		flags.Usage()
+		return 2
 	}
+	fallback := storageFallback(*cfgPath)
 	var running bool
 	var err error
 	if action == "reload" {
@@ -431,11 +453,11 @@ func runStatus(args []string, out, errOut io.Writer) int {
 		}
 		return 2
 	}
-	fallback := "var/storage"
-	if cfg, err := config.LoadServerDraft(*cfgPath); err == nil {
-		fallback = cfg.StorageRoot
+	if flags.NArg() != 0 {
+		flags.Usage()
+		return 2
 	}
-	snap, err := control.Status(*cfgPath, fallback)
+	snap, err := control.Status(*cfgPath, storageFallback(*cfgPath))
 	if err != nil {
 		fmt.Fprintln(errOut, "sftd status：", err)
 		return 1
@@ -459,7 +481,7 @@ func runLogs(args []string, out, errOut io.Writer) int {
 	flags.SetOutput(errOut)
 	cfgPath := flags.String("config", "configs/server.local.json", "服务端配置文件")
 	after := flags.Uint64("after", 0, "仅显示序号大于此值的日志")
-	level := flags.String("level", "", "按等级过滤")
+	level := flags.String("level", "", "按等级过滤 (DEBUG/INFO/WARN/ERROR)")
 	user := flags.String("user", "", "按用户过滤")
 	file := flags.String("file", "", "按文件名关键字过滤")
 	text := flags.String("text", "", "按正文关键字过滤")
@@ -469,13 +491,20 @@ func runLogs(args []string, out, errOut io.Writer) int {
 		}
 		return 2
 	}
-	fallback := "var/storage"
-	if cfg, err := config.LoadServerDraft(*cfgPath); err == nil {
-		fallback = cfg.StorageRoot
+	if flags.NArg() != 0 {
+		flags.Usage()
+		return 2
 	}
-	page, err := control.QueryLogs(*cfgPath, fallback, monitor.LogQuery{
+	normLevel := strings.ToUpper(strings.TrimSpace(*level))
+	switch normLevel {
+	case "", "DEBUG", "INFO", "WARN", "ERROR":
+	default:
+		fmt.Fprintf(errOut, "sftd logs：无效日志等级 %q（支持 DEBUG/INFO/WARN/ERROR）\n", *level)
+		return 2
+	}
+	page, err := control.QueryLogs(*cfgPath, storageFallback(*cfgPath), monitor.LogQuery{
 		After: *after,
-		Level: *level,
+		Level: normLevel,
 		User:  *user,
 		File:  *file,
 		Text:  *text,
@@ -483,6 +512,9 @@ func runLogs(args []string, out, errOut io.Writer) int {
 	if err != nil {
 		fmt.Fprintln(errOut, "sftd logs：", err)
 		return 1
+	}
+	if page.Lost {
+		fmt.Fprintln(errOut, "注意：部分早期日志已被环形缓冲覆盖，以下为保留区间")
 	}
 	for _, ev := range page.Events {
 		fmt.Fprintf(out, "#%d %s [%s] %s %s\n", ev.Sequence, ev.Time.Format(time.RFC3339), ev.Level, ev.Message, ev.Detail)

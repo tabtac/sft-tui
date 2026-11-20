@@ -139,8 +139,12 @@ func ParseServerNames(names string) ([]string, []net.IP, error) {
 		if len(name) > 253 {
 			return nil, nil, fmt.Errorf("非法 DNS 名称：%q", name)
 		}
-		for i, label := range strings.Split(name, ".") {
+		labels := strings.Split(name, ".")
+		for i, label := range labels {
 			if i == 0 && label == "*" {
+				if len(labels) < 2 {
+					return nil, nil, fmt.Errorf("非法 DNS 名称：%q", name)
+				}
 				continue
 			}
 			if label == "" || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
@@ -167,8 +171,17 @@ func ValidateConnectAddress(address string) (string, string, error) {
 	if err != nil || n < 1 || n > 65535 {
 		return "", "", fmt.Errorf("端口须为 1–65535")
 	}
-	if host == "" || host == "0.0.0.0" || host == "::" {
-		return "", "", fmt.Errorf("客户端连接地址必须为实际 IP 或 DNS，不能使用通配监听地址")
+	if host == "" || strings.Contains(host, ",") {
+		return "", "", fmt.Errorf("客户端连接地址必须为单个实际 IP 或 DNS")
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		if ip.IsUnspecified() {
+			return "", "", fmt.Errorf("客户端连接地址必须为实际 IP 或 DNS，不能使用通配监听地址")
+		}
+		return host, port, nil
+	}
+	if host == "*" || strings.HasPrefix(host, "*.") {
+		return "", "", fmt.Errorf("客户端连接地址不能使用通配域名")
 	}
 	if _, _, err = ParseServerNames(host); err != nil {
 		return "", "", err

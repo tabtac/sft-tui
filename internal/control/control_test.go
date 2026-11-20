@@ -168,3 +168,26 @@ func TestControlManagedStatusLogsAndStopActions(t *testing.T) {
 		}
 	}
 }
+
+func TestLocateFallsBackOnCorruptHint(t *testing.T) {
+	dir := t.TempDir()
+	cfg := filepath.Join(dir, "server.json")
+	hintPath, _, err := locationPath(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(hintPath, []byte("{corrupt"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	fallback := filepath.Join(dir, "fallback-storage")
+	got, err := Locate(cfg, fallback)
+	if err != nil {
+		t.Fatalf("Locate failed on corrupt hint: %v", err)
+	}
+	if got != fallback {
+		t.Fatalf("Locate=%q want fallback=%q", got, fallback)
+	}
+	if _, statErr := os.Stat(hintPath); !os.IsNotExist(statErr) {
+		t.Fatalf("expected corrupt hint removed, statErr=%v", statErr)
+	}
+}
