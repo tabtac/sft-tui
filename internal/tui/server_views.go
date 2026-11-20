@@ -315,12 +315,13 @@ func (m *serverModel) renderFooter() string {
 			hotReason = "热配置一致"
 		}
 		return renderActionFooter(m.th, m.width, "设置:", []footerChip{
+			{key: "Enter", label: "编辑当前", reason: cfgReason, essential: true},
 			{key: "m", label: "基础", reason: cfgReason, essential: true},
 			{key: "a", label: "高级", reason: cfgReason, essential: true},
 			{key: "A", label: "热加载", reason: hotReason, essential: true},
 			{key: "Tab", label: "切页"},
 			{key: "?", label: "帮助"},
-			{key: "q", label: "退出", reason: quitReason, essential: true},
+			{key: "q", label: "退出", reason: quitReason},
 		})
 	default:
 		pauseLabel := "暂停"
@@ -970,14 +971,22 @@ func (m *serverModel) settingsFieldLine(label, saved, runtime string, hasRuntime
 	return fmt.Sprintf("  %s %s%s", padPlainRightCell(label, 20), saved, diffSuffix)
 }
 
-func (m *serverModel) settingsLines() []string {
+type settingsRow struct {
+	text        string
+	selectable  bool
+	targetModal serverModalKind
+	focusKey    string
+	jumpPage    int // >= 0 表示按 Enter 跳转到对应标签页
+}
+
+func (m *serverModel) settingsRows() []settingsRow {
 	c := m.cfg
 	hasRt := m.runtime != nil
 	var rt config.Server
 	if hasRt {
 		rt = m.runtime.Config
 	}
-	diffTag := m.th.badgeMuted.Render("服务当前离线（按 [m]/[a] 修改配置，启动服务后生效）")
+	diffTag := m.th.badgeMuted.Render("服务当前离线（按 [Enter]/[m]/[a] 修改配置，启动服务后生效）")
 	if hasRt {
 		needRestart := config.RestartRequired(rt, c)
 		needHot := !config.HotEqual(rt, c)
@@ -1002,59 +1011,79 @@ func (m *serverModel) settingsLines() []string {
 		clientsEqual = config.HotEqual(tmpDisk, tmpRt)
 	}
 
-	return []string{
-		diffTag,
-		"",
-		m.th.hintKey.Render("【基础网络、存储与日志】"),
-		m.settingsFieldLine("监听地址", c.Listen, rt.Listen, hasRt, false, c.Listen != rt.Listen),
-		m.settingsFieldLine("存储目录", c.StorageRoot, rt.StorageRoot, hasRt, false, c.StorageRoot != rt.StorageRoot),
-		m.settingsFieldLine("日志单文件上限", progress.FormatBytes(c.Logging.MaxFileBytes), progress.FormatBytes(rt.Logging.MaxFileBytes), hasRt, false, c.Logging.MaxFileBytes != rt.Logging.MaxFileBytes),
-		m.settingsFieldLine("TLS 证书链", formatTLSSummary(c.TLS), formatTLSSummary(rt.TLS), hasRt, true, !tlsEqual),
-		m.settingsFieldLine("授权用户数", fmt.Sprintf("%d 个", len(c.AuthorizedClients)), fmt.Sprintf("%d 个", len(rt.AuthorizedClients)), hasRt, true, !clientsEqual),
-		"",
-		m.th.hintKey.Render("【带宽限速策略】"),
-		m.settingsFieldLine("默认单用户带宽", formatBandwidthSummary(c.Bandwidth), formatBandwidthSummary(rt.Bandwidth), hasRt, false, c.Bandwidth != rt.Bandwidth),
-		m.settingsFieldLine("全局总带宽上限", formatGlobalBandwidthSummary(c.GlobalBandwidth), formatGlobalBandwidthSummary(rt.GlobalBandwidth), hasRt, true, !reflect.DeepEqual(c.GlobalBandwidth, rt.GlobalBandwidth)),
-		"",
-		m.th.hintKey.Render("【容量、并发与频率限制】"),
-		m.settingsFieldLine("单文件 / 用户配额",
+	note := func(s string) settingsRow { return settingsRow{text: s, jumpPage: -1} }
+	basic := func(key, text string) settingsRow {
+		return settingsRow{text: text, selectable: true, targetModal: srvModalEditSettings, focusKey: key, jumpPage: -1}
+	}
+	adv := func(key, text string) settingsRow {
+		return settingsRow{text: text, selectable: true, targetModal: srvModalEditAdvancedSettings, focusKey: key, jumpPage: -1}
+	}
+	jump := func(page int, text string) settingsRow {
+		return settingsRow{text: text, selectable: true, jumpPage: page}
+	}
+
+	return []settingsRow{
+		note(diffTag),
+		note(""),
+		note(m.th.hintKey.Render("【基础网络、存储与日志】")),
+		basic("listen", m.settingsFieldLine("监听地址", c.Listen, rt.Listen, hasRt, false, c.Listen != rt.Listen)),
+		basic("storage_root", m.settingsFieldLine("存储目录", c.StorageRoot, rt.StorageRoot, hasRt, false, c.StorageRoot != rt.StorageRoot)),
+		basic("logging.max_file_bytes", m.settingsFieldLine("日志单文件上限", progress.FormatBytes(c.Logging.MaxFileBytes), progress.FormatBytes(rt.Logging.MaxFileBytes), hasRt, false, c.Logging.MaxFileBytes != rt.Logging.MaxFileBytes)),
+		jump(3, m.settingsFieldLine("TLS 证书链", formatTLSSummary(c.TLS), formatTLSSummary(rt.TLS), hasRt, true, !tlsEqual)),
+		jump(1, m.settingsFieldLine("授权用户数", fmt.Sprintf("%d 个", len(c.AuthorizedClients)), fmt.Sprintf("%d 个", len(rt.AuthorizedClients)), hasRt, true, !clientsEqual)),
+		note(""),
+		note(m.th.hintKey.Render("【带宽限速策略】")),
+		basic("bandwidth.upload_bytes_per_second", m.settingsFieldLine("默认单用户带宽", formatBandwidthSummary(c.Bandwidth), formatBandwidthSummary(rt.Bandwidth), hasRt, false, c.Bandwidth != rt.Bandwidth)),
+		basic("global_bandwidth.upload", m.settingsFieldLine("全局总带宽上限", formatGlobalBandwidthSummary(c.GlobalBandwidth), formatGlobalBandwidthSummary(rt.GlobalBandwidth), hasRt, true, !reflect.DeepEqual(c.GlobalBandwidth, rt.GlobalBandwidth))),
+		note(""),
+		note(m.th.hintKey.Render("【容量、并发与频率限制】")),
+		basic("resources.max_file_bytes", m.settingsFieldLine("单文件 / 用户配额",
 			fmt.Sprintf("%s / %s", progress.FormatBytes(c.Resources.MaxFileBytes), progress.FormatBytes(c.Resources.UserStorageBytes)),
 			fmt.Sprintf("%s / %s", progress.FormatBytes(rt.Resources.MaxFileBytes), progress.FormatBytes(rt.Resources.UserStorageBytes)),
-			hasRt, false, c.Resources.MaxFileBytes != rt.Resources.MaxFileBytes || c.Resources.UserStorageBytes != rt.Resources.UserStorageBytes),
-		m.settingsFieldLine("全局连接 / 握手上限",
+			hasRt, false, c.Resources.MaxFileBytes != rt.Resources.MaxFileBytes || c.Resources.UserStorageBytes != rt.Resources.UserStorageBytes)),
+		adv("resources.max_connections", m.settingsFieldLine("全局连接 / 握手上限",
 			fmt.Sprintf("%d / %d", c.Resources.MaxConnections, c.Resources.MaxHandshakes),
 			fmt.Sprintf("%d / %d", rt.Resources.MaxConnections, rt.Resources.MaxHandshakes),
-			hasRt, false, c.Resources.MaxConnections != rt.Resources.MaxConnections || c.Resources.MaxHandshakes != rt.Resources.MaxHandshakes),
-		m.settingsFieldLine("每IP未认证 / 每用户",
+			hasRt, false, c.Resources.MaxConnections != rt.Resources.MaxConnections || c.Resources.MaxHandshakes != rt.Resources.MaxHandshakes)),
+		adv("resources.max_unauthenticated_per_ip", m.settingsFieldLine("每IP未认证 / 每用户",
 			fmt.Sprintf("%d / %d", c.Resources.MaxUnauthenticatedPerIP, c.Resources.MaxConnectionsPerUser),
 			fmt.Sprintf("%d / %d", rt.Resources.MaxUnauthenticatedPerIP, rt.Resources.MaxConnectionsPerUser),
-			hasRt, false, c.Resources.MaxUnauthenticatedPerIP != rt.Resources.MaxUnauthenticatedPerIP || c.Resources.MaxConnectionsPerUser != rt.Resources.MaxConnectionsPerUser),
-		m.settingsFieldLine("每用户流 / 待处理",
+			hasRt, false, c.Resources.MaxUnauthenticatedPerIP != rt.Resources.MaxUnauthenticatedPerIP || c.Resources.MaxConnectionsPerUser != rt.Resources.MaxConnectionsPerUser)),
+		adv("resources.max_streams_per_user", m.settingsFieldLine("每用户流 / 待处理",
 			fmt.Sprintf("%d / %d", c.Resources.MaxStreamsPerUser, c.Resources.MaxPendingTransfersPerUser),
 			fmt.Sprintf("%d / %d", rt.Resources.MaxStreamsPerUser, rt.Resources.MaxPendingTransfersPerUser),
-			hasRt, false, c.Resources.MaxStreamsPerUser != rt.Resources.MaxStreamsPerUser || c.Resources.MaxPendingTransfersPerUser != rt.Resources.MaxPendingTransfersPerUser),
-		m.settingsFieldLine("每用户最大文件数",
+			hasRt, false, c.Resources.MaxStreamsPerUser != rt.Resources.MaxStreamsPerUser || c.Resources.MaxPendingTransfersPerUser != rt.Resources.MaxPendingTransfersPerUser)),
+		adv("resources.max_files_per_user", m.settingsFieldLine("每用户最大文件数",
 			fmt.Sprintf("%d 个", c.Resources.MaxFilesPerUser), fmt.Sprintf("%d 个", rt.Resources.MaxFilesPerUser),
-			hasRt, false, c.Resources.MaxFilesPerUser != rt.Resources.MaxFilesPerUser),
-		m.settingsFieldLine("新建任务 / 检查点",
+			hasRt, false, c.Resources.MaxFilesPerUser != rt.Resources.MaxFilesPerUser)),
+		adv("resources.max_new_tasks_per_minute", m.settingsFieldLine("新建任务 / 检查点",
 			fmt.Sprintf("%d/分 · %d/秒", c.Resources.MaxNewTasksPerMinute, c.Resources.MaxUploadCheckpointsPerSecond),
 			fmt.Sprintf("%d/分 · %d/秒", rt.Resources.MaxNewTasksPerMinute, rt.Resources.MaxUploadCheckpointsPerSecond),
-			hasRt, false, c.Resources.MaxNewTasksPerMinute != rt.Resources.MaxNewTasksPerMinute || c.Resources.MaxUploadCheckpointsPerSecond != rt.Resources.MaxUploadCheckpointsPerSecond),
-		m.settingsFieldLine("检查点保留时长",
+			hasRt, false, c.Resources.MaxNewTasksPerMinute != rt.Resources.MaxNewTasksPerMinute || c.Resources.MaxUploadCheckpointsPerSecond != rt.Resources.MaxUploadCheckpointsPerSecond)),
+		adv("resources.transfer_retention_seconds", m.settingsFieldLine("检查点保留时长",
 			fmt.Sprintf("%s (%d秒)", time.Duration(c.Resources.TransferRetentionSeconds)*time.Second, c.Resources.TransferRetentionSeconds),
 			fmt.Sprintf("%s (%d秒)", time.Duration(rt.Resources.TransferRetentionSeconds)*time.Second, rt.Resources.TransferRetentionSeconds),
-			hasRt, false, c.Resources.TransferRetentionSeconds != rt.Resources.TransferRetentionSeconds),
-		"",
-		m.th.hintKey.Render("【协议流控与超时】"),
-		m.settingsFieldLine("流控参数",
+			hasRt, false, c.Resources.TransferRetentionSeconds != rt.Resources.TransferRetentionSeconds)),
+		note(""),
+		note(m.th.hintKey.Render("【协议流控与超时】")),
+		adv("limits.max_streams", m.settingsFieldLine("流控参数",
 			fmt.Sprintf("流=%d · 分块=%s · 窗口=%s", c.Limits.MaxStreams, progress.FormatBytes(uint64(c.Limits.ChunkSize)), progress.FormatBytes(uint64(c.Limits.WindowSize))),
 			fmt.Sprintf("流=%d · 分块=%s · 窗口=%s", rt.Limits.MaxStreams, progress.FormatBytes(uint64(rt.Limits.ChunkSize)), progress.FormatBytes(uint64(rt.Limits.WindowSize))),
-			hasRt, false, c.Limits != rt.Limits),
-		m.settingsFieldLine("超时秒数",
+			hasRt, false, c.Limits != rt.Limits)),
+		adv("timeouts.handshake_seconds", m.settingsFieldLine("超时秒数",
 			fmt.Sprintf("握手=%d · HELLO=%d · 读=%d · 写=%d · 空闲=%ds", c.Timeouts.HandshakeSeconds, c.Timeouts.HelloSeconds, c.Timeouts.FrameReadSeconds, c.Timeouts.WriteSeconds, c.Timeouts.IdleSeconds),
 			fmt.Sprintf("握手=%d · HELLO=%d · 读=%d · 写=%d · 空闲=%ds", rt.Timeouts.HandshakeSeconds, rt.Timeouts.HelloSeconds, rt.Timeouts.FrameReadSeconds, rt.Timeouts.WriteSeconds, rt.Timeouts.IdleSeconds),
-			hasRt, false, c.Timeouts != rt.Timeouts),
+			hasRt, false, c.Timeouts != rt.Timeouts)),
 	}
+}
+
+func (m *serverModel) settingsLines() []string {
+	rows := m.settingsRows()
+	out := make([]string, len(rows))
+	for i, r := range rows {
+		out[i] = r.text
+	}
+	return out
 }
 
 func (m *serverModel) renderSettingsPage(bodyH int) string {
@@ -1065,15 +1094,24 @@ func (m *serverModel) renderSettingsPage(bodyH int) string {
 		lines = append(lines, m.th.badgeErr.Render("加载配置失败："+sanitizeInline(m.cfgErr.Error())))
 		lines = append(lines, m.th.badgeWarn.Render("可返回 [1 概览] 按 [I] 启动初始化向导"))
 	} else {
-		all := m.settingsLines()
-		start := scrollOffset(m.cursors[4], len(all), visRows)
+		all := m.settingsRows()
+		cur := m.cursors[4]
+		if cur >= 0 && cur < len(all) && !all[cur].selectable {
+			for i, r := range all {
+				if r.selectable {
+					cur = i
+					break
+				}
+			}
+		}
+		start := scrollOffset(cur, len(all), visRows)
 		end := min(len(all), start+visRows)
 		for i := start; i < end; i++ {
-			ln := all[i]
-			if i == m.cursors[4] {
-				lines = append(lines, highlightRow(m.th, "▸ "+ln, innerW))
+			r := all[i]
+			if i == cur && r.selectable {
+				lines = append(lines, highlightRow(m.th, "▸ "+r.text, innerW))
 			} else {
-				lines = append(lines, truncCell("  "+ln, innerW))
+				lines = append(lines, truncCell("  "+r.text, innerW))
 			}
 		}
 	}
@@ -1230,7 +1268,7 @@ func (m *serverModel) infoModalData() (title string, lines []string, footer stri
 			helpKeyRow(m.th, "    ", "[K] / [S]", "续期 CA (365天) / 轮换服务端证书", subKW),
 			helpKeyRow(m.th, "    ", "[C] / [Enter]", "签发外部 CSR / 查看证书详情与指纹", subKW),
 			m.th.badgeMuted.Render("  5 设置"),
-			helpKeyRow(m.th, "    ", "[m] / [a]", "编辑基础设置(含日志上限) / 高级参数", subKW),
+			helpKeyRow(m.th, "    ", "[Enter]/[m]/[a]", "编辑当前项 / 基础设置 / 高级参数", subKW),
 			helpKeyRow(m.th, "    ", "[A]", "热加载可热更配置到运行中的服务", subKW),
 			m.th.badgeMuted.Render("  6 日志"),
 			helpKeyRow(m.th, "    ", "[p] / [l]", "暂停或恢复跟随 / 循环切换最低日志等级", subKW),
@@ -1261,6 +1299,12 @@ func (m *serverModel) renderModal(base string) string {
 		}
 		view, _ := renderModalScrollBox(m.width, m.height, m.th, "停止 sftd 服务", lines, "g 优雅停服 · f 强制停服 · Esc 取消", 0)
 		return view
+
+	case srvModalConfirm:
+		if m.confirm != nil {
+			view, _ := renderModalScrollBox(m.width, m.height, m.th, m.confirm.title, m.confirm.lines, "Enter / y 确认执行 · Esc / n 取消", 0)
+			return view
+		}
 	}
 
 	_, innerW := modalBoxDimensions(m.width)

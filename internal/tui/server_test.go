@@ -86,10 +86,14 @@ func TestServerBubbleTeaPagesLiveControlAndUserPolicy(t *testing.T) {
 		t.Fatalf("unexpected sftd users view:\n%s", usersView)
 	}
 
-	// 按 t 吊销/切换 alice 并验证热重载到运行态 Snapshot
-	_, toggleCmd := m.Update(keyRune('t'))
+	// 按 t 弹出吊销确认弹窗，按 y 确认后吊销 alice 并验证热重载到运行态 Snapshot
+	m.Update(keyRune('t'))
+	if m.modal != srvModalConfirm {
+		t.Fatalf("expected confirm modal on pressing t, got %v", m.modal)
+	}
+	_, toggleCmd := m.Update(keyRune('y'))
 	if toggleCmd == nil {
-		t.Fatal("expected toggle command on pressing t")
+		t.Fatal("expected toggle command after confirming t")
 	}
 	res := toggleCmd()
 	m.Update(res)
@@ -501,11 +505,15 @@ func TestServerRenewCertPreservesDisabledUserState(t *testing.T) {
 		t.Fatal("precondition failed: alice should be disabled before renewal")
 	}
 
-	// 按 w 续期用户证书，必须保持原禁用状态
+	// 按 w 弹出续期确认弹窗，按 Enter 确认续期用户证书，必须保持原禁用状态
 	oldCertificate := m.cfg.AuthorizedClients[0].Certificate
-	_, cmd := m.Update(keyRune('w'))
+	m.Update(keyRune('w'))
+	if m.modal != srvModalConfirm {
+		t.Fatalf("expected confirm modal on pressing w, got %v", m.modal)
+	}
+	_, cmd := m.Update(keyType(tea.KeyEnter))
 	if cmd == nil {
-		t.Fatal("w did not trigger renewUserCertCmd")
+		t.Fatal("confirming w did not trigger renewUserCertCmd")
 	}
 	res := cmd()
 	action, ok := res.(serverActionResultMsg)
@@ -521,10 +529,14 @@ func TestServerRenewCertPreservesDisabledUserState(t *testing.T) {
 		t.Fatalf("cert renewal unexpectedly re-enabled disabled user: %+v", m.cfg.AuthorizedClients[0])
 	}
 
-	// 重新启用必须是独立操作（例如按 t）
-	_, enableCmd := m.Update(keyRune('t'))
+	// 重新启用必须是独立操作（例如按 t 确认）
+	m.Update(keyRune('t'))
+	if m.modal != srvModalConfirm {
+		t.Fatalf("expected confirm modal on pressing t, got %v", m.modal)
+	}
+	_, enableCmd := m.Update(keyRune('y'))
 	if enableCmd == nil {
-		t.Fatal("t did not trigger toggleUserDisabledCmd")
+		t.Fatal("confirming t did not trigger toggleUserDisabledCmd")
 	}
 	m.Update(enableCmd())
 	m.Update(m.loadConfigCmd()())
@@ -1331,5 +1343,49 @@ func TestServerEscFilterClearAndHomeEndLogResume(t *testing.T) {
 	m.Update(keyType(tea.KeyEsc))
 	if m.hasLogFilters() {
 		t.Fatalf("expected Esc on logs page to clear filters, level=%q", m.logMinLevel)
+	}
+}
+
+func TestServerConfirmModalCancelAndSettingsRowEnterNavigation(t *testing.T) {
+	m := regressionServer(t, 110, 32)
+
+	// 1. 证书页按 K 弹出确认弹窗，按 Esc 取消不执行续期
+	m.Update(keyRune('4'))
+	m.Update(keyRune('K'))
+	if m.modal != srvModalConfirm || !strings.Contains(ansi.Strip(m.View()), "确认续期 CA") {
+		t.Fatalf("expected CA confirm modal on K, modal=%v", m.modal)
+	}
+	_, cancelCmd := m.Update(keyType(tea.KeyEsc))
+	if cancelCmd != nil || m.modal != srvModalNone || m.busy {
+		t.Fatalf("expected Esc to cancel confirm modal cleanly: modal=%v busy=%v", m.modal, m.busy)
+	}
+
+	// 2. 设置页自动跳过标题和空行，按 Enter 打开对应表单并定位字段
+	m.Update(keyRune('5'))
+	rows := m.settingsRows()
+	if !rows[m.cursors[4]].selectable {
+		t.Fatalf("settings cursor landed on non-selectable row %d: %q", m.cursors[4], rows[m.cursors[4]].text)
+	}
+	// 定位到“存储目录”并按 Enter，应打开基础设置且聚焦 storage_root 输入框
+	m.Update(keyType(tea.KeyDown))
+	if rows[m.cursors[4]].focusKey != "storage_root" {
+		t.Fatalf("expected second selectable settings row to be storage_root, got %q", rows[m.cursors[4]].focusKey)
+	}
+	m.Update(keyType(tea.KeyEnter))
+	stIdx, ok := m.inputByKey("storage_root")
+	if m.modal != srvModalEditSettings || !ok || !m.formInputs[stIdx].Focused() {
+		t.Fatalf("expected Enter on storage_root row to open basic settings focusing storage_root, modal=%v", m.modal)
+	}
+	m.Update(keyType(tea.KeyEsc))
+
+	// 定位到“超时秒数”并按 Enter，应打开高级设置并聚焦握手超时
+	m.Update(keyType(tea.KeyEnd))
+	if rows[m.cursors[4]].focusKey != "timeouts.handshake_seconds" {
+		t.Fatalf("expected End on settings page to land on timeouts row, got %q", rows[m.cursors[4]].focusKey)
+	}
+	m.Update(keyType(tea.KeyEnter))
+	hsIdx, ok := m.inputByKey("timeouts.handshake_seconds")
+	if m.modal != srvModalEditAdvancedSettings || !ok || !m.formInputs[hsIdx].Focused() {
+		t.Fatalf("expected Enter on timeouts row to open advanced settings focusing handshake_seconds, modal=%v", m.modal)
 	}
 }

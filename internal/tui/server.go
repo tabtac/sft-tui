@@ -49,7 +49,14 @@ const (
 	srvModalEditAdvancedSettings
 	srvModalRotateServer
 	srvModalDeployWizard
+	srvModalConfirm
 )
+
+type serverConfirmAction struct {
+	title     string
+	lines     []string
+	onConfirm func() tea.Cmd
+}
 
 type certRow struct {
 	Name        string
@@ -150,6 +157,7 @@ type serverModel struct {
 	formState
 	targetUser         *config.AuthorizedClient
 	userDraft          *userFormDraft
+	confirm            *serverConfirmAction
 	deployAutoPrompted bool
 	deploy             *deployWizardDraft
 	settingsExpected   config.Server
@@ -797,11 +805,19 @@ func (m *serverModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if m.page == 5 {
 			m.logPaused = true
 		}
+		if m.page == 4 {
+			m.stepSettingsCursor(-1)
+			return m, nil
+		}
 		if m.cursors[m.page] > 0 {
 			m.cursors[m.page]--
 		}
 		return m, nil
 	case "down", "j":
+		if m.page == 4 {
+			m.stepSettingsCursor(1)
+			return m, nil
+		}
 		n := m.currentPageLen()
 		if m.cursors[m.page] < n-1 {
 			m.cursors[m.page]++
@@ -815,10 +831,16 @@ func (m *serverModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.logPaused = true
 		}
 		m.cursors[m.page] = max(0, m.cursors[m.page]-8)
+		if m.page == 4 {
+			m.snapSettingsCursor(-1)
+		}
 		return m, nil
 	case "pgdown":
 		if n := m.currentPageLen(); n > 0 {
 			m.cursors[m.page] = min(n-1, m.cursors[m.page]+8)
+		}
+		if m.page == 4 {
+			m.snapSettingsCursor(1)
 		}
 		return m, nil
 	case "home":
@@ -826,10 +848,16 @@ func (m *serverModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.logPaused = true
 		}
 		m.cursors[m.page] = 0
+		if m.page == 4 {
+			m.snapSettingsCursor(1)
+		}
 		return m, nil
 	case "end", "G":
 		if n := m.currentPageLen(); n > 0 {
 			m.cursors[m.page] = n - 1
+		}
+		if m.page == 4 {
+			m.snapSettingsCursor(-1)
 		}
 		if m.page == 5 && m.logPaused {
 			m.logPaused = false
@@ -842,6 +870,9 @@ func (m *serverModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.logPaused = true
 		}
 		m.cursors[m.page] = 0
+		if m.page == 4 {
+			m.snapSettingsCursor(1)
+		}
 		return m, nil
 	}
 
@@ -898,7 +929,26 @@ func (m *serverModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 			if len(users) > 0 && m.cursors[1] < len(users) {
-				return m, m.toggleUserDisabledCmd(users[m.cursors[1]])
+				u := users[m.cursors[1]]
+				title := "确认吊销用户授权"
+				lines := []string{
+					m.th.badgeWarn.Render("即将吊销用户 " + sanitizeInline(u.UserID) + " 的访问权限。"),
+					"",
+					"  • 确认后将写入服务端配置，并立即热加载到运行中的 sftd 实例。",
+					"  • 该用户将无法建立新传输连接；随时可再次按 [t] 重新启用。",
+				}
+				if u.Disabled {
+					title = "确认重新启用用户"
+					lines = []string{
+						m.th.badgeOk.Render("即将重新启用用户 " + sanitizeInline(u.UserID) + " 的访问权限。"),
+						"",
+						"  • 确认后将写入服务端配置，并立即热加载到运行中的 sftd 实例。",
+					}
+				}
+				m.openConfirmModal(title, lines, func() tea.Cmd {
+					return m.toggleUserDisabledCmd(u)
+				})
+				return m, nil
 			}
 		case "p":
 			if m.cfgErr != nil {
@@ -926,7 +976,16 @@ func (m *serverModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 					m.openCSRModalForRenew(u)
 					return m, textinput.Blink
 				}
-				return m, m.renewUserCertCmd(u)
+				lines := []string{
+					m.th.badgeWarn.Render("即将为用户 " + sanitizeInline(u.UserID) + " 签发新的客户端证书并热加载。"),
+					"",
+					"  • 新证书签发后，旧证书将失效；请按 [e] 重新导出分发包给客户端。",
+					"  • 该操作不会改变用户当前的启停与限速策略。",
+				}
+				m.openConfirmModal("确认续期用户证书", lines, func() tea.Cmd {
+					return m.renewUserCertCmd(u)
+				})
+				return m, nil
 			}
 		case "e":
 			if m.cfgErr != nil {
@@ -987,7 +1046,15 @@ func (m *serverModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			if m.rejectIfBusy() {
 				return m, nil
 			}
-			return m, m.renewCACmd()
+			m.openConfirmModal("确认续期 CA 根证书", []string{
+				m.th.badgeWarn.Render("即将沿用现有 CA 私钥将根证书有效期延长 365 天。"),
+				"",
+				"  • 续期完成后将自动热加载到运行中的服务端。",
+				"  • 建议随后将更新后的 ca.pem 同步至各客户端。",
+			}, func() tea.Cmd {
+				return m.renewCACmd()
+			})
+			return m, nil
 		case "S":
 			if m.cfgErr != nil {
 				m.setToast("当前配置不可用")
@@ -1037,6 +1104,10 @@ func (m *serverModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 		case "A":
 			return m, m.reloadServiceCmd()
+		case "enter":
+			if m.cfgErr == nil {
+				return m.activateSettingsRow()
+			}
 		}
 	case 5: // 日志
 		switch k {
@@ -1203,8 +1274,86 @@ func (m *serverModel) clampCursors() {
 			if m.cursors[i] >= n {
 				m.cursors[i] = max(0, n-1)
 			}
+			if i == 4 && n > 0 {
+				m.snapSettingsCursor(1)
+			}
 		}
 	}
+}
+
+func (m *serverModel) openConfirmModal(title string, lines []string, onConfirm func() tea.Cmd) {
+	m.confirm = &serverConfirmAction{
+		title:     title,
+		lines:     lines,
+		onConfirm: onConfirm,
+	}
+	m.modal = srvModalConfirm
+}
+
+func (m *serverModel) stepSettingsCursor(dir int) {
+	rows := m.settingsRows()
+	if len(rows) == 0 {
+		m.cursors[4] = 0
+		return
+	}
+	cur := m.cursors[4]
+	for next := cur + dir; next >= 0 && next < len(rows); next += dir {
+		if rows[next].selectable {
+			m.cursors[4] = next
+			return
+		}
+	}
+}
+
+func (m *serverModel) snapSettingsCursor(preferDir int) {
+	rows := m.settingsRows()
+	if len(rows) == 0 {
+		m.cursors[4] = 0
+		return
+	}
+	cur := max(0, min(len(rows)-1, m.cursors[4]))
+	if rows[cur].selectable {
+		m.cursors[4] = cur
+		return
+	}
+	for _, dir := range []int{preferDir, -preferDir} {
+		if dir == 0 {
+			dir = 1
+		}
+		for i := cur + dir; i >= 0 && i < len(rows); i += dir {
+			if rows[i].selectable {
+				m.cursors[4] = i
+				return
+			}
+		}
+	}
+	m.cursors[4] = cur
+}
+
+func (m *serverModel) activateSettingsRow() (tea.Model, tea.Cmd) {
+	rows := m.settingsRows()
+	if m.cursors[4] < 0 || m.cursors[4] >= len(rows) {
+		return m, nil
+	}
+	r := rows[m.cursors[4]]
+	if r.jumpPage >= 0 {
+		return m.switchPage(r.jumpPage)
+	}
+	switch r.targetModal {
+	case srvModalEditSettings:
+		m.openEditSettingsModal()
+		if idx, ok := m.inputByKey(r.focusKey); ok {
+			return m, m.focusInputRow(idx)
+		}
+		return m, textinput.Blink
+	case srvModalEditAdvancedSettings:
+		m.openAdvancedSettingsModal()
+		if idx, ok := m.inputByKey(r.focusKey); ok {
+			return m, m.focusInputRow(idx)
+		}
+		return m, textinput.Blink
+	}
+	return m, nil
 }
 
 func (m *serverModel) initForm(labels, defaults, toggleLabels []string, toggles []bool) {
@@ -1474,12 +1623,19 @@ func (m *serverModel) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 		if m.page == 5 {
 			m.logPaused = true
 		}
-		if m.cursors[m.page] > 0 {
+		if m.page == 4 {
+			m.stepSettingsCursor(-1)
+		} else if m.cursors[m.page] > 0 {
 			m.cursors[m.page]--
 		}
 	case tea.MouseButtonWheelDown:
-		if m.cursors[m.page] < total-1 {
+		if m.page == 4 {
+			m.stepSettingsCursor(1)
+		} else if m.cursors[m.page] < total-1 {
 			m.cursors[m.page]++
+		} else if m.page == 5 && m.logPaused {
+			m.logPaused = false
+			return m, m.pollRuntimeCmd()
 		}
 	case tea.MouseButtonLeft:
 		if total == 0 {
@@ -1503,6 +1659,9 @@ func (m *serverModel) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 			idx := scrollOffset(m.cursors[m.page], total, visRows) + relY
 			if idx >= 0 && idx < total {
 				m.cursors[m.page] = idx
+				if m.page == 4 {
+					m.snapSettingsCursor(1)
+				}
 			}
 		}
 	}
@@ -1560,7 +1719,23 @@ func (m *serverModel) handleModalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.modal = srvModalNone
 		m.targetUser = nil
 		m.userDraft = nil
+		m.confirm = nil
 		m.settingsDraft = nil
+		return m, nil
+	}
+	if m.modal == srvModalConfirm {
+		switch k {
+		case "enter", "y", "Y":
+			act := m.confirm
+			m.confirm = nil
+			m.modal = srvModalNone
+			if act != nil && act.onConfirm != nil {
+				return m, act.onConfirm()
+			}
+		case "n", "N":
+			m.confirm = nil
+			m.modal = srvModalNone
+		}
 		return m, nil
 	}
 	if m.modal == srvModalHelp || m.modal == srvModalDetail {
