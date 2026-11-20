@@ -69,21 +69,25 @@ func New(mode string, status, results io.Writer) (*Display, error) {
 		}
 	}
 	d.enabled = mode == "always" || (mode == "auto" && d.ansi)
-	go func() {
-		defer close(d.stopped)
-		ticker := time.NewTicker(150 * time.Millisecond)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-d.stop:
-				return
-			case <-ticker.C:
-				d.mu.Lock()
-				d.draw()
-				d.mu.Unlock()
+	if d.enabled {
+		go func() {
+			defer close(d.stopped)
+			ticker := time.NewTicker(150 * time.Millisecond)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-d.stop:
+					return
+				case <-ticker.C:
+					d.mu.Lock()
+					d.draw()
+					d.mu.Unlock()
+				}
 			}
-		}
-	}()
+		}()
+	} else {
+		close(d.stopped)
+	}
 	return d, nil
 }
 
@@ -116,7 +120,7 @@ func (d *Display) Finish(id int, message string, failed bool) {
 	defer d.mu.Unlock()
 	d.clear()
 	if e := d.entries[id]; e != nil && d.enabled {
-		if failed {
+		if failed && e.phase != queue.Paused && e.phase != queue.Cancelled && e.phase != queue.Skipped {
 			e.phase = queue.Pending
 		}
 		fmt.Fprintln(d.status, d.line(e))
@@ -151,6 +155,13 @@ func (d *Display) clear() {
 func (d *Display) draw() {
 	if !d.enabled || len(d.entries) == 0 {
 		return
+	}
+	if d.ansi {
+		if f, ok := d.status.(*os.File); ok {
+			if w, h, err := term.GetSize(f.Fd()); err == nil && w > 0 && h > 0 {
+				d.width, d.height = w, h
+			}
+		}
 	}
 	d.clear()
 	ids := make([]int, 0, len(d.entries))
@@ -191,8 +202,10 @@ func (d *Display) line(e *entry) string {
 			speed = FormatRate(float64(e.done-e.initial) / sec)
 		}
 	}
-	txt := fmt.Sprintf("%-22s [%s] %3.0f%%  %s/%s  %s  (%s)",
-		ansi.Truncate(e.label, 22, "…"), bar, frac*100,
+	trunc := ansi.Truncate(e.label, 22, "…")
+	pad := max(0, 22-ansi.StringWidth(trunc))
+	txt := fmt.Sprintf("%s%s [%s] %3.0f%%  %s/%s  %s  (%s)",
+		trunc, strings.Repeat(" ", pad), bar, frac*100,
 		FormatBytes(e.done), FormatBytes(e.total), speed, e.phase)
 	if d.ansi {
 		return ansi.Truncate(txt, max(1, d.width-1), "…")

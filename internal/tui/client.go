@@ -122,10 +122,11 @@ type identityActivatedMsg struct {
 	err      error
 }
 type batchOpResultMsg struct {
-	notice   string
-	err      error
-	quit     bool
-	enqueued []queue.Task
+	notice     string
+	err        error
+	quit       bool
+	isGlobalOp bool
+	enqueued   []queue.Task
 }
 type batchTracker struct {
 	id      string
@@ -236,6 +237,7 @@ type model struct {
 	idCursor        int
 	pendingBatchDir protocol.Direction
 	pendingSpecs    []queue.Spec
+	pendingClearSel bool
 	conflictNames   []string
 	renameTask      *queue.Task
 }
@@ -312,6 +314,7 @@ func (m *model) cleanup() {
 }
 
 func (m *model) Init() tea.Cmd {
+	m.activatingID = true
 	return tea.Batch(
 		m.loadLocalCmd(m.localDir),
 		m.initIdentityCmd(),
@@ -403,6 +406,18 @@ func (m *model) loadRemoteCmd() tea.Cmd {
 func (m *model) initIdentityCmd() tea.Cmd {
 	opts := m.opts
 	return func() tea.Msg {
+		if opts.ConfigPath == "" && opts.BundleDir == "" {
+			if cfg, activeID, customLabel, err := identity.ActiveProfileInfo(opts.ExecutableDir); err == nil {
+				res := openIdentityStack(cfg, customLabel)
+				res.activeID = activeID
+				return res
+			} else if !os.IsNotExist(err) {
+				return identityActivatedMsg{
+					stage: identityStageLookup,
+					err:   err,
+				}
+			}
+		}
 		wd, _ := os.Getwd()
 		cfg, err := identity.Resolve(opts.ExecutableDir, wd, opts.BundleDir, opts.ConfigPath, false, nil)
 		if err != nil {
@@ -671,9 +686,13 @@ func (m *model) activateChoiceCmd(ch identityChoice, customPath string) tea.Cmd 
 			}
 			useSel = true
 		default:
+			stagedLabel := strings.TrimSpace(ch.profile.Label)
 			prof, err = identity.PrepareImport(exeDir, wd, ch.profile.Path)
 			if err != nil {
 				return identityActivatedMsg{stage: identityStageLookup, err: err}
+			}
+			if stagedLabel != "" {
+				prof.Label = stagedLabel
 			}
 		}
 		if _, err = security.ClientTLS(prof.Config); err != nil {
@@ -729,7 +748,9 @@ func (m *model) activateChoiceCmd(ch identityChoice, customPath string) tea.Cmd 
 						err:    fmt.Errorf("切换身份前暂停当前任务失败：%w", err),
 					}
 				}
-				_ = oldRunner.Close()
+				if oldRunner != nil {
+					_ = oldRunner.Close()
+				}
 				_ = oldMgr.Close()
 			}
 			res.activeID = prof.ID
@@ -749,7 +770,9 @@ func (m *model) activateChoiceCmd(ch identityChoice, customPath string) tea.Cmd 
 					err:    fmt.Errorf("切换身份前暂停当前任务失败：%w", err),
 				}
 			}
-			_ = oldRunner.Close()
+			if oldRunner != nil {
+				_ = oldRunner.Close()
+			}
 			_ = oldMgr.Close()
 		}
 		res := openIdentityStack(cfg, prof.Label)
@@ -793,11 +816,27 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if !m.editingPath {
 			m.pathInput.SetValue(msg.dir)
 		}
-		if msg.dir != prevDir && m.pendingLocalFocusPath == "" {
-			m.visibleLocal = nil
-			m.localCursor = 0
+		if msg.dir != prevDir {
+			m.localSelected = make(map[string]bool)
+			if m.pendingLocalFocusPath == "" {
+				m.visibleLocal = nil
+				m.localCursor = 0
+			}
 		}
 		m.localEntries = msg.entries
+		if len(m.localSelected) > 0 {
+			live := make(map[string]bool, len(msg.entries))
+			for _, e := range msg.entries {
+				if e.regular {
+					live[e.path] = true
+				}
+			}
+			for path := range m.localSelected {
+				if !live[path] {
+					delete(m.localSelected, path)
+				}
+			}
+		}
 		m.rebuildLocalVisible()
 		return m, nil
 
@@ -812,6 +851,17 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.remoteErr = ""
 		m.remoteEntries = msg.entries
+		if len(m.remoteSelected) > 0 {
+			live := make(map[string]bool, len(msg.entries))
+			for _, f := range msg.entries {
+				live[f.FileName] = true
+			}
+			for name := range m.remoteSelected {
+				if !live[name] {
+					delete(m.remoteSelected, name)
+				}
+			}
+		}
 		m.rebuildRemoteVisible()
 		return m, nil
 
@@ -881,16 +931,20 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.testingConn = false
 		if msg.err != nil {
 			m.idTestResults[msg.path] = identityTestState{tested: true, latency: msg.latency, err: msg.err.Error()}
-			m.setToastSticky("连接测试失败：" + msg.err.Error())
+			if m.modal == modalIdentity {
+				m.setToastSticky("连接测试失败：" + msg.err.Error())
+			}
 		} else {
 			m.idTestResults[msg.path] = identityTestState{tested: true, latency: msg.latency}
-			m.setToastSticky(fmt.Sprintf("连接测试成功，耗时 %s", msg.latency.Round(time.Millisecond)))
+			if m.modal == modalIdentity {
+				m.setToastSticky(fmt.Sprintf("连接测试成功，耗时 %s", msg.latency.Round(time.Millisecond)))
+			}
 		}
 		return m, nil
 
 	case identityActivatedMsg:
 		m.activatingID = false
-		if m.opLabel == "正在切换身份" {
+		if m.opLabel == "正在切换身份" || m.opLabel == "正在导入身份" || m.opLabel == "正在扫描身份目录" {
 			m.opLabel = ""
 			m.opStart = time.Time{}
 		}
@@ -929,7 +983,13 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.setToastError(msg.err.Error())
 			return m, nil
 		}
-		// 释放旧实例仅在替换时安全（通常 activateChoiceCmd 已关闭旧实例；启动期无旧实例）
+		// 若与 Init 等流程并发打开，释放未被替掉的旧实例
+		if m.runner != nil && m.runner != msg.runner {
+			_ = m.runner.Close()
+		}
+		if m.manager != nil && m.manager != msg.manager {
+			_ = m.manager.Close()
+		}
 		m.idInitFailedStage = 0
 		m.idInitFailedLabel = ""
 		m.cfg = &msg.cfg
@@ -940,6 +1000,13 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.runner = msg.runner
 		m.modal = modalNone
 		m.connStatus = "已配置，正在拉取远端文件"
+		m.remoteEntries = nil
+		m.visibleRemote = nil
+		m.remoteSelected = make(map[string]bool)
+		m.remoteErr = ""
+		m.remoteCursor = 0
+		m.completedSeen = make(map[string]bool)
+		m.batchHistory = nil
 		m.recoveryNotice = ""
 		m.activeBatches = make(map[string]*batchTracker)
 		m.lastBatch = nil
@@ -968,9 +1035,11 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, m.loadRemoteCmd()
 
 	case batchOpResultMsg:
-		m.opBusy = false
-		m.opLabel = ""
-		m.opStart = time.Time{}
+		if msg.isGlobalOp {
+			m.opBusy = false
+			m.opLabel = ""
+			m.opStart = time.Time{}
+		}
 		if msg.err != nil {
 			m.setToastError(msg.err.Error())
 			return m, nil
@@ -1104,7 +1173,10 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, textinput.Blink
 	case "p":
 		if m.focus == areaQueue {
-			return m, m.pauseSelectedCmd()
+			if !m.historyView {
+				return m, m.pauseSelectedCmd()
+			}
+			return m, nil
 		}
 		m.editingPath = true
 		m.pathInput.SetValue(m.localDir)
@@ -1209,6 +1281,9 @@ func (m *model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 	if m.modal == modalIdentity {
+		if m.pendingSwitch != nil || m.editingIDLabel || m.activatingID {
+			return m, nil
+		}
 		switch msg.Button {
 		case tea.MouseButtonWheelUp:
 			if m.idCursor > 0 {
@@ -1243,7 +1318,7 @@ func (m *model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 						return m, m.beginIdentitySwitch(m.idChoices[idx], "", false)
 					}
 				}
-			} else if relY >= inputRelY {
+			} else if relY == inputRelY {
 				m.editingIDLabel = false
 				m.idLabelInput.Blur()
 				m.idInputFocus = true
@@ -1311,17 +1386,23 @@ func (m *model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 		panelH := max(5, bodyH-1)
 		visRows := max(1, panelH-3)
 		relY := msg.Y - (bodyY + 3)
-		if m.focus == areaQueue && msg.Y == bodyY+2 && msg.Button == tea.MouseButtonLeft {
-			qLabels := []string{fmt.Sprintf("活动队列 (%d)", len(m.activeTasks)), fmt.Sprintf("历史归档 (%d)", len(m.historyTasks))}
-			activeQ := 0
-			if m.historyView {
-				activeQ = 1
+		if m.focus == areaQueue {
+			if msg.Y == bodyY+2 && msg.Button == tea.MouseButtonLeft {
+				qLabels := []string{fmt.Sprintf("活动队列 (%d)", len(m.activeTasks)), fmt.Sprintf("历史归档 (%d)", len(m.historyTasks))}
+				activeQ := 0
+				if m.historyView {
+					activeQ = 1
+				}
+				if idx := tabHitIndexGap(msg.X, 2, 1, qLabels, m.th, activeQ); idx >= 0 {
+					m.historyView = idx == 1
+					m.clampQueueCursor()
+				}
+				return m, nil
 			}
-			if idx := tabHitIndex(msg.X, 2, qLabels, m.th, activeQ); idx >= 0 {
-				m.historyView = idx == 1
-				m.clampQueueCursor()
+			if !m.historyView && m.recoveryNotice != "" && len(m.activeTasks) > 0 && visRows >= 3 {
+				visRows--
+				relY--
 			}
-			return m, nil
 		}
 		switch m.focus {
 		case areaLocal:
@@ -1361,7 +1442,7 @@ func (m *model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 		if m.historyView {
 			activeQ = 1
 		}
-		if idx := tabHitIndex(msg.X, 2, qLabels, m.th, activeQ); idx >= 0 {
+		if idx := tabHitIndexGap(msg.X, 2, 1, qLabels, m.th, activeQ); idx >= 0 {
 			m.historyView = idx == 1
 			m.clampQueueCursor()
 		}
@@ -1465,6 +1546,10 @@ func (m *model) handleModalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, cmd
 		}
 		if k == "esc" {
+			if m.activatingID {
+				m.setToastSticky("正在切换或导入身份，请稍候…")
+				return m, nil
+			}
 			m.modal = modalNone
 			m.pendingSwitch = nil
 			m.editingIDLabel = false
@@ -1540,11 +1625,16 @@ func (m *model) handleModalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.modal = modalNone
 			m.pendingSpecs = nil
 			m.conflictNames = nil
+			m.pendingClearSel = false
 			m.clearToast()
 			return m, nil
 		case "r", "a":
 			specs := m.resolveConflictsAutoRename()
-			m.clearSelectionForDir(m.pendingBatchDir)
+			clearSel := m.pendingClearSel
+			m.pendingClearSel = false
+			if clearSel {
+				m.clearSelectionForDir(m.pendingBatchDir)
+			}
 			m.modal = modalNone
 			m.pendingSpecs = nil
 			m.conflictNames = nil
@@ -1552,7 +1642,11 @@ func (m *model) handleModalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, m.enqueueSpecsCmd(specs)
 		case "s":
 			specs := m.resolveConflictsSkip()
-			m.clearSelectionForDir(m.pendingBatchDir)
+			clearSel := m.pendingClearSel
+			m.pendingClearSel = false
+			if clearSel {
+				m.clearSelectionForDir(m.pendingBatchDir)
+			}
 			m.modal = modalNone
 			m.pendingSpecs = nil
 			m.conflictNames = nil
@@ -1702,6 +1796,10 @@ func (m *model) cycleView(delta int) {
 }
 
 func (m *model) requestExit() (tea.Model, tea.Cmd) {
+	if m.activatingID {
+		m.setToastSticky("正在切换或导入身份，请稍候…")
+		return m, nil
+	}
 	if m.manager != nil && m.manager.HasRunning() {
 		m.modal = modalQuit
 		return m, nil
@@ -2094,13 +2192,13 @@ func (m *model) retryFailedTasksCmd() tea.Cmd {
 			}
 		}
 		if resumed == 0 && firstErr != nil {
-			return batchOpResultMsg{err: firstErr}
+			return batchOpResultMsg{err: firstErr, isGlobalOp: true}
 		}
 		notice := fmt.Sprintf("已重新提交 %d 个失败任务继续传输", resumed)
 		if firstErr != nil {
 			notice += "（部分失败：" + firstErr.Error() + "）"
 		}
-		return batchOpResultMsg{notice: notice}
+		return batchOpResultMsg{notice: notice, isGlobalOp: true}
 	}
 }
 
@@ -2353,6 +2451,7 @@ func (m *model) prepareBatch(dir protocol.Direction, specs []queue.Spec, clearSe
 		m.pendingBatchDir = dir
 		m.pendingSpecs = specs
 		m.conflictNames = conflicts
+		m.pendingClearSel = clearSel
 		m.clearToast()
 		m.modal = modalConflict
 		return nil
@@ -2364,28 +2463,49 @@ func (m *model) prepareBatch(dir protocol.Direction, specs []queue.Spec, clearSe
 }
 
 func (m *model) resolveConflictsAutoRename() []queue.Spec {
-	used := make(map[string]bool)
 	ignoreCase := m.pendingBatchDir != protocol.DirectionUpload && runtime.GOOS == "windows"
+	var remoteUsed map[string]bool
+	var dirUsed map[string]map[string]bool
 	if m.pendingBatchDir == protocol.DirectionUpload {
+		remoteUsed = make(map[string]bool, len(m.remoteEntries))
 		for _, f := range m.remoteEntries {
-			used[f.FileName] = true
+			remoteUsed[f.FileName] = true
 		}
 	} else {
-		for _, e := range m.localEntries {
-			k := e.name
-			if ignoreCase {
-				k = strings.ToLower(k)
-			}
-			used[k] = true
-		}
+		dirUsed = make(map[string]map[string]bool)
 	}
 	out := make([]queue.Spec, 0, len(m.pendingSpecs))
 	for _, s := range m.pendingSpecs {
 		if m.pendingBatchDir == protocol.DirectionUpload {
-			name := uniqueName(s.Remote, used)
-			used[name] = true
+			name := uniqueName(s.Remote, remoteUsed)
+			remoteUsed[name] = true
 			s.Remote = name
 		} else {
+			dir := filepath.Dir(s.Path)
+			used := dirUsed[dir]
+			if used == nil {
+				used = make(map[string]bool)
+				entries, err := os.ReadDir(dir)
+				if err == nil {
+					for _, e := range entries {
+						k := e.Name()
+						if ignoreCase {
+							k = strings.ToLower(k)
+						}
+						used[k] = true
+					}
+				}
+				if filepath.Clean(dir) == filepath.Clean(m.localDir) || len(entries) == 0 {
+					for _, e := range m.localEntries {
+						k := e.name
+						if ignoreCase {
+							k = strings.ToLower(k)
+						}
+						used[k] = true
+					}
+				}
+				dirUsed[dir] = used
+			}
 			base := filepath.Base(s.Path)
 			name := uniqueNameFold(base, used, ignoreCase)
 			k := name
@@ -2393,7 +2513,7 @@ func (m *model) resolveConflictsAutoRename() []queue.Spec {
 				k = strings.ToLower(k)
 			}
 			used[k] = true
-			s.Path = filepath.Join(filepath.Dir(s.Path), name)
+			s.Path = filepath.Join(dir, name)
 		}
 		out = append(out, s)
 	}
@@ -2621,17 +2741,17 @@ func (m *model) toggleAllCmd() tea.Cmd {
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 			defer cancel()
 			if err := mgr.PauseAll(ctx); err != nil {
-				return batchOpResultMsg{err: err}
+				return batchOpResultMsg{err: err, isGlobalOp: true}
 			}
-			return batchOpResultMsg{notice: "已全部暂停"}
+			return batchOpResultMsg{notice: "已全部暂停", isGlobalOp: true}
 		}
 	}
 	m.opLabel = "正在全部恢复"
 	return func() tea.Msg {
 		if err := mgr.ResumeAll(); err != nil {
-			return batchOpResultMsg{err: err}
+			return batchOpResultMsg{err: err, isGlobalOp: true}
 		}
-		return batchOpResultMsg{notice: "已全部恢复"}
+		return batchOpResultMsg{notice: "已全部恢复", isGlobalOp: true}
 	}
 }
 
@@ -2650,8 +2770,8 @@ func (m *model) pauseAllAndQuitCmd() tea.Cmd {
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
 		if err := mgr.PauseAll(ctx); err != nil {
-			return batchOpResultMsg{err: err}
+			return batchOpResultMsg{err: err, isGlobalOp: true}
 		}
-		return batchOpResultMsg{quit: true}
+		return batchOpResultMsg{quit: true, isGlobalOp: true}
 	}
 }

@@ -1122,3 +1122,108 @@ func TestServerRuntimeMonitorCardAdaptivelyFillsPanelWidth(t *testing.T) {
 		t.Fatalf("expected offline monitor card to show right-aligned status and listen hint:\n%s", offlineView)
 	}
 }
+
+func TestServerSettingsValidationFocusBackButtonAndLogsFixes(t *testing.T) {
+	m := regressionServer(t, 120, 34)
+
+	// 1. 验证部署向导第1步与基础设置均拦截非法端口 99999。
+	wm := newServerModel(ServerOptions{ExecutableDir: t.TempDir(), ConfigPath: filepath.Join(t.TempDir(), "missing.json")})
+	wm.Update(tea.WindowSizeMsg{Width: 120, Height: 34})
+	wm.beginDeployWizard()
+	wm.formInputs[1].SetValue("127.0.0.1:99999")
+	wm.activateFormButton(1)
+	if wm.deploy == nil || wm.deploy.step != 1 || !strings.Contains(wm.statusToast, "1–65535") {
+		t.Fatalf("expected invalid listen port rejected on step 1: deploy=%v toast=%q", wm.deploy, wm.statusToast)
+	}
+
+	m.modal = srvModalNone
+	m.openEditSettingsModal()
+	if lIdx, ok := m.inputByKey("listen"); !ok {
+		t.Fatal("missing listen field in basic settings")
+	} else {
+		m.formInputs[lIdx].SetValue("0.0.0.0:99999")
+		m.activateFormButton(2)
+		if m.modal != srvModalEditSettings || m.formFocus < 0 || !strings.Contains(m.statusToast, "1–65535") {
+			t.Fatalf("expected invalid port rejected in basic settings: modal=%v toast=%q", m.modal, m.statusToast)
+		}
+	}
+
+	// 2. 验证高级设置点击“返回基础设置”时，不因前方空字段丢失后方已修改的有效字段。
+	m.openAdvancedSettingsModal()
+	msIdx, ok1 := m.inputByKey("limits.max_streams")
+	idleIdx, ok2 := m.inputByKey("timeouts.idle_seconds")
+	if !ok1 || !ok2 {
+		t.Fatal("missing expected keys in advanced settings")
+	}
+	m.formInputs[msIdx].SetValue("0")
+	m.formInputs[idleIdx].SetValue("321")
+	m.activateFormButton(0) // ◀ 返回基础设置
+	if m.settingsDraft == nil || m.settingsDraft.Timeouts.IdleSeconds != 321 {
+		t.Fatalf("expected valid timeout preserved when returning to basic settings: draft=%+v", m.settingsDraft)
+	}
+
+	// 3. 验证 HELLO 参数越界精确定位到对应字段。
+	m.openAdvancedSettingsModal()
+	m.formInputs[msIdx].SetValue("99")
+	m.activateFormButton(1) // 保存全部设置 ★
+	if m.modal != srvModalEditAdvancedSettings || m.formFocus >= len(m.formRows) || m.formRows[m.formFocus].inputIdx != msIdx {
+		t.Fatalf("expected focus on max_streams (%d) after HELLO range error, got row=%d toast=%q", msIdx, m.formFocus, m.statusToast)
+	}
+
+	// 4. 验证文件日志级别过滤不再误伤含 warn/error 子串的文件名，且支持时间窗筛选。
+	now := time.Now().UTC()
+	oldTs := now.Add(-2 * time.Hour).Format(time.RFC3339)
+	newTs := now.Add(-30 * time.Second).Format(time.RFC3339)
+	m.logFallback = strings.Join([]string{
+		fmt.Sprintf("time=%s level=INFO msg=done file=warning_report.txt", newTs),
+		fmt.Sprintf("time=%s level=WARN msg=slow file=old.bin", oldTs),
+		fmt.Sprintf("time=%s level=ERROR msg=fail file=new.bin", newTs),
+	}, "\n")
+	m.logMinLevel = "WARN"
+	m.logSinceIdx = 1 // 近 5 分钟
+	gotLines := m.filteredLogFallbackLines()
+	if len(gotLines) != 1 || !strings.Contains(gotLines[0], "level=ERROR") {
+		t.Fatalf("unexpected fallback log filtering result: %+v", gotLines)
+	}
+
+	// 5. 验证日志回卷重查保留 Lost 标记，且陈旧 logEpoch 轮询结果不会覆盖新筛选状态。
+	svc, err := control.StartManaged(m.opts.ConfigPath, m.cfg.StorageRoot, control.Handlers{
+		Snapshot: func() monitor.Snapshot {
+			return monitor.Snapshot{Version: monitor.Version, State: "running", Started: now}
+		},
+		Logs: func(q monitor.LogQuery) monitor.LogPage {
+			if q.After > 0 {
+				return monitor.LogPage{Last: 10, Lost: true}
+			}
+			return monitor.LogPage{
+				Last:   10,
+				Lost:   false,
+				Events: []monitor.Event{{Sequence: 10, Level: "INFO", Message: "fresh"}},
+			}
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer svc.Close()
+
+	m.page = 5
+	m.logPaused = false
+	m.logCursor = 3
+	m.logStarted = now
+	m.logEpoch = 5
+	polled, ok := m.pollRuntimeSeqCmd(0)().(serverRuntimePolledMsg)
+	if !ok || !polled.logLost {
+		t.Fatalf("expected Lost preserved across rewind re-query, got %+v", polled)
+	}
+	stale := polled
+	stale.logEpoch = 4
+	m.Update(stale)
+	if len(m.logEvents) != 0 {
+		t.Fatalf("stale logEpoch unexpectedly overwrote logEvents: %+v", m.logEvents)
+	}
+	m.Update(polled)
+	if !m.logLost || len(m.logEvents) != 1 {
+		t.Fatalf("expected fresh epoch applied with logLost=true: lost=%v events=%+v", m.logLost, m.logEvents)
+	}
+}

@@ -253,10 +253,12 @@ func (m *model) viewModal(base string) string {
 		return renderModalOverlay(base, "文件名冲突安全确认（禁止静默覆盖）", lines, "按键选择：r 自动改名 / s 跳过冲突 / Esc 取消", m)
 
 	case modalRename:
+		ri := m.renameInput
+		ri.Width = min(ri.Width, max(8, innerW-4))
 		lines := []string{
 			"为任务设置新的目标名称以继续重传（原任务保持状态不覆盖）：",
 			"",
-			m.renameInput.View(),
+			ri.View(),
 		}
 		lines = appendModalNoticeLines(lines, m.th, m.statusToast, innerW)
 		return renderModalOverlay(base, "改名另存并入队", lines, "Enter 确认入队 · Esc 取消", m)
@@ -316,10 +318,10 @@ func (m *model) identityModalMetrics() (innerW, listStartRelY, maxShow, inputRel
 	inputRows := 3 // 空行 + 提示 + 输入框
 	availList := maxBody - listStartRelY - previewRows - inputRows - len(noticeLines)
 	if len(m.idChoices) == 0 {
-		return innerW, listStartRelY, 0, listStartRelY + 1
+		return innerW, listStartRelY, 0, listStartRelY + 3
 	}
 	maxShow = max(1, min(6, min(len(m.idChoices), availList)))
-	inputRelY = listStartRelY + maxShow + previewRows + 1
+	inputRelY = listStartRelY + maxShow + previewRows + 2
 	return innerW, listStartRelY, maxShow, inputRelY
 }
 
@@ -410,14 +412,15 @@ func (m *model) buildIdentityModalContent() (title, footer string, lines []strin
 			}
 			daysLeft := int(time.Until(p.Expires).Hours() / 24)
 			expNote := fmt.Sprintf("%s (剩%d天)", p.Expires.Format("2006-01-02"), daysLeft)
+			expired := !p.Expires.IsZero() && time.Now().After(p.Expires)
 			if p.Expires.IsZero() {
 				expNote = "-"
-			} else if daysLeft < 0 {
+			} else if expired {
 				expNote = fmt.Sprintf("%s (已过期!)", p.Expires.Format("2006-01-02"))
 			}
 			expLine := truncPlainCell(fmt.Sprintf("指纹: %s · 到期: %s", fpShort, expNote), innerW)
 			switch {
-			case !p.Expires.IsZero() && daysLeft < 0:
+			case expired:
 				lines = append(lines, m.th.badgeErr.Render(expLine))
 			case !p.Expires.IsZero() && daysLeft <= 14:
 				lines = append(lines, m.th.badgeWarn.Render(expLine))
@@ -435,7 +438,7 @@ func (m *model) buildIdentityModalContent() (title, footer string, lines []strin
 			if ts, ok := m.idTestResults[p.Path]; ok {
 				switch {
 				case ts.testing:
-					connPreview = formatBusyBadge(m.th, m.spinIdx, "连通: 正在测试 mTLS 握手…", time.Time{})
+					connPreview = truncCell(formatBusyBadge(m.th, m.spinIdx, "连通: 正在测试 mTLS 握手…", time.Time{}), innerW)
 				case ts.tested && ts.err == "":
 					connPreview = m.th.badgeOk.Render(truncCell(fmt.Sprintf("连通: ✔ mTLS 握手通过（耗时 %s）", ts.latency.Round(time.Millisecond)), innerW))
 				case ts.tested && ts.err != "":

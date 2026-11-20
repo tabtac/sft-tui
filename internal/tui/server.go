@@ -3,6 +3,8 @@ package tui
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"os"
@@ -66,6 +68,7 @@ type serverConfigLoadedMsg struct {
 
 type serverRuntimePolledMsg struct {
 	seq          uint64
+	logEpoch     uint64
 	endpointRoot string
 	snap         *monitor.Snapshot
 	runtimeState string
@@ -106,6 +109,7 @@ type serverModel struct {
 
 	// 日志状态
 	logQuery     monitor.LogQuery
+	logEpoch     uint64
 	logCursor    uint64
 	logStarted   time.Time
 	logPaused    bool
@@ -323,7 +327,9 @@ func (m *serverModel) effectiveLogQuery() monitor.LogQuery {
 }
 
 func (m *serverModel) resetLogsAndPollCmd() tea.Cmd {
+	m.logEpoch++
 	m.logCursor = 0
+	m.logLost = false
 	m.logEvents = nil
 	m.logPaused = false
 	return m.pollRuntimeCmd()
@@ -341,6 +347,7 @@ func (m *serverModel) pollRuntimeSeqCmd(seq uint64) tea.Cmd {
 		diskRoot = m.cfg.StorageRoot
 	}
 	wantLogs := m.page == 5 && !m.logPaused
+	logEpoch := m.logEpoch
 	q := m.effectiveLogQuery()
 	if !wantLogs {
 		q = monitor.LogQuery{}
@@ -370,6 +377,7 @@ func (m *serverModel) pollRuntimeSeqCmd(seq uint64) tea.Cmd {
 
 		var out serverRuntimePolledMsg
 		out.seq = seq
+		out.logEpoch = logEpoch
 		out.endpointRoot = root
 		out.err = err
 		out.snap = snap
@@ -393,9 +401,12 @@ func (m *serverModel) pollRuntimeSeqCmd(seq uint64) tea.Cmd {
 				q.After = after
 				page, logErr := control.QueryLogs(cfgPath, root, q)
 				if logErr == nil && (page.Lost || after > page.Last) {
+					wasLost := page.Lost
 					q.After = 0
 					prevEvents = nil
 					page, logErr = control.QueryLogs(cfgPath, root, q)
+					out.logLost = wasLost || page.Lost
+				} else if logErr == nil {
 					out.logLost = page.Lost
 				}
 				if logErr != nil {
@@ -528,10 +539,10 @@ func (m *serverModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.trend = m.trend[len(m.trend)-120:]
 			}
 		}
-		if m.page == 5 && !m.logPaused {
+		if m.page == 5 && !m.logPaused && msg.logEpoch == m.logEpoch {
 			m.logErr = msg.logErr
 			m.logFallback = msg.logFallback
-			m.logLost = msg.logLost
+			m.logLost = m.logLost || msg.logLost
 			if msg.logErr == "" && msg.logFallback == "" {
 				m.logEvents = msg.logEvents
 				m.logCursor = msg.logLast
@@ -594,14 +605,18 @@ func (m *serverModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.err != nil {
 			if m.deploy != nil {
 				m.deploy.finishMsg = "部署已保存；导出失败：" + msg.err.Error()
-				m.openDeployStep(5)
+				if m.modal == srvModalDeployWizard && m.deploy.step == 5 {
+					m.openDeployStep(5)
+				}
 			}
 			m.setToastError("导出失败：" + msg.err.Error())
 			return m, nil
 		}
 		if m.deploy != nil {
 			m.deploy.finishMsg = "用户包已成功导出至：" + msg.outDir
-			m.openDeployStep(5)
+			if m.modal == srvModalDeployWizard && m.deploy.step == 5 {
+				m.openDeployStep(5)
+			}
 		}
 		m.setToast("用户包已导出：" + msg.outDir)
 		return m, nil
@@ -694,6 +709,9 @@ func (m *serverModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "shift+tab":
 		return m.switchPage((m.page + 5) % 6)
 	case "/":
+		if m.page != 1 && m.page != 2 && m.page != 5 {
+			return m, nil
+		}
 		m.editingQuery = true
 		m.queryMode = ""
 		switch m.page {
@@ -783,21 +801,56 @@ func (m *serverModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		users := m.filteredUsers()
 		switch k {
 		case "n":
+			if m.cfgErr != nil {
+				m.setToast("当前配置不可用，无法新建用户")
+				return m, nil
+			}
+			if m.rejectIfBusy() {
+				return m, nil
+			}
 			m.openNewUserModal()
 			return m, textinput.Blink
 		case "C":
+			if m.cfgErr != nil {
+				m.setToast("当前配置不可用，无法签发 CSR")
+				return m, nil
+			}
+			if m.rejectIfBusy() {
+				return m, nil
+			}
 			m.openCSRModal("")
 			return m, textinput.Blink
 		case "t":
+			if m.cfgErr != nil {
+				m.setToast("当前配置不可用")
+				return m, nil
+			}
+			if m.rejectIfBusy() {
+				return m, nil
+			}
 			if len(users) > 0 && m.cursors[1] < len(users) {
 				return m, m.toggleUserDisabledCmd(users[m.cursors[1]])
 			}
 		case "p":
+			if m.cfgErr != nil {
+				m.setToast("当前配置不可用")
+				return m, nil
+			}
+			if m.rejectIfBusy() {
+				return m, nil
+			}
 			if len(users) > 0 && m.cursors[1] < len(users) {
 				m.openEditPolicyModal(users[m.cursors[1]])
 				return m, textinput.Blink
 			}
 		case "w":
+			if m.cfgErr != nil {
+				m.setToast("当前配置不可用")
+				return m, nil
+			}
+			if m.rejectIfBusy() {
+				return m, nil
+			}
 			if len(users) > 0 && m.cursors[1] < len(users) {
 				u := users[m.cursors[1]]
 				if u.ExternalKey {
@@ -807,6 +860,13 @@ func (m *serverModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				return m, m.renewUserCertCmd(u)
 			}
 		case "e":
+			if m.cfgErr != nil {
+				m.setToast("当前配置不可用")
+				return m, nil
+			}
+			if m.rejectIfBusy() {
+				return m, nil
+			}
 			if len(users) > 0 && m.cursors[1] < len(users) {
 				m.openExportUserModal(users[m.cursors[1]])
 				return m, textinput.Blink
@@ -814,10 +874,12 @@ func (m *serverModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		case "g":
 			if len(users) > 0 && m.cursors[1] < len(users) {
 				u := users[m.cursors[1]]
+				m.logEpoch++
 				m.logQuery = monitor.LogQuery{User: u.UserID}
 				m.logMinLevel = ""
 				m.logSinceIdx = 0
 				m.logCursor = 0
+				m.logLost = false
 				m.logEvents = nil
 				m.logPaused = false
 				m.setToast("已按用户过滤并跳转至相关日志：" + u.UserID)
@@ -834,10 +896,12 @@ func (m *serverModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		case "g":
 			if len(tasks) > 0 && m.cursors[2] < len(tasks) {
 				t := tasks[m.cursors[2]]
+				m.logEpoch++
 				m.logQuery = monitor.LogQuery{User: t.User, File: t.File}
 				m.logMinLevel = ""
 				m.logSinceIdx = 0
 				m.logCursor = 0
+				m.logLost = false
 				m.logEvents = nil
 				m.logPaused = false
 				m.setToast(fmt.Sprintf("已跳转至 %s / %s 的相关日志", t.User, t.File))
@@ -864,11 +928,32 @@ func (m *serverModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case 3: // 证书状态
 		switch k {
 		case "K":
+			if m.cfgErr != nil {
+				m.setToast("当前配置不可用")
+				return m, nil
+			}
+			if m.rejectIfBusy() {
+				return m, nil
+			}
 			return m, m.renewCACmd()
 		case "S":
+			if m.cfgErr != nil {
+				m.setToast("当前配置不可用")
+				return m, nil
+			}
+			if m.rejectIfBusy() {
+				return m, nil
+			}
 			m.openRotateServerModal()
 			return m, textinput.Blink
 		case "C":
+			if m.cfgErr != nil {
+				m.setToast("当前配置不可用")
+				return m, nil
+			}
+			if m.rejectIfBusy() {
+				return m, nil
+			}
 			m.openCSRModal("")
 			return m, textinput.Blink
 		case "enter":
@@ -963,6 +1048,9 @@ func (m *serverModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 }
 
 func (m *serverModel) switchPage(idx int) (tea.Model, tea.Cmd) {
+	m.editingQuery = false
+	m.queryMode = ""
+	m.queryInput.Blur()
 	m.page = max(0, min(5, idx))
 	m.clampCursors()
 	if m.page == 5 {
@@ -1212,6 +1300,12 @@ func (m *serverModel) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 			_, _, topTotalH, botH := overviewLayout(m.width, bodyH)
 			rowStartY = bodyY + topTotalH + 2
 			visRows = max(1, botH-3)
+		} else if m.page == 5 {
+			m.logPaused = true
+			if m.hasLogFilters() {
+				rowStartY++
+				visRows = max(1, visRows-1)
+			}
 		}
 		relY := msg.Y - rowStartY
 		if relY >= 0 && relY < visRows {
@@ -1414,7 +1508,7 @@ func (m *serverModel) submitModalForm() (tea.Model, tea.Cmd) {
 	case srvModalNewUser:
 		name := strings.TrimSpace(m.formInputs[0].Value())
 		if !config.ValidUserPath(name) || isReservedIdentityName(name) {
-			m.setToastSticky("用户名无效（须为字母/数字/._-，且不能为系统保留名）")
+			m.setToastSticky("用户名无效（须为字母、数字、_ 或 -，且不能为系统保留名）")
 			return m, m.focusInputRow(0)
 		}
 		if existing, ok := m.findAuthorizedClient(name); ok {
@@ -1452,7 +1546,7 @@ func (m *serverModel) submitModalForm() (tea.Model, tea.Cmd) {
 	case srvModalCSR:
 		name := strings.TrimSpace(m.formInputs[0].Value())
 		if !config.ValidUserPath(name) || isReservedIdentityName(name) {
-			m.setToastSticky("用户名无效（须为字母/数字/._-，且不能为系统保留名）")
+			m.setToastSticky("用户名无效（须为字母、数字、_ 或 -，且不能为系统保留名）")
 			return m, m.focusInputRow(0)
 		}
 		renewTarget := m.targetUser != nil && (m.targetUser.UserID == name || (runtime.GOOS == "windows" && strings.EqualFold(m.targetUser.UserID, name)))
@@ -1472,10 +1566,12 @@ func (m *serverModel) submitModalForm() (tea.Model, tea.Cmd) {
 			m.setToastSticky(err.Error())
 			return m, m.focusInputRow(2)
 		}
-		if _, err := security.ReadCSR(csr); err != nil {
+		parsedCSR, err := security.ReadCSR(csr)
+		if err != nil {
 			m.setToastSticky(err.Error())
 			return m, m.focusInputRow(1)
 		}
+		csrSum := sha256.Sum256(parsedCSR.Raw)
 		var expected *config.AuthorizedClient
 		if renewTarget {
 			uCopy := *m.targetUser
@@ -1487,6 +1583,7 @@ func (m *serverModel) submitModalForm() (tea.Model, tea.Cmd) {
 		m.targetUser = nil
 		o := m.certBaseOptions(name)
 		o.CSR = csr
+		o.CSRFingerprint = hex.EncodeToString(csrSum[:])
 		o.Days = days
 		o.Renew = renewTarget
 		o.ExpectedUser = expected

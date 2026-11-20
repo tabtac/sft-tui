@@ -311,6 +311,32 @@ func Active(executableDir string) (config.Client, error) {
 	return loadActive(filepath.Join(executableDir, ".sft"))
 }
 
+// ActiveProfileInfo 返回当前激活的身份配置及已持久化的 Profile ID 与自定义显示标签。
+func ActiveProfileInfo(executableDir string) (cfg config.Client, activeID, label string, err error) {
+	home := filepath.Join(executableDir, ".sft")
+	data, err := pal.ReadSmall(filepath.Join(home, "active"), 256)
+	if err != nil {
+		return config.Client{}, "", "", err
+	}
+	id := strings.TrimSpace(string(data))
+	pPath, err := profilePath(home, id)
+	if err != nil {
+		return config.Client{}, "", "", err
+	}
+	cfg, err = loadProfile(pPath)
+	if os.IsNotExist(err) {
+		return cfg, "", "", fmt.Errorf("保存的身份材料缺失，请重新导入：%v", err)
+	}
+	if err != nil {
+		return config.Client{}, "", "", err
+	}
+	labels, lErr := readLabels(home)
+	if lErr == nil {
+		label = labels[id]
+	}
+	return cfg, id, label, nil
+}
+
 func normalizeLabel(label string) (string, error) {
 	trimmed := strings.TrimSpace(label)
 	if trimmed == "" || len([]rune(trimmed)) > 80 || strings.IndexFunc(trimmed, unicode.IsControl) >= 0 {

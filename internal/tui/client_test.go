@@ -796,3 +796,122 @@ func TestClientMissingConfigOpensIdentityPicker(t *testing.T) {
 		t.Fatalf("missing config view did not preserve onboarding guidance:\n%s", view)
 	}
 }
+
+func TestClientStartupLoadsCustomLabelAndStagesUnimportedLabel(t *testing.T) {
+	base := t.TempDir()
+	certsDir := filepath.Join(base, "certs")
+	if err := testcert.Generate(certsDir); err != nil {
+		t.Fatal(err)
+	}
+	if err := testcert.IssueClient(certsDir, "alice"); err != nil {
+		t.Fatal(err)
+	}
+	if err := testcert.IssueClient(certsDir, "bob"); err != nil {
+		t.Fatal(err)
+	}
+	srcDir := filepath.Join(base, "src")
+	if err := os.MkdirAll(srcDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.DefaultClient()
+	cfg.ServerAddress = "127.0.0.1:7443"
+	cfg.ServerName = "localhost"
+	cfg.StateDir = filepath.Join(base, "state")
+	cfg.TLS = config.TLSFiles{
+		CACertificate: filepath.Join(certsDir, "ca.pem"),
+		Certificate:   filepath.Join(certsDir, "alice.pem"),
+		PrivateKey:    filepath.Join(certsDir, "alice-key.pem"),
+	}
+	srcCfgPath := filepath.Join(srcDir, "client.alice.local.json")
+	if err := config.SaveJSON(srcCfgPath, cfg); err != nil {
+		t.Fatal(err)
+	}
+
+	exeDir := filepath.Join(base, "exe")
+	prof, err := identity.PrepareImport(exeDir, base, srcCfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := identity.SelectPrepared(exeDir, prof, "自定义别名A"); err != nil {
+		t.Fatal(err)
+	}
+
+	// 启动加载已保存身份时应带出自定义标签而非回退为 user@host。
+	m := newModel(Options{ExecutableDir: exeDir, Directory: base})
+	m.Init()
+	actMsg, ok := m.initIdentityCmd()().(identityActivatedMsg)
+	if !ok || actMsg.err != nil {
+		t.Fatalf("expected active profile load success, got %#v", actMsg)
+	}
+	if actMsg.activeID != prof.ID || actMsg.label != "自定义别名A" {
+		t.Fatalf("unexpected startup profile metadata: id=%q label=%q", actMsg.activeID, actMsg.label)
+	}
+	m.Update(actMsg)
+	m.cleanup()
+	if m.identityLabel != "自定义别名A" || m.activeID != prof.ID {
+		t.Fatalf("expected model to adopt saved label, got id=%q label=%q", m.activeID, m.identityLabel)
+	}
+
+	// 未导入身份修改标签后立即激活，应保留暂存标签。
+	unimported := filepath.Join(base, "client.new.json")
+	cfg2 := cfg
+	cfg2.StateDir = filepath.Join(base, "state2")
+	if err := config.SaveJSON(unimported, cfg2); err != nil {
+		t.Fatal(err)
+	}
+	m2 := newModel(Options{ExecutableDir: filepath.Join(base, "exe2"), Directory: base})
+	m2.modal = modalIdentity
+	m2.idChoices = []identityChoice{{
+		profile: identity.Profile{Label: "orig-label", Path: unimported, Config: cfg2},
+	}}
+	m2.idCursor = 0
+	m2.editingIDLabel = true
+	m2.idLabelInput.SetValue("我的生产客户端")
+	m2.handleModalKey(tea.KeyMsg{Type: tea.KeyEnter})
+	if m2.idChoices[0].profile.Label != "我的生产客户端" {
+		t.Fatalf("staged label not applied to choice: %q", m2.idChoices[0].profile.Label)
+	}
+	raw := m2.activateChoiceCmd(m2.idChoices[0], "")()
+	act2, ok := raw.(identityActivatedMsg)
+	if !ok || act2.err != nil || act2.label != "我的生产客户端" {
+		t.Fatalf("staged label lost during import activation: %#v", raw)
+	}
+	m2.Update(act2)
+	m2.cleanup()
+}
+
+func TestClientOpBusyPreservedAcrossSingleOpAndCrossDirConflictScan(t *testing.T) {
+	m := newModel(Options{ExecutableDir: t.TempDir(), Directory: t.TempDir()})
+	m.opBusy = true
+	m.opLabel = "正在全部暂停"
+	m.opStart = time.Now()
+	m.Update(batchOpResultMsg{notice: "单条取消", isGlobalOp: false})
+	if !m.opBusy {
+		t.Fatal("non-global batchOpResultMsg prematurely cleared opBusy")
+	}
+	m.Update(batchOpResultMsg{notice: "已全部暂停", isGlobalOp: true})
+	if m.opBusy || m.opLabel != "" {
+		t.Fatalf("global batchOpResultMsg failed to clear opBusy/opLabel: busy=%v label=%q", m.opBusy, m.opLabel)
+	}
+
+	// 验证目标目录与当前视图目录不同（如历史任务重试）时，自动改名应扫描目标目录磁盘文件。
+	targetDir := t.TempDir()
+	for _, name := range []string{"report.bin", "report (1).bin"} {
+		if err := os.WriteFile(filepath.Join(targetDir, name), []byte("x"), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	m.localEntries = nil // 模拟当前浏览目录与目标目录不同
+	m.pendingBatchDir = protocol.DirectionDownload
+	m.pendingSpecs = []queue.Spec{{
+		Direction: protocol.DirectionDownload,
+		Remote:    "report.bin",
+		Path:      filepath.Join(targetDir, "report.bin"),
+	}}
+	m.conflictNames = []string{"report.bin"}
+	renamed := m.resolveConflictsAutoRename()
+	want := filepath.Join(targetDir, "report (2).bin")
+	if len(renamed) != 1 || renamed[0].Path != want {
+		t.Fatalf("expected target dir scan to pick %q, got %+v", want, renamed)
+	}
+}

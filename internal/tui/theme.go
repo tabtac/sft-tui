@@ -59,7 +59,7 @@ func saveUIPrefsCmd(path string, prefs uiPrefs) tea.Cmd {
 	}
 }
 
-func tabHitIndex(x, startOffset int, labels []string, th theme, activeIdx int) int {
+func tabHitIndexGap(x, startOffset, gap int, labels []string, th theme, activeIdx int) int {
 	pos := startOffset
 	for i, lbl := range labels {
 		var w int
@@ -71,9 +71,13 @@ func tabHitIndex(x, startOffset int, labels []string, th theme, activeIdx int) i
 		if x >= pos && x < pos+w {
 			return i
 		}
-		pos += w
+		pos += w + gap
 	}
 	return -1
+}
+
+func tabHitIndex(x, startOffset int, labels []string, th theme, activeIdx int) int {
+	return tabHitIndexGap(x, startOffset, 0, labels, th, activeIdx)
 }
 
 type theme struct {

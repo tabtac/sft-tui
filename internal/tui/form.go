@@ -269,6 +269,36 @@ func (f *formState) parseSizeInput(inputIdx int, errLabel string) (uint64, error
 	return v, nil
 }
 
+func (f *formState) hasFocusableInputRow() bool {
+	for _, r := range f.formRows {
+		if r.kind != formRowNote {
+			return true
+		}
+	}
+	return false
+}
+
+func (f *formState) stepFocusableRow(from, dir int) (int, bool) {
+	n := len(f.formRows)
+	hasBtns := len(f.formButtons) > 0
+	maxSlot := n - 1
+	if hasBtns {
+		maxSlot = n
+	}
+	if maxSlot < 0 || (dir != -1 && dir != 1) {
+		return from, false
+	}
+	for cur := from + dir; cur >= 0 && cur <= maxSlot; cur += dir {
+		if cur == n && hasBtns {
+			return cur, true
+		}
+		if cur >= 0 && cur < n && f.formRows[cur].kind != formRowNote {
+			return cur, true
+		}
+	}
+	return from, false
+}
+
 func (f *formState) nextFocusableRow(from, dir int) int {
 	n := len(f.formRows)
 	hasBtns := len(f.formButtons) > 0
@@ -382,22 +412,41 @@ func (m *serverModel) setRowFocus(rowIdx, sub int) {
 	m.ensureFormRowVisible()
 }
 
+func (m *serverModel) formLayoutParams() (innerW, rowBudget, popupH int) {
+	_, innerW = modalBoxDimensions(m.width)
+	noticeLines := m.modalFormNoticeLines(innerW)
+	btnBlock, _ := m.layoutFormButtons(innerW, 0)
+	var maxPopupH int
+	rowBudget, maxPopupH = m.formRowBudget(innerW, len(noticeLines), len(btnBlock))
+	opts := m.currentDropdownOptions()
+	if m.dropdownOpen {
+		popupH = min(len(opts), maxPopupH)
+	}
+	return innerW, rowBudget, popupH
+}
+
 func (m *serverModel) ensureFormRowVisible() {
 	if len(m.formRows) == 0 {
 		m.formScroll = 0
 		return
 	}
-	_, innerW := modalBoxDimensions(m.width)
-	noticeLines := m.modalFormNoticeLines(innerW)
-	btnBlock, _ := m.layoutFormButtons(innerW, 0)
-	rowBudget, maxPopupH := m.formRowBudget(innerW, len(noticeLines), len(btnBlock))
-	opts := m.currentDropdownOptions()
-	popupH := 0
-	if m.dropdownOpen {
-		popupH = min(len(opts), maxPopupH)
-	}
+	innerW, rowBudget, popupH := m.formLayoutParams()
 	start, _ := m.solveFormVisibleRange(innerW, rowBudget, popupH)
 	m.formScroll = start
+}
+
+func (m *serverModel) scrollFormBy(delta int) {
+	n := len(m.formRows)
+	if n == 0 {
+		m.formScroll = 0
+		return
+	}
+	innerW, rowBudget, popupH := m.formLayoutParams()
+	maxStart := n - 1
+	for maxStart > 0 && m.formFitEnd(maxStart-1, innerW, rowBudget, popupH) == n {
+		maxStart--
+	}
+	m.formScroll = max(0, min(maxStart, m.formScroll+delta))
 }
 
 func (m *serverModel) focusInputRow(inputIdx int) tea.Cmd {
@@ -545,22 +594,68 @@ func (m *serverModel) handleFormKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, textinput.Blink
 
 	case "down":
-		if hasBtns && m.formFocus == nRows {
+		if !m.hasFocusableInputRow() {
+			m.scrollFormBy(1)
 			return m, nil
 		}
-		next := m.nextFocusableRow(m.formFocus, 1)
-		m.setRowFocus(next, 0)
-		return m, textinput.Blink
+		if next, ok := m.stepFocusableRow(m.formFocus, 1); ok {
+			m.setRowFocus(next, 0)
+			return m, textinput.Blink
+		}
+		m.scrollFormBy(1)
+		return m, nil
 
 	case "up":
-		if m.formFocus == nRows && hasBtns {
-			prev := m.nextFocusableRow(nRows, -1)
+		if !m.hasFocusableInputRow() {
+			m.scrollFormBy(-1)
+			return m, nil
+		}
+		if prev, ok := m.stepFocusableRow(m.formFocus, -1); ok {
 			m.setRowFocus(prev, 0)
 			return m, textinput.Blink
 		}
-		prev := m.nextFocusableRow(m.formFocus, -1)
-		m.setRowFocus(prev, 0)
-		return m, textinput.Blink
+		m.scrollFormBy(-1)
+		return m, nil
+
+	case "pgup":
+		if !m.hasFocusableInputRow() {
+			m.scrollFormBy(-5)
+			return m, nil
+		}
+		cur := m.formFocus
+		for i := 0; i < 5; i++ {
+			prev, ok := m.stepFocusableRow(cur, -1)
+			if !ok {
+				break
+			}
+			cur = prev
+		}
+		if cur != m.formFocus {
+			m.setRowFocus(cur, 0)
+			return m, textinput.Blink
+		}
+		m.scrollFormBy(-5)
+		return m, nil
+
+	case "pgdown":
+		if !m.hasFocusableInputRow() {
+			m.scrollFormBy(5)
+			return m, nil
+		}
+		cur := m.formFocus
+		for i := 0; i < 5; i++ {
+			next, ok := m.stepFocusableRow(cur, 1)
+			if !ok {
+				break
+			}
+			cur = next
+		}
+		if cur != m.formFocus {
+			m.setRowFocus(cur, 0)
+			return m, textinput.Blink
+		}
+		m.scrollFormBy(5)
+		return m, nil
 
 	case "left":
 		if m.formFocus == nRows && hasBtns {
@@ -751,37 +846,35 @@ func (m *serverModel) formRowBudget(innerW, noticeH, btnH int) (rowBudget, maxPo
 	return rowBudget, maxPopupH
 }
 
+func (m *serverModel) formFitEnd(s, innerW, rowBudget, popupH int) int {
+	n := len(m.formRows)
+	used := 0
+	e := s
+	for e < n {
+		h := m.formRowBaseHeight(m.formRows[e], innerW)
+		if m.dropdownOpen && m.dropdownRow == e {
+			h += popupH
+		}
+		ind := 0
+		if s > 0 {
+			ind++
+		}
+		if e+1 < n {
+			ind++
+		}
+		if e > s && used+h+ind > rowBudget {
+			break
+		}
+		used += h
+		e++
+	}
+	return e
+}
+
 func (m *serverModel) solveFormVisibleRange(innerW, rowBudget, popupH int) (start, end int) {
 	n := len(m.formRows)
 	if n == 0 {
 		return 0, 0
-	}
-	rowH := func(idx int) int {
-		h := m.formRowBaseHeight(m.formRows[idx], innerW)
-		if m.dropdownOpen && m.dropdownRow == idx {
-			h += popupH
-		}
-		return h
-	}
-	fitEnd := func(s int) int {
-		used := 0
-		e := s
-		for e < n {
-			h := rowH(e)
-			ind := 0
-			if s > 0 {
-				ind++
-			}
-			if e+1 < n {
-				ind++
-			}
-			if e > s && used+h+ind > rowBudget {
-				break
-			}
-			used += h
-			e++
-		}
-		return e
 	}
 
 	target := m.formFocus
@@ -789,17 +882,17 @@ func (m *serverModel) solveFormVisibleRange(innerW, rowBudget, popupH int) (star
 		target = m.dropdownRow
 	} else if target < 0 || target >= n {
 		s := max(0, min(n-1, m.formScroll))
-		return s, fitEnd(s)
+		return s, m.formFitEnd(s, innerW, rowBudget, popupH)
 	}
 
 	s := max(0, min(n-1, m.formScroll))
 	if target < s {
 		s = target
 	}
-	e := fitEnd(s)
+	e := m.formFitEnd(s, innerW, rowBudget, popupH)
 	for s < target && target >= e {
 		s++
-		e = fitEnd(s)
+		e = m.formFitEnd(s, innerW, rowBudget, popupH)
 	}
 	return s, e
 }
@@ -1007,8 +1100,15 @@ func (m *serverModel) handleModalMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 			}
 			return m, nil
 		}
-		prev := m.nextFocusableRow(m.formFocus, -1)
-		m.setRowFocus(prev, 0)
+		if !m.hasFocusableInputRow() {
+			m.scrollFormBy(-1)
+			return m, nil
+		}
+		if prev, ok := m.stepFocusableRow(m.formFocus, -1); ok {
+			m.setRowFocus(prev, 0)
+		} else {
+			m.scrollFormBy(-1)
+		}
 		return m, nil
 	}
 	if msg.Button == tea.MouseButtonWheelDown {
@@ -1018,8 +1118,15 @@ func (m *serverModel) handleModalMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 			}
 			return m, nil
 		}
-		next := m.nextFocusableRow(m.formFocus, 1)
-		m.setRowFocus(next, 0)
+		if !m.hasFocusableInputRow() {
+			m.scrollFormBy(1)
+			return m, nil
+		}
+		if next, ok := m.stepFocusableRow(m.formFocus, 1); ok {
+			m.setRowFocus(next, 0)
+		} else {
+			m.scrollFormBy(1)
+		}
 		return m, nil
 	}
 	if msg.Button != tea.MouseButtonLeft {

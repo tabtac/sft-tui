@@ -331,38 +331,113 @@ func (m *serverModel) hasLogFilters() bool {
 	return m.logMinLevel != "" || m.logQuery.User != "" || m.logQuery.File != "" || m.logQuery.Text != "" || m.logSinceIdx != 0
 }
 
+func parseFallbackLogLevel(ln string) int {
+	upper := strings.ToUpper(ln)
+	for _, kv := range []struct {
+		tok string
+		lvl int
+	}{
+		{"LEVEL=ERROR", 3},
+		{"[ERROR]", 3},
+		{"LEVEL=WARN", 2},
+		{"[WARN]", 2},
+		{"LEVEL=INFO", 1},
+		{"[INFO]", 1},
+		{"LEVEL=DEBUG", 0},
+		{"[DEBUG]", 0},
+	} {
+		search := 0
+		for {
+			off := strings.Index(upper[search:], kv.tok)
+			if off < 0 {
+				break
+			}
+			idx := search + off
+			search = idx + len(kv.tok)
+			if kv.tok[0] != '[' && idx > 0 {
+				prev := upper[idx-1]
+				if prev != ' ' && prev != '\t' && prev != '"' {
+					continue
+				}
+			}
+			if idx+len(kv.tok) < len(upper) {
+				next := upper[idx+len(kv.tok)]
+				if next != ' ' && next != '\t' && next != '"' && next != ':' {
+					continue
+				}
+			}
+			return kv.lvl
+		}
+	}
+	return -1
+}
+
+func parseFallbackLogTime(ln string) time.Time {
+	var raw string
+	if idx := strings.Index(ln, "time="); idx >= 0 && (idx == 0 || ln[idx-1] == ' ' || ln[idx-1] == '\t') {
+		rest := ln[idx+len("time="):]
+		if end := strings.IndexAny(rest, " \t"); end >= 0 {
+			rest = rest[:end]
+		}
+		raw = strings.Trim(rest, `"`)
+	} else {
+		fields := strings.Fields(ln)
+		if len(fields) > 0 {
+			raw = strings.Trim(fields[0], `"`)
+		}
+	}
+	if raw == "" {
+		return time.Time{}
+	}
+	for _, layout := range []string{time.RFC3339Nano, time.RFC3339} {
+		if t, err := time.Parse(layout, raw); err == nil {
+			return t
+		}
+	}
+	return time.Time{}
+}
+
 func (m *serverModel) filteredLogFallbackLines() []string {
 	trimmed := strings.TrimRight(m.logFallback, "\n")
 	if trimmed == "" {
 		return nil
 	}
 	raw := strings.Split(trimmed, "\n")
-	if m.logMinLevel == "" && m.logQuery.User == "" && m.logQuery.File == "" && m.logQuery.Text == "" {
+	if m.logMinLevel == "" && m.logQuery.User == "" && m.logQuery.File == "" && m.logQuery.Text == "" && m.logSinceIdx == 0 {
 		return raw
 	}
 	var out []string
-	minLvl := strings.ToUpper(strings.TrimSpace(m.logMinLevel))
+	minReq := -1
+	switch strings.ToUpper(strings.TrimSpace(m.logMinLevel)) {
+	case "INFO":
+		minReq = 1
+	case "WARN":
+		minReq = 2
+	case "ERROR":
+		minReq = 3
+	}
+	var cutoff time.Time
+	switch m.logSinceIdx {
+	case 1:
+		cutoff = time.Now().Add(-5 * time.Minute)
+	case 2:
+		cutoff = time.Now().Add(-1 * time.Hour)
+	case 3:
+		cutoff = time.Now().Add(-24 * time.Hour)
+	}
 	u := strings.ToLower(strings.TrimSpace(m.logQuery.User))
 	f := strings.ToLower(strings.TrimSpace(m.logQuery.File))
 	txt := strings.ToLower(strings.TrimSpace(m.logQuery.Text))
 	for _, ln := range raw {
-		low := strings.ToLower(ln)
-		if minLvl != "" {
-			switch minLvl {
-			case "WARN":
-				if !strings.Contains(low, "warn") && !strings.Contains(low, "error") {
-					continue
-				}
-			case "ERROR":
-				if !strings.Contains(low, "error") {
-					continue
-				}
-			case "INFO":
-				if strings.Contains(low, "level=debug") || strings.Contains(low, "[debug]") {
-					continue
-				}
+		if minReq >= 0 && parseFallbackLogLevel(ln) < minReq {
+			continue
+		}
+		if !cutoff.IsZero() {
+			if ts := parseFallbackLogTime(ln); !ts.IsZero() && ts.Before(cutoff) {
+				continue
 			}
 		}
+		low := strings.ToLower(ln)
 		if u != "" && !strings.Contains(low, u) {
 			continue
 		}
@@ -855,10 +930,14 @@ func (m *serverModel) settingsLines() []string {
 	}
 	diffTag := m.th.badgeMuted.Render("服务当前离线（按 [m]/[a] 修改配置，启动服务后生效）")
 	if hasRt {
+		needRestart := config.RestartRequired(rt, c)
+		needHot := !config.HotEqual(rt, c)
 		switch {
-		case config.RestartRequired(rt, c):
+		case needRestart && needHot:
+			diffTag = m.th.badgeWarn.Render("⚠ 同时存在待热加载和待重启生效的变更（按 [A] 可热加载部分，其余需重启）")
+		case needRestart:
 			diffTag = m.th.badgeWarn.Render("⚠ 存在待重启生效的变更（请择机重启服务）")
-		case !config.HotEqual(rt, c):
+		case needHot:
 			diffTag = m.th.badgeWarn.Render("⚠ 存在待热加载的变更（按 [A] 立即热加载）")
 		default:
 			diffTag = m.th.badgeOk.Render("✔ 磁盘配置与运行实例一致")

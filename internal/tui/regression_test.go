@@ -2,11 +2,9 @@ package tui
 
 import (
 	"bytes"
-	"crypto/sha256"
 	"fmt"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"testing"
 	"unicode"
@@ -229,21 +227,14 @@ func TestRegressionBandwidthReloadFailureIsReported(t *testing.T) {
 	proposed.GlobalBandwidth = &bandwidth
 	m.settingsExpected = before
 
-	// A malformed runtime location is a real, deterministic reload failure.
-	// It is rejected before dialing any socket, including on Windows.
-	absConfig, err := filepath.Abs(m.opts.ConfigPath)
+	// Start a managed local IPC control service that deterministically rejects Reload.
+	svc, err := control.StartManaged(m.opts.ConfigPath, before.StorageRoot, control.Handlers{
+		Reload: func() error { return fmt.Errorf("simulated reload failure") },
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	key := absConfig
-	if runtime.GOOS == "windows" {
-		key = strings.ToLower(key)
-	}
-	digest := sha256.Sum256([]byte(key))
-	hint := filepath.Join(filepath.Dir(absConfig), fmt.Sprintf(".sftd-runtime-%x.json", digest[:12]))
-	if err := os.WriteFile(hint, []byte("{broken-location"), 0600); err != nil {
-		t.Fatal(err)
-	}
+	defer svc.Close()
 	if _, err := control.Reload(m.opts.ConfigPath, before.StorageRoot); err == nil {
 		t.Fatal("fixture did not cause a reload failure")
 	}

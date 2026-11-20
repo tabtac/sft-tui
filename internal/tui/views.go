@@ -85,12 +85,16 @@ func (m *model) renderHeader() string {
 func (m *model) renderSubHeader() string {
 	pathView := m.th.badgeMuted.Render("目录: ") + truncPlainCell(m.localDir, max(12, m.width/3))
 	if m.editingPath {
-		pathView = m.pathInput.View()
+		pi := m.pathInput
+		pi.Width = min(42, max(10, m.width/2-4))
+		pathView = pi.View()
 	}
 
 	searchView := m.th.badgeMuted.Render("筛选(/): ")
 	if m.editingSearch {
-		searchView += m.searchInput.View()
+		si := m.searchInput
+		si.Width = min(42, max(10, m.width/3-4))
+		searchView += si.View()
 	} else if m.query != "" {
 		searchView += m.th.badgeOk.Render(truncPlainCell(m.query, 24))
 	} else {

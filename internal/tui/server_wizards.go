@@ -17,9 +17,23 @@ import (
 	"sft-tui/internal/config"
 	"sft-tui/internal/control"
 	"sft-tui/internal/progress"
+	"sft-tui/internal/protocol"
+	"sft-tui/internal/security"
 	"sft-tui/internal/service"
 	"sft-tui/internal/setup"
 )
+
+func validateListenAddr(addr string) (string, int, error) {
+	host, portStr, err := net.SplitHostPort(strings.TrimSpace(addr))
+	if err != nil || strings.TrimSpace(host) == "" || portStr == "" {
+		return "", 0, fmt.Errorf("监听地址须为 IP:端口（如 0.0.0.0:7443）")
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil || port < 1 || port > 65535 {
+		return "", 0, fmt.Errorf("监听端口须为 1–65535 的整数")
+	}
+	return host, port, nil
+}
 
 type deployInitDoneMsg struct {
 	d       setup.Deployment
@@ -158,9 +172,11 @@ func (m *serverModel) openDeployStep(step int) {
 					m.setToastSticky("跨主机地址请将部署场景切换为「局域网 / 跨主机部署」")
 					return m, m.focusSelectRow(sceneIdx)
 				}
-				if _, lport, err := net.SplitHostPort(w.d.Listen); err != nil || lport == "" {
-					m.setToastSticky("监听地址格式无效，须为 IP:端口（如 0.0.0.0:7443）")
-					return m, m.focusInputRow(listenIdx)
+				if w.d.Listen != "" {
+					if _, _, err := validateListenAddr(w.d.Listen); err != nil {
+						m.setToastSticky(err.Error())
+						return m, m.focusInputRow(listenIdx)
+					}
 				}
 				baseKey := fmt.Sprintf("%d:%s", w.scene, w.d.Address)
 				if w.addrBase != baseKey {
@@ -245,8 +261,8 @@ func (m *serverModel) openDeployStep(step int) {
 
 		capture3 := func(validateNums bool) (int, error) {
 			w.d.User = strings.TrimSpace(m.formInputs[userIdx].Value())
-			if validateNums && !config.ValidUserPath(w.d.User) {
-				return userIdx, fmt.Errorf("初始授权用户名无效（须为字母/数字/._-，且不能为系统保留名）")
+			if validateNums && (!config.ValidUserPath(w.d.User) || isReservedIdentityName(w.d.User)) {
+				return userIdx, fmt.Errorf("初始授权用户名无效（须为字母、数字、_ 或 -，且不能为系统保留名）")
 			}
 			if w.advanced {
 				w.d.CertDir = strings.TrimSpace(m.formInputs[certIdx].Value())
@@ -262,6 +278,19 @@ func (m *serverModel) openDeployStep(step int) {
 					}
 					if w.d.ServerName == "" {
 						return snameIdx, fmt.Errorf("客户端校验名称 (SAN) 不能为空")
+					}
+					if strings.Contains(w.d.ServerName, ",") || (strings.Contains(w.d.ServerName, ":") && net.ParseIP(w.d.ServerName) == nil) {
+						return snameIdx, fmt.Errorf("客户端校验名称 (SAN) 须为单个域名或 IP")
+					}
+					_, snameIPs, err := security.ParseServerNames(w.d.ServerName)
+					if err != nil {
+						return snameIdx, err
+					}
+					if len(snameIPs) == 1 && snameIPs[0].IsUnspecified() {
+						return snameIdx, fmt.Errorf("客户端校验名称 (SAN) 不能为通配地址")
+					}
+					if _, _, err := security.ParseServerNames(w.d.Hosts); err != nil {
+						return sanIdx, err
 					}
 				}
 				if d, err := parseStrictCertDays(m.formInputs[daysIdx].Value()); err == nil {
@@ -678,8 +707,8 @@ func (m *serverModel) rebuildBasicSettingsForm() {
 		c.Listen = strings.TrimSpace(m.formInputs[listenIdx].Value())
 		c.StorageRoot = strings.TrimSpace(m.formInputs[storageIdx].Value())
 		if strict {
-			if _, _, err := net.SplitHostPort(c.Listen); err != nil {
-				return listenIdx, fmt.Errorf("监听地址须为 IP:端口")
+			if _, _, err := validateListenAddr(c.Listen); err != nil {
+				return listenIdx, err
 			}
 			if c.StorageRoot == "" {
 				return storageIdx, fmt.Errorf("存储根目录不能为空")
@@ -812,36 +841,45 @@ func (m *serverModel) openAdvancedSettingsModal() {
 		}
 	}
 
-	applyAdv := func() (int, error) {
+	applyAdv := func(strict bool) (int, error) {
 		for i, f := range fields {
 			if isSize[i] {
 				v, err := m.parseSizeInput(idxMap[i], f.Path)
 				if err != nil {
-					return idxMap[i], err
+					if strict {
+						return idxMap[i], err
+					}
+					continue
 				}
 				if err := f.Set(strconv.FormatUint(v, 10)); err != nil {
-					return idxMap[i], err
+					if strict {
+						return idxMap[i], err
+					}
 				}
 			} else {
 				if err := f.Set(m.formInputs[idxMap[i]].Value()); err != nil {
-					return idxMap[i], err
+					if strict {
+						return idxMap[i], err
+					}
 				}
 			}
 		}
-		if err := c.ValidateDraft(); err != nil {
-			return m.settingsValidationFocus(*c, err, idxMap[0]), err
+		if strict {
+			if err := c.ValidateDraft(); err != nil {
+				return m.settingsValidationFocus(*c, err, idxMap[0]), err
+			}
 		}
 		return -1, nil
 	}
 
 	m.formButtons = []formButton{
 		{label: "◀ 返回基础设置", onClick: func() (tea.Model, tea.Cmd) {
-			_, _ = applyAdv()
+			_, _ = applyAdv(false)
 			m.rebuildBasicSettingsForm()
 			return m, textinput.Blink
 		}},
 		{label: "保存全部设置 ★", primary: true, onClick: func() (tea.Model, tea.Cmd) {
-			if badIdx, err := applyAdv(); err != nil {
+			if badIdx, err := applyAdv(true); err != nil {
 				m.setToastSticky(err.Error())
 				return m, m.focusInputRow(badIdx)
 			}
@@ -899,11 +937,11 @@ func (m *serverModel) settingsValidationFocus(c config.Server, err error, fallba
 	case strings.Contains(msg, "全局带宽"):
 		if c.GlobalBandwidth != nil {
 			switch {
-			case c.GlobalBandwidth.UploadBytesPerSecond == 0:
+			case c.GlobalBandwidth.UploadBytesPerSecond == 0 || c.GlobalBandwidth.UploadBytesPerSecond > 1<<53:
 				if idx, ok := pick("global_bandwidth.upload"); ok {
 					return idx
 				}
-			case c.GlobalBandwidth.DownloadBytesPerSecond == 0:
+			case c.GlobalBandwidth.DownloadBytesPerSecond == 0 || c.GlobalBandwidth.DownloadBytesPerSecond > 1<<53:
 				if idx, ok := pick("global_bandwidth.download"); ok {
 					return idx
 				}
@@ -911,15 +949,18 @@ func (m *serverModel) settingsValidationFocus(c config.Server, err error, fallba
 				if idx, ok := pick("global_bandwidth.burst"); ok {
 					return idx
 				}
+				if idx, ok := pick("limits.chunk_size"); ok {
+					return idx
+				}
 			}
 		}
 	case strings.Contains(msg, "突发量"), strings.Contains(msg, "带宽必须为正"):
 		switch {
-		case c.Bandwidth.UploadBytesPerSecond == 0:
+		case c.Bandwidth.UploadBytesPerSecond == 0 || c.Bandwidth.UploadBytesPerSecond > 1<<53:
 			if idx, ok := pick("bandwidth.upload_bytes_per_second"); ok {
 				return idx
 			}
-		case c.Bandwidth.DownloadBytesPerSecond == 0:
+		case c.Bandwidth.DownloadBytesPerSecond == 0 || c.Bandwidth.DownloadBytesPerSecond > 1<<53:
 			if idx, ok := pick("bandwidth.download_bytes_per_second"); ok {
 				return idx
 			}
@@ -927,18 +968,26 @@ func (m *serverModel) settingsValidationFocus(c config.Server, err error, fallba
 			if idx, ok := pick("bandwidth.burst_bytes"); ok {
 				return idx
 			}
+			if idx, ok := pick("limits.chunk_size"); ok {
+				return idx
+			}
 		}
 	case strings.Contains(msg, "日志文件大小"):
 		if idx, ok := pick("logging.max_file_bytes"); ok {
 			return idx
 		}
-	case strings.Contains(msg, "分块"), strings.Contains(msg, "窗口"):
-		if c.Limits.MaxStreams <= 0 {
+	case strings.Contains(msg, "分块"), strings.Contains(msg, "窗口"), strings.Contains(msg, "HELLO"):
+		if c.Limits.MaxStreams < protocol.MinStreams || c.Limits.MaxStreams > protocol.MaxStreams {
 			if idx, ok := pick("limits.max_streams"); ok {
 				return idx
 			}
 		}
-		if c.Limits.WindowSize < c.Limits.ChunkSize || c.Limits.WindowSize <= 0 {
+		if c.Limits.ChunkSize < protocol.MinChunkSize || c.Limits.ChunkSize > protocol.MaxChunkSize {
+			if idx, ok := pick("limits.chunk_size"); ok {
+				return idx
+			}
+		}
+		if c.Limits.WindowSize < protocol.MinWindowSize || c.Limits.WindowSize > protocol.MaxWindowSize || c.Limits.WindowSize < c.Limits.ChunkSize {
 			if idx, ok := pick("limits.window_size"); ok {
 				return idx
 			}

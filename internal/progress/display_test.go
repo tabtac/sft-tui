@@ -6,6 +6,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/charmbracelet/x/ansi"
+
 	"sft-tui/internal/queue"
 )
 
@@ -88,5 +90,37 @@ func TestProgressZeroByteAndOverflowRemainBounded(t *testing.T) {
 				t.Errorf("progress missing expected percentage %s: %q", tc.percent, status.String())
 			}
 		})
+	}
+}
+
+func TestDisplayWideRuneAlignmentAndPausedFinishPhase(t *testing.T) {
+	var status, results bytes.Buffer
+	d, err := New("always", &status, &results)
+	if err != nil {
+		t.Fatal(err)
+	}
+	d.Start(0, "中文测试文件.bin")
+	d.Start(1, "ascii-name.bin")
+	d.Update(0, 50, 100, queue.Paused)
+	d.Update(1, 50, 100, queue.Transferring)
+
+	d.mu.Lock()
+	line0 := d.line(d.entries[0])
+	line1 := d.line(d.entries[1])
+	d.mu.Unlock()
+	idx0 := strings.Index(line0, " [")
+	idx1 := strings.Index(line1, " [")
+	if idx0 < 0 || idx1 < 0 {
+		t.Fatalf("missing progress bar in rendered lines: %q / %q", line0, line1)
+	}
+	if ansi.StringWidth(line0[:idx0]) != ansi.StringWidth(line1[:idx1]) {
+		t.Fatalf("display width mismatch between CJK and ASCII labels: %d != %d (%q vs %q)",
+			ansi.StringWidth(line0[:idx0]), ansi.StringWidth(line1[:idx1]), line0, line1)
+	}
+
+	d.Finish(0, "paused: 中文测试文件.bin", true)
+	d.Close()
+	if !strings.Contains(status.String(), "("+string(queue.Paused)+")") {
+		t.Fatalf("expected Finish(..., true) to keep paused phase in final line, got: %q", status.String())
 	}
 }
