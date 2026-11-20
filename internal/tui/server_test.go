@@ -1227,3 +1227,33 @@ func TestServerSettingsValidationFocusBackButtonAndLogsFixes(t *testing.T) {
 		t.Fatalf("expected fresh epoch applied with logLost=true: lost=%v events=%+v", m.logLost, m.logEvents)
 	}
 }
+
+func TestServerNarrowWidthSearchInputAndToastFallbackVisible(t *testing.T) {
+	m := newServerModel(ServerOptions{ExecutableDir: t.TempDir(), ConfigPath: "configs/server.local.json", Page: 1})
+	m.loaded = true
+	m.cfg = config.DefaultServer()
+	m.Update(tea.WindowSizeMsg{Width: 52, Height: 18})
+
+	// 1. 52 列极窄屏进入 / 搜索态，输入框必须可见且不超出宽度
+	m.Update(keyRune('/'))
+	m.Update(keyRune('a'))
+	m.Update(keyRune('l'))
+	tabView := ansi.Strip(m.renderTabBar())
+	if !strings.Contains(tabView, "筛选:") || !strings.Contains(tabView, "al") {
+		t.Fatalf("expected search input visible at 52 cols, got %q", tabView)
+	}
+	if lipgloss.Height(tabView) != 1 || lipgloss.Width(tabView) > 52 {
+		t.Fatalf("narrow search tab bar overflowed: h=%d w=%d %q", lipgloss.Height(tabView), lipgloss.Width(tabView), tabView)
+	}
+	m.Update(keyType(tea.KeyEsc))
+
+	// 2. 52 列极窄屏有 Toast 或忙碌状态时，应通过底栏回退确保提示可见
+	m.setToast("已刷新配置")
+	v := ansi.Strip(m.View())
+	if !strings.Contains(v, "已刷新配置") {
+		t.Fatalf("expected toast visible at 52 cols via footer fallback:\n%s", v)
+	}
+	if lipgloss.Height(v) > 18 {
+		t.Fatalf("52x18 view exceeded height: %d", lipgloss.Height(v))
+	}
+}

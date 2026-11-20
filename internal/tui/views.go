@@ -16,7 +16,12 @@ func (m *model) View() string {
 		return "正在初始化界面..."
 	}
 	if m.width < 48 || m.height < 14 {
-		return m.th.badgeWarn.Render(fmt.Sprintf("终端窗口过小（%d×%d），请至少调整至 48×14 以上（推荐 ≥ 96×28）", m.width, m.height))
+		msg := fmt.Sprintf("终端窗口过小（%d×%d），请至少调整至 48×14 以上（推荐 ≥ 96×28）", m.width, m.height)
+		lines := wrapModalLines([]string{msg}, max(8, m.width-2))
+		for i, ln := range lines {
+			lines[i] = m.th.badgeWarn.Render(ln)
+		}
+		return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, strings.Join(lines, "\n"))
 	}
 
 	header := m.renderHeader()
@@ -84,36 +89,96 @@ func (m *model) renderHeader() string {
 }
 
 func (m *model) renderSubHeader() string {
-	pathView := m.th.badgeMuted.Render("目录: ") + truncPlainCell(m.localDir, max(12, m.width/3))
+	budget := max(10, m.width-2)
+	sep := "   "
+	if m.width <= 96 {
+		sep = "  "
+	}
+	sepW := len(sep)
+
 	if m.editingPath {
+		lbl := m.th.hintKey.Render("目录: ")
 		pi := m.pathInput
-		pi.Width = min(42, max(10, m.width/2-4))
-		pathView = pi.View()
+		pi.Width = min(48, max(8, budget-lipgloss.Width(lbl)-2))
+		line := lbl + pi.View()
+		return lipgloss.NewStyle().Padding(0, 1).Width(m.width).Render(truncCell(line, budget))
+	}
+
+	if m.editingSearch {
+		lbl := m.th.hintKey.Render("筛选(/): ")
+		si := m.searchInput
+		si.Width = min(40, max(8, budget-lipgloss.Width(lbl)-14))
+		searchPart := lbl + si.View()
+		rem := budget - lipgloss.Width(searchPart) - sepW
+		if rem >= 12 {
+			pathPart := m.th.badgeMuted.Render("目录: ") + truncPlainCell(m.localDir, max(6, rem-6))
+			line := pathPart + sep + searchPart
+			return lipgloss.NewStyle().Padding(0, 1).Width(m.width).Render(truncCell(line, budget))
+		}
+		return lipgloss.NewStyle().Padding(0, 1).Width(m.width).Render(truncCell(searchPart, budget))
+	}
+
+	var msg string
+	switch {
+	case m.opBusy && m.opLabel != "":
+		msg = formatBusyBadge(m.th, m.spinIdx, m.opLabel, m.opStart)
+	case m.activatingID:
+		msg = formatBusyBadge(m.th, m.spinIdx, "身份切换中", m.opStart)
+	case m.statusToast != "":
+		msg = m.th.toast.Render("· " + sanitizeInline(m.statusToast))
 	}
 
 	searchView := m.th.badgeMuted.Render("筛选(/): ")
-	if m.editingSearch {
-		si := m.searchInput
-		si.Width = min(42, max(10, m.width/3-4))
-		searchView += si.View()
-	} else if m.query != "" {
+	if m.query != "" {
 		searchView += m.th.badgeOk.Render(truncPlainCell(m.query, 24))
 	} else {
 		searchView += m.th.badgeMuted.Render("全部")
 	}
-
 	sortLabel := m.th.badgeMuted.Render("排序(o): " + m.activeSortLabel())
-	msg := ""
-	switch {
-	case m.opBusy && m.opLabel != "":
-		msg = "  " + formatBusyBadge(m.th, m.spinIdx, m.opLabel, m.opStart)
-	case m.activatingID:
-		msg = "  " + formatBusyBadge(m.th, m.spinIdx, "身份切换中", m.opStart)
-	case m.statusToast != "":
-		msg = "  " + m.th.toast.Render("· "+truncPlainCell(m.statusToast, max(10, m.width/4)))
+
+	if msg != "" {
+		// 有活动状态或 Toast 时优先保证其可见，避免被左侧长路径挤出屏幕。
+		msgBudget := min(lipgloss.Width(msg), max(16, budget/2))
+		msgRendered := truncCell(msg, msgBudget)
+		msgW := lipgloss.Width(msgRendered)
+		rem := budget - msgW - sepW
+
+		var parts []string
+		if rem >= 12 {
+			pathMax := min(max(12, m.width/3), max(6, rem-6))
+			if m.query != "" && rem >= 30 {
+				qPart := m.th.badgeMuted.Render("筛选: ") + m.th.badgeOk.Render(truncPlainCell(m.query, 12))
+				qW := lipgloss.Width(qPart)
+				pathMax = min(pathMax, max(6, rem-qW-sepW-6))
+				parts = append(parts, m.th.badgeMuted.Render("目录: ")+truncPlainCell(m.localDir, pathMax), qPart)
+			} else {
+				parts = append(parts, m.th.badgeMuted.Render("目录: ")+truncPlainCell(m.localDir, pathMax))
+			}
+			// 若剩余宽度仍充裕，补齐筛选与排序信息
+			used := 0
+			for i, p := range parts {
+				used += lipgloss.Width(p)
+				if i > 0 {
+					used += sepW
+				}
+			}
+			if m.query == "" && used+sepW+lipgloss.Width(searchView) <= rem {
+				parts = append(parts, searchView)
+				used += sepW + lipgloss.Width(searchView)
+			}
+			if used+sepW+lipgloss.Width(sortLabel) <= rem {
+				parts = append(parts, sortLabel)
+			}
+		}
+		parts = append(parts, msgRendered)
+		return lipgloss.NewStyle().Padding(0, 1).Width(m.width).Render(truncCell(strings.Join(parts, sep), budget))
 	}
-	line := pathView + "   " + searchView + "   " + sortLabel + msg
-	return lipgloss.NewStyle().Padding(0, 1).Width(m.width).Render(truncCell(line, m.width-2))
+
+	usedRight := lipgloss.Width(searchView) + sepW + lipgloss.Width(sortLabel)
+	pathMax := max(10, min(max(12, m.width/3), budget-usedRight-sepW-6))
+	pathView := m.th.badgeMuted.Render("目录: ") + truncPlainCell(m.localDir, pathMax)
+	line := pathView + sep + searchView + sep + sortLabel
+	return lipgloss.NewStyle().Padding(0, 1).Width(m.width).Render(truncCell(line, budget))
 }
 
 func (m *model) renderFooter() string {

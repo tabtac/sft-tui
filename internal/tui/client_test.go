@@ -915,3 +915,47 @@ func TestClientOpBusyPreservedAcrossSingleOpAndCrossDirConflictScan(t *testing.T
 		t.Fatalf("expected target dir scan to pick %q, got %+v", want, renamed)
 	}
 }
+
+func TestClientNarrowSubHeaderToastAndScrollableConflictModal(t *testing.T) {
+	m := newModel(Options{ExecutableDir: t.TempDir(), Directory: "/very/long/nested/directory/path/for/narrow/terminal/testing"})
+	m.Update(tea.WindowSizeMsg{Width: 64, Height: 18})
+	m.setToast("已入队 3 个传输任务")
+
+	sub := ansi.Strip(m.renderSubHeader())
+	if lipgloss.Height(sub) != 1 || lipgloss.Width(sub) > 64 {
+		t.Fatalf("narrow subheader overflowed 64 cols: h=%d w=%d %q", lipgloss.Height(sub), lipgloss.Width(sub), sub)
+	}
+	if !strings.Contains(sub, "已入队 3 个传输任务") {
+		t.Fatalf("expected toast visible in narrow 64-col subheader, got %q", sub)
+	}
+
+	// 冲突弹窗含大量冲突文件时，在 50x14 极小窗口内支持滚动且不溢出高度/宽度
+	m.Update(tea.WindowSizeMsg{Width: 50, Height: 14})
+	m.pendingBatchDir = protocol.DirectionUpload
+	for i := 0; i < 15; i++ {
+		name := "conflict-" + string(rune('a'+i)) + ".bin"
+		m.conflictNames = append(m.conflictNames, name)
+		m.pendingSpecs = append(m.pendingSpecs, queue.Spec{Direction: protocol.DirectionUpload, Remote: name})
+	}
+	m.infoScroll = 0
+	m.modal = modalConflict
+
+	v0 := ansi.Strip(m.View())
+	if lipgloss.Height(v0) > 14 {
+		t.Fatalf("conflict modal exceeded 14 rows: got %d\n%s", lipgloss.Height(v0), v0)
+	}
+	for i, ln := range strings.Split(v0, "\n") {
+		if lipgloss.Width(ln) > 50 {
+			t.Fatalf("conflict modal line %d exceeded 50 cols: %q", i+1, ln)
+		}
+	}
+	m.Update(keyType(tea.KeyDown))
+	if m.infoScroll == 0 {
+		t.Fatal("expected Down key to scroll long conflict modal")
+	}
+	m.Update(keyType(tea.KeyEnd))
+	vEnd := ansi.Strip(m.View())
+	if !strings.Contains(vEnd, "跳过冲突文件") {
+		t.Fatalf("expected conflict action options reachable at bottom of scrollable modal:\n%s", vEnd)
+	}
+}

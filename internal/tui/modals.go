@@ -196,8 +196,33 @@ func (m *model) infoModalData() (title string, lines []string, footer string) {
 		return m.detailTitle, m.detailLines, "↑↓/滚轮 滚动 · Enter 或 Esc 关闭"
 	case modalBatchSummary:
 		return m.batchSummaryModalData()
+	case modalConflict:
+		return m.conflictModalData()
 	}
 	return "", nil, ""
+}
+
+func (m *model) conflictModalData() (title string, lines []string, footer string) {
+	_, innerW := modalBoxDimensions(m.width)
+	dirLabel := "下载目标本地目录已存在同名文件："
+	if m.pendingBatchDir == protocol.DirectionUpload {
+		dirLabel = "远端已存在同名文件："
+	}
+	lines = []string{
+		m.th.badgeWarn.Render(dirLabel),
+		"",
+	}
+	for _, name := range m.conflictNames {
+		lines = append(lines, "  • "+sanitizeInline(name))
+	}
+	lines = append(lines, "",
+		fmt.Sprintf("共待入队 %d 个文件（冲突 %d 个）。请选择处理策略：", len(m.pendingSpecs), len(m.conflictNames)),
+		"  "+m.th.hintKey.Render("[r]")+" 自动为冲突项生成不重复新文件名（如 file (1).ext）后全部入队",
+		"  "+m.th.hintKey.Render("[s]")+" 跳过冲突文件，仅入队其余无冲突文件",
+		"  "+m.th.hintKey.Render("[Esc]")+" 取消本次批量传输（保留已勾选状态）",
+	)
+	lines = appendModalNoticeLines(lines, m.th, m.statusToast, innerW)
+	return "文件名冲突安全确认（禁止静默覆盖）", lines, "r 自动改名 · s 跳过冲突 · ↑↓ 滚动 · Esc 取消"
 }
 
 func appendModalNoticeLines(lines []string, th theme, notice string, innerW int) []string {
@@ -218,7 +243,7 @@ func appendModalNoticeLines(lines []string, th theme, notice string, innerW int)
 func (m *model) viewModal(base string) string {
 	_, innerW := modalBoxDimensions(m.width)
 	switch m.modal {
-	case modalHelp, modalDetail, modalBatchSummary:
+	case modalHelp, modalDetail, modalBatchSummary, modalConflict:
 		title, lines, footer := m.infoModalData()
 		view, _ := renderModalScrollBox(m.width, m.height, m.th, title, lines, footer, m.infoScroll)
 		return view
@@ -227,39 +252,10 @@ func (m *model) viewModal(base string) string {
 		title, footer, lines := m.buildIdentityModalContent()
 		return renderModalOverlay(base, title, lines, footer, m)
 
-	case modalConflict:
-		dirLabel := "下载目标本地目录已存在同名文件："
-		if m.pendingBatchDir == protocol.DirectionUpload {
-			dirLabel = "远端已存在同名文件："
-		}
-		lines := []string{
-			m.th.badgeWarn.Render(dirLabel),
-			"",
-		}
-		limit := min(5, len(m.conflictNames))
-		for i := 0; i < limit; i++ {
-			lines = append(lines, "  • "+truncPlainCell(m.conflictNames[i], max(12, innerW-6)))
-		}
-		if len(m.conflictNames) > limit {
-			lines = append(lines, fmt.Sprintf("  … 另有 %d 个冲突文件", len(m.conflictNames)-limit))
-		}
-		lines = append(lines, "",
-			fmt.Sprintf("共待入队 %d 个文件（冲突 %d 个）。请选择处理策略：", len(m.pendingSpecs), len(m.conflictNames)),
-			"  "+m.th.hintKey.Render("[r]")+" 自动为冲突项生成不重复新文件名（如 file (1).ext）后全部入队",
-			"  "+m.th.hintKey.Render("[s]")+" 跳过冲突文件，仅入队其余无冲突文件",
-			"  "+m.th.hintKey.Render("[Esc]")+" 取消本次批量传输（保留已勾选状态）",
-		)
-		lines = appendModalNoticeLines(lines, m.th, m.statusToast, innerW)
-		return renderModalOverlay(base, "文件名冲突安全确认（禁止静默覆盖）", lines, "按键选择：r 自动改名 / s 跳过冲突 / Esc 取消", m)
-
 	case modalRename:
 		ri := m.renameInput
 		ri.Width = min(ri.Width, max(8, innerW-4))
-		lines := []string{
-			"为任务设置新的目标名称以继续重传（原任务保持状态不覆盖）：",
-			"",
-			ri.View(),
-		}
+		lines := append(wrapModalLines([]string{"为任务设置新的目标名称以继续重传（原任务保持状态不覆盖）："}, innerW), "", ri.View())
 		lines = appendModalNoticeLines(lines, m.th, m.statusToast, innerW)
 		return renderModalOverlay(base, "改名另存并入队", lines, "Enter 确认入队 · Esc 取消", m)
 
@@ -271,14 +267,16 @@ func (m *model) viewModal(base string) string {
 			"  " + m.th.hintKey.Render("[f]") + "  立即强制退出（已确认检查点仍保存在 SQLite 中）",
 			"  " + m.th.hintKey.Render("[Esc]") + "  返回客户端界面继续传输",
 		}
-		return renderModalOverlay(base, "退出确认", lines, "按 p 安全暂停退出 · f 强制退出 · Esc 返回", m)
+		view, _ := renderModalScrollBox(m.width, m.height, m.th, "退出确认", lines, "按 p 安全暂停退出 · f 强制退出 · Esc 返回", 0)
+		return view
 
 	case modalClearHistory:
 		lines := []string{
 			"确定清空所有已完成 / 已取消 / 已跳过的历史归档记录吗？",
 			m.th.badgeMuted.Render("（注：仅清理 SQLite 历史表，绝不删除本地文件或影响活动队列）"),
 		}
-		return renderModalOverlay(base, "清空历史记录", lines, "Enter / y 确认清空 · Esc 取消", m)
+		view, _ := renderModalScrollBox(m.width, m.height, m.th, "清空历史记录", lines, "Enter / y 确认清空 · Esc 取消", 0)
+		return view
 	}
 	return base
 }

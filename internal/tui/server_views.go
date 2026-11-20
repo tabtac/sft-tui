@@ -18,7 +18,12 @@ func (m *serverModel) View() string {
 		return "正在初始化服务端管理界面…"
 	}
 	if m.width < 52 || m.height < 14 {
-		return m.th.badgeWarn.Render(fmt.Sprintf("终端窗口过小（%d×%d），请至少调整至 52×14 以上", m.width, m.height))
+		msg := fmt.Sprintf("终端窗口过小（%d×%d），请至少调整至 52×14 以上", m.width, m.height)
+		lines := wrapModalLines([]string{msg}, max(8, m.width-2))
+		for i, ln := range lines {
+			lines[i] = m.th.badgeWarn.Render(ln)
+		}
+		return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, strings.Join(lines, "\n"))
 	}
 
 	header := m.renderHeader()
@@ -101,7 +106,7 @@ func (m *serverModel) renderHeader() string {
 	return m.th.headerBar.Width(m.width).Render(truncCell(left+strings.Repeat(" ", gap)+stats, m.width-2))
 }
 
-func (m *serverModel) renderTabBar() string {
+func (m *serverModel) tabBarInlineCapacity() (tabsRow string, avail int, sep string) {
 	names := []string{"1 概览", "2 用户", "3 传输", "4 证书", "5 设置", "6 日志"}
 	var tabs []string
 	for i, name := range names {
@@ -111,9 +116,19 @@ func (m *serverModel) renderTabBar() string {
 			tabs = append(tabs, m.th.tabInactive.Render(name))
 		}
 	}
-	row := lipgloss.JoinHorizontal(lipgloss.Center, tabs...)
-	avail := m.width - 2 - lipgloss.Width(row) - 3
-	if m.editingQuery && avail > 8 {
+	tabsRow = lipgloss.JoinHorizontal(lipgloss.Center, tabs...)
+	sep = "   "
+	if m.width < 80 {
+		sep = " "
+	}
+	avail = m.width - 2 - lipgloss.Width(tabsRow) - len(sep)
+	return tabsRow, avail, sep
+}
+
+func (m *serverModel) renderTabBar() string {
+	budget := max(10, m.width-2)
+	row, avail, sep := m.tabBarInlineCapacity()
+	if m.editingQuery {
 		promptLbl := "筛选: "
 		switch m.queryMode {
 		case "log-user":
@@ -121,17 +136,26 @@ func (m *serverModel) renderTabBar() string {
 		case "log-file":
 			promptLbl = "按文件筛选: "
 		}
-		row += "   " + m.th.hintKey.Render(promptLbl) + m.queryInput.View()
+		promptRendered := m.th.hintKey.Render(promptLbl)
+		qi := m.queryInput
+		if avail >= 18 {
+			qi.Width = min(36, max(6, avail-lipgloss.Width(promptRendered)-2))
+			row += sep + promptRendered + qi.View()
+		} else {
+			// 窄屏进入筛选态时独占本行展示输入框，防止输入内容完全不可见。
+			qi.Width = min(40, max(6, budget-lipgloss.Width(promptRendered)-2))
+			row = promptRendered + qi.View()
+		}
 	} else if m.busy && avail >= 6 {
 		op := m.busyOp
 		if op == "" {
 			op = "操作执行中"
 		}
-		row += "   " + formatBusyBadge(m.th, m.busySpin, op, m.busyStart)
+		row += sep + formatBusyBadge(m.th, m.busySpin, op, m.busyStart)
 	} else if m.statusToast != "" && avail >= 6 {
-		row += "   " + m.th.toast.Render("· "+truncPlainCell(m.statusToast, avail-2))
+		row += sep + m.th.toast.Render("· "+truncPlainCell(m.statusToast, max(4, avail-2)))
 	}
-	return lipgloss.NewStyle().Padding(0, 1).Width(m.width).Render(truncCell(row, m.width-2))
+	return lipgloss.NewStyle().Padding(0, 1).Width(m.width).Render(truncCell(row, budget))
 }
 
 func (m *serverModel) renderFooter() string {
@@ -143,6 +167,19 @@ func (m *serverModel) renderFooter() string {
 			hint = "日志文件名过滤：输入文件名片段 · Enter 应用 · Esc 清空"
 		}
 		return m.th.footerBar.Width(m.width).Render(truncPlainCell(hint, max(1, m.width-2)))
+	}
+	// 超窄屏下标签栏无余量展示忙碌状态或 Toast 时，借用底栏回退展示以免信息静默丢失。
+	if _, avail, _ := m.tabBarInlineCapacity(); avail < 6 {
+		if m.busy {
+			op := m.busyOp
+			if op == "" {
+				op = "操作执行中"
+			}
+			return m.th.footerBar.Width(m.width).Render(truncCell(formatBusyBadge(m.th, m.busySpin, op, m.busyStart), max(1, m.width-2)))
+		}
+		if m.statusToast != "" {
+			return m.th.footerBar.Width(m.width).Render(truncCell(m.th.toast.Render("· "+sanitizeInline(m.statusToast)), max(1, m.width-2)))
+		}
 	}
 	busyReason := ""
 	if m.busy {

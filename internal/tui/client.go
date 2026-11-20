@@ -1266,7 +1266,7 @@ func (m *model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 	if msg.Action != tea.MouseActionPress || m.width <= 0 || m.height <= 0 {
 		return m, nil
 	}
-	if m.modal == modalHelp || m.modal == modalDetail || m.modal == modalBatchSummary {
+	if m.modal == modalHelp || m.modal == modalDetail || m.modal == modalBatchSummary || m.modal == modalConflict {
 		switch msg.Button {
 		case tea.MouseButtonWheelUp:
 			m.scrollClientInfoModal("up")
@@ -1648,6 +1648,7 @@ func (m *model) handleModalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.clearToast()
 			return m, m.enqueueSpecsCmd(specs)
 		}
+		m.scrollClientInfoModal(k)
 		return m, nil
 
 	case modalRename:
@@ -2447,6 +2448,7 @@ func (m *model) prepareBatch(dir protocol.Direction, specs []queue.Spec, clearSe
 		m.pendingSpecs = specs
 		m.conflictNames = conflicts
 		m.pendingClearSel = clearSel
+		m.infoScroll = 0
 		m.clearToast()
 		m.modal = modalConflict
 		return nil
