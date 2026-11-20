@@ -99,6 +99,42 @@ func EnsurePrivateDir(path string) error {
 	return nil
 }
 
+// EnsureDir 在 Windows 下确保用户指定目录存在且非重解析点，但绝不修改已有目录的 DACL 或继承关系。
+func EnsureDir(path string) error {
+	path = filepath.Clean(path)
+	p, err := windows.UTF16PtrFromString(path)
+	if err != nil {
+		return err
+	}
+	h, err := windows.CreateFile(
+		p,
+		windows.GENERIC_READ,
+		windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE,
+		nil,
+		windows.OPEN_EXISTING,
+		windows.FILE_FLAG_BACKUP_SEMANTICS|windows.FILE_FLAG_OPEN_REPARSE_POINT,
+		0,
+	)
+	if err == nil {
+		defer windows.CloseHandle(h)
+		var info windows.ByHandleFileInformation
+		if err := windows.GetFileInformationByHandle(h, &info); err != nil {
+			return err
+		}
+		if info.FileAttributes&windows.FILE_ATTRIBUTE_DIRECTORY == 0 {
+			return fmt.Errorf("security violation: %q is not a directory", path)
+		}
+		if info.FileAttributes&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+			return fmt.Errorf("security violation: %q is a reparse point/symlink", path)
+		}
+		return nil
+	}
+	if !os.IsNotExist(err) {
+		return &os.PathError{Op: "CreateFile", Path: path, Err: err}
+	}
+	return os.MkdirAll(path, 0700)
+}
+
 func openAndHardenPrivateDir(p *uint16, path string) (bool, error) {
 	h, err := windows.CreateFile(
 		p,

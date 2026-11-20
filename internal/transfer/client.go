@@ -701,7 +701,7 @@ func (c *Client) executeDownload(ctx context.Context, task *queue.Task, op *queu
 		return result, err
 	}
 	parent, base := filepath.Dir(absPath), filepath.Base(absPath)
-	root, err := pal.OpenRoot(parent)
+	root, err := pal.OpenUserRoot(parent)
 	if err != nil {
 		return result, err
 	}
@@ -1179,7 +1179,7 @@ func (c *Client) abortCheckpoint(parent context.Context, task *queue.Task, updat
 	}
 	var dlRoot *pal.Root
 	if task.Direction == protocol.DirectionDownload && task.Path != "" {
-		r, err := pal.OpenRoot(filepath.Dir(task.Path))
+		r, err := pal.OpenUserRoot(filepath.Dir(task.Path))
 		if err == nil {
 			dlRoot = r
 			defer dlRoot.Close()

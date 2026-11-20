@@ -88,7 +88,7 @@ func remember(absConfig, storageRoot string) (string, string, error) {
 	if err != nil {
 		return "", "", err
 	}
-	if err := pal.EnsurePrivateDir(filepath.Dir(hintPath)); err != nil {
+	if err := pal.EnsureDir(filepath.Dir(hintPath)); err != nil {
 		return "", "", err
 	}
 	data, err := json.MarshalIndent(location{Config: absConfig, Storage: absRoot}, "", "  ")

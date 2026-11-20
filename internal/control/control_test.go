@@ -191,3 +191,23 @@ func TestLocateFallsBackOnCorruptHint(t *testing.T) {
 		t.Fatalf("expected corrupt hint removed, statErr=%v", statErr)
 	}
 }
+
+func TestStartManagedPreservesExistingConfigParentPermissions(t *testing.T) {
+	base := t.TempDir()
+	cfgDir := filepath.Join(base, "shared-configs")
+	if err := os.Mkdir(cfgDir, 0770); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(cfgDir, 0770); err != nil {
+		t.Fatal(err)
+	}
+	svc, err := StartManaged(filepath.Join(cfgDir, "server.json"), filepath.Join(base, "storage"), Handlers{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer svc.Close()
+	info, err := os.Stat(cfgDir)
+	if err != nil || info.Mode().Perm() != 0770 {
+		t.Fatalf("config parent permissions changed: got %#o (err=%v), want 0770", info.Mode().Perm(), err)
+	}
+}

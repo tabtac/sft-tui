@@ -33,6 +33,24 @@ func EnsurePrivateDir(path string) error {
 	return os.Chmod(path, 0700)
 }
 
+// EnsureDir 确保用户指定目录存在且不是符号链接，但绝不修改已有目录的权限。
+func EnsureDir(path string) error {
+	info, err := os.Lstat(path)
+	if err == nil {
+		if info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("security violation: path %q is a symbolic link", path)
+		}
+		if !info.IsDir() {
+			return fmt.Errorf("security violation: path %q is not a directory", path)
+		}
+		return nil
+	}
+	if !os.IsNotExist(err) {
+		return err
+	}
+	return os.MkdirAll(path, 0700)
+}
+
 // secureSubdir 收紧根内子目录权限为 0700
 func (r *Root) secureSubdir(sub string) error {
 	return r.root.Chmod(sub, 0700)

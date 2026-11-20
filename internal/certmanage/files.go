@@ -52,7 +52,7 @@ func applyChanges(changes []fileChange) (result error) {
 		}
 		seen[abs] = true
 
-		if err := pal.EnsurePrivateDir(filepath.Dir(c.path)); err != nil {
+		if err := pal.EnsureDir(filepath.Dir(c.path)); err != nil {
 			return err
 		}
 		s := stagedSnapshot{fileChange: c}

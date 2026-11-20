@@ -126,3 +126,37 @@ func TestReviewNativeParentDirectoryForBackslashFilename(t *testing.T) {
 		t.Errorf("staged backslash filename content=%q err=%v", got, err)
 	}
 }
+
+func TestOpenUserRootAndEnsureDirPreserveExistingPermissionsAndRejectSymlink(t *testing.T) {
+	base := t.TempDir()
+	shared := filepath.Join(base, "shared")
+	if err := os.Mkdir(shared, 0770); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(shared, 0770); err != nil {
+		t.Fatal(err)
+	}
+	if err := EnsureDir(shared); err != nil {
+		t.Fatalf("EnsureDir existing shared dir: %v", err)
+	}
+	root, err := OpenUserRoot(shared)
+	if err != nil {
+		t.Fatalf("OpenUserRoot existing shared dir: %v", err)
+	}
+	_ = root.Close()
+	info, err := os.Stat(shared)
+	if err != nil || info.Mode().Perm() != 0770 {
+		t.Fatalf("existing shared dir permissions altered: got %v (err=%v), want 0770", info.Mode().Perm(), err)
+	}
+
+	link := filepath.Join(base, "link")
+	if err := os.Symlink(shared, link); err != nil {
+		t.Fatal(err)
+	}
+	if err := EnsureDir(link); err == nil {
+		t.Fatal("EnsureDir accepted symlink")
+	}
+	if _, err := OpenUserRoot(link); err == nil {
+		t.Fatal("OpenUserRoot accepted symlink")
+	}
+}

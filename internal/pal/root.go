@@ -33,6 +33,28 @@ func OpenRoot(path string) (*Root, error) {
 	}, nil
 }
 
+// OpenUserRoot 打开用户指定的已有目录（或创建缺失目录）并锚定为 os.Root，
+// 强制拒绝符号链接但绝不改写已有目录的权限或 ACL。
+func OpenUserRoot(path string) (*Root, error) {
+	absPath, err := filepath.Abs(path)
+	if err != nil {
+		return nil, fmt.Errorf("invalid path %q: %w", path, err)
+	}
+	if err := EnsureDir(absPath); err != nil {
+		return nil, fmt.Errorf("failed to prepare directory %q: %w", absPath, err)
+	}
+
+	r, err := os.OpenRoot(absPath)
+	if err != nil {
+		return nil, fmt.Errorf("open root failed: %w", err)
+	}
+
+	return &Root{
+		root: r,
+		path: absPath,
+	}, nil
+}
+
 // Path 返回根目录绝对路径
 func (r *Root) Path() string {
 	return r.path

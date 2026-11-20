@@ -33,7 +33,7 @@ func Open(path string, maxBytes int64) (*Writer, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err = pal.EnsurePrivateDir(filepath.Dir(absolute)); err != nil {
+	if err = pal.EnsureDir(filepath.Dir(absolute)); err != nil {
 		return nil, err
 	}
 	lock, err := pal.OpenLockFile(absolute + ".lock")

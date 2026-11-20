@@ -311,7 +311,7 @@ func Server(in io.Reader, out io.Writer, path, scanDir string) error {
 			return fmt.Errorf("配置在交互期间发生变化，请重新运行 init")
 		}
 	}
-	if err := pal.EnsurePrivateDir(filepath.Dir(path)); err != nil {
+	if err := pal.EnsureDir(filepath.Dir(path)); err != nil {
 		return err
 	}
 	data, err := json.MarshalIndent(c, "", "  ")

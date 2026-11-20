@@ -52,7 +52,7 @@ func saveUIPrefsCmd(path string, prefs uiPrefs) tea.Cmd {
 		if err != nil {
 			return prefsSavedMsg{err: err}
 		}
-		if err := pal.EnsurePrivateDir(filepath.Dir(path)); err != nil && !os.IsExist(err) {
+		if err := pal.EnsureDir(filepath.Dir(path)); err != nil && !os.IsExist(err) {
 			return prefsSavedMsg{err: err}
 		}
 		return prefsSavedMsg{err: pal.StageAndReplaceMode(path, append(data, '\n'), 0600, false)}

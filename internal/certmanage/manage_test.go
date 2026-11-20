@@ -355,3 +355,33 @@ func TestFullExportStripsCombinedCAPrivateKey(t *testing.T) {
 		t.Fatalf("exported bundle client config invalid: %v", err)
 	}
 }
+
+func TestInteractivePolicyDialogProtectsAgainstConcurrentRevoke(t *testing.T) {
+	o := testOptions(t)
+	if _, err := Execute("init", o); err != nil {
+		t.Fatal(err)
+	}
+	var prompts bytes.Buffer
+	action, stale, err := UsersDialog(strings.NewReader("1\n\n\n\n\n"), &prompts, o)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stale.ExpectedUser == nil {
+		t.Fatal("expected UsersDialog to attach ExpectedUser snapshot")
+	}
+	concurrent := o
+	concurrent.Policy = &UserPolicy{Disabled: true, Permissions: []string{"download"}}
+	if _, err := Execute("policy", concurrent); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Execute(action, stale); err == nil {
+		t.Fatal("stale interactive policy edit overwrote concurrent revocation")
+	}
+	cur, err := config.LoadServer(o.ServerConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cur.AuthorizedClients[0].Disabled {
+		t.Fatal("concurrent revocation was undone by stale interactive policy save")
+	}
+}

@@ -150,15 +150,18 @@ func UsersDialog(in io.Reader, out io.Writer, o Options) (string, Options, error
 		}
 	}
 	u := c.AuthorizedClients[index]
+	uCopy := u
 	o.Name = u.UserID
 	switch choice {
 	case 0:
+		o.ExpectedUser = &uCopy
 		o.Policy, err = policyDialog(d, c, u)
 		return "policy", o, err
 	case 2:
 		o.Out, err = d.Text("导出到新目录", o.Name+"-bundle", prompt.Nonempty)
 		return "export", o, err
 	case 3:
+		o.ExpectedUser = &uCopy
 		days := uint64(o.Days)
 		if days == 0 {
 			days = 30
