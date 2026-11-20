@@ -459,14 +459,12 @@ func (s *Server) handleUpload(user string, bw config.Bandwidth, st *session.Stre
 	committedOffset := task.Offset
 	lastFlush := time.Now()
 	flushBatch := uint64(max(st.ChunkSize(), min(st.WindowSize()/2, 512*1024)))
-	flushUpload := func(waitCtx context.Context, throttle bool) error {
+	flushUpload := func(waitCtx context.Context) error {
 		if offset <= committedOffset {
 			return nil
 		}
-		if throttle {
-			if err := s.waitCheckpoint(waitCtx, user, bw); err != nil {
-				return err
-			}
+		if err := s.waitCheckpoint(waitCtx, user, bw); err != nil {
+			return err
 		}
 		committed, err := s.store.FlushUploadCheckpoint(st.Context(), task.ID, lease)
 		if err != nil {
@@ -492,7 +490,7 @@ func (s *Server) handleUpload(user string, bw config.Bandwidth, st *session.Stre
 			timedOut := errors.Is(err, context.DeadlineExceeded) && waitCtx.Err() == context.DeadlineExceeded && st.Context().Err() == nil
 			cancelWait()
 			if timedOut {
-				if fErr := flushUpload(st.PayloadContext(), true); fErr != nil {
+				if fErr := flushUpload(st.PayloadContext()); fErr != nil {
 					if st.PayloadContext().Err() != nil && st.Context().Err() == nil {
 						continue
 					}
@@ -534,7 +532,7 @@ func (s *Server) handleUpload(user string, bw config.Bandwidth, st *session.Stre
 			offset = newOffset
 			s.progress(monID, offset, "传输")
 			if offset == task.FileSize || offset-committedOffset >= flushBatch || time.Since(lastFlush) >= 50*time.Millisecond {
-				if err = flushUpload(st.PayloadContext(), true); err != nil {
+				if err = flushUpload(st.PayloadContext()); err != nil {
 					if st.PayloadContext().Err() != nil && st.Context().Err() == nil {
 						continue
 					}
@@ -544,7 +542,7 @@ func (s *Server) handleUpload(user string, bw config.Bandwidth, st *session.Stre
 
 		case protocol.TypeCommit:
 			if offset > committedOffset {
-				if err = flushUpload(st.Context(), true); err != nil {
+				if err = flushUpload(st.Context()); err != nil {
 					return "failed", err
 				}
 			}

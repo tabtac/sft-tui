@@ -82,7 +82,6 @@ func tabHitIndex(x, startOffset int, labels []string, th theme, activeIdx int) i
 
 type theme struct {
 	primary     lipgloss.TerminalColor
-	secondary   lipgloss.TerminalColor
 	accent      lipgloss.TerminalColor
 	success     lipgloss.TerminalColor
 	warning     lipgloss.TerminalColor
@@ -117,7 +116,6 @@ type theme struct {
 func makeTheme() theme {
 	t := theme{
 		primary:     lipgloss.AdaptiveColor{Dark: "#38BDF8", Light: "#0369A1"}, // 晴空蓝 / 深天蓝
-		secondary:   lipgloss.AdaptiveColor{Dark: "#A5B4FC", Light: "#4338CA"}, // 靛紫
 		accent:      lipgloss.AdaptiveColor{Dark: "#22D3EE", Light: "#0E7490"}, // 青蓝焦点
 		success:     lipgloss.AdaptiveColor{Dark: "#34D399", Light: "#047857"}, // 翡翠绿
 		warning:     lipgloss.AdaptiveColor{Dark: "#FBBF24", Light: "#B45309"}, // 琥珀黄

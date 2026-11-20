@@ -228,7 +228,6 @@ type model struct {
 	completedSeen map[string]bool
 	statusToast   string
 	toastUntil    time.Time
-	quitting      bool
 
 	// 弹窗辅助数据
 	detailTitle     string
@@ -1260,11 +1259,7 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 func (m *model) scrollClientInfoModal(k string) {
 	title, lines, footer := m.infoModalData()
-	_, maxScroll := renderModalScrollBox(m.width, m.height, m.th, title, lines, footer, m.infoScroll)
-	next, ok := modalScrollStep(k, m.infoScroll, maxScroll, modalScrollBoxPageRows(m.height, footer))
-	if ok {
-		m.infoScroll = next
-	}
+	scrollInfoModalStep(m.width, m.height, m.th, title, lines, footer, &m.infoScroll, k)
 }
 
 func (m *model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {

@@ -240,7 +240,6 @@ func TestControlPersistenceFailureKeepsIntent(t *testing.T) {
 				active:  map[string]*running{},
 				cfg:     Config{StateDir: dir, Identity: identity},
 			}
-			m.storageText.Store("")
 
 			if active {
 				op := NewOperation(context.Background())

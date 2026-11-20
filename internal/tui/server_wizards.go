@@ -44,7 +44,6 @@ type deployInitDoneMsg struct {
 
 type deployExportDoneMsg struct {
 	outDir string
-	msgs   []string
 	err    error
 }
 
@@ -640,7 +639,7 @@ func (m *serverModel) openDeployStep(step int) {
 				d := w.d
 				m.startBusy("导出用户分发包")
 				return m, func() tea.Msg {
-					res, err := certmanage.Execute("export", certmanage.Options{
+					_, err := certmanage.Execute("export", certmanage.Options{
 						Dir:             d.CertDir,
 						ServerConfig:    d.Config,
 						ClientConfigDir: d.ClientDir,
@@ -648,7 +647,7 @@ func (m *serverModel) openDeployStep(step int) {
 						Out:             out,
 						Days:            d.Days,
 					})
-					return deployExportDoneMsg{outDir: out, msgs: res.Messages, err: err}
+					return deployExportDoneMsg{outDir: out, err: err}
 				}
 			}},
 		}

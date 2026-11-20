@@ -83,7 +83,6 @@ type Manager struct {
 	active       map[string]*running
 	hold, closed bool
 	storageErr   error
-	storageText  atomic.Value
 	notify       chan struct{}
 	loopDone     chan struct{}
 	wg           sync.WaitGroup
@@ -163,7 +162,6 @@ func Open(cfg Config) (*Manager, error) {
 		notify:   make(chan struct{}, 1),
 		loopDone: make(chan struct{}),
 	}
-	m.storageText.Store("")
 
 	for _, t := range tasks {
 		if t.Identity != cfg.Identity || protocol.ValidateName(t.Remote) != nil || !filepath.IsAbs(t.Path) {

@@ -29,7 +29,6 @@ const (
 )
 
 type formSelectField struct {
-	label    string
 	options  []string
 	selected int
 	onChange func(val string, idx int)
@@ -63,12 +62,10 @@ type formState struct {
 	formInputs     []textinput.Model
 	formUnits      []*formUnitField
 	formSelects    []formSelectField
-	formLabels     []string
 	formFocus      int
 	formSubFocus   int
 	formScroll     int
 	formToggles    []bool
-	formToggleLbl  []string
 	formButtons    []formButton
 	formBtnIdx     int
 	dropdownOpen   bool
@@ -131,9 +128,7 @@ func (f *formState) resetForm() {
 	f.formInputs = nil
 	f.formUnits = nil
 	f.formSelects = nil
-	f.formLabels = nil
 	f.formToggles = nil
-	f.formToggleLbl = nil
 	f.formButtons = nil
 	f.formBtnIdx = 0
 	f.formFocus = 0
@@ -172,7 +167,6 @@ func (f *formState) addTextRow(label, value string) int {
 	idx := len(f.formInputs)
 	f.formInputs = append(f.formInputs, makeModalInput(value))
 	f.formUnits = append(f.formUnits, nil)
-	f.formLabels = append(f.formLabels, label)
 	f.formRows = append(f.formRows, formRow{
 		kind:     formRowText,
 		label:    label,
@@ -194,7 +188,6 @@ func (f *formState) addSizeUnitRow(label string, bytesVal uint64, isRate bool) i
 	ti.Width = 18
 	f.formInputs = append(f.formInputs, ti)
 	f.formUnits = append(f.formUnits, &formUnitField{options: opts, selected: sel})
-	f.formLabels = append(f.formLabels, label)
 	f.formRows = append(f.formRows, formRow{
 		kind:     formRowSizeUnit,
 		label:    label,
@@ -215,7 +208,6 @@ func (f *formState) addSelectRow(label string, options []string, selected int, o
 	}
 	idx := len(f.formSelects)
 	f.formSelects = append(f.formSelects, formSelectField{
-		label:    label,
 		options:  options,
 		selected: selected,
 		onChange: onChange,
@@ -231,7 +223,6 @@ func (f *formState) addSelectRow(label string, options []string, selected int, o
 func (f *formState) addToggleRow(label string, checked bool, onToggle func(bool)) int {
 	idx := len(f.formToggles)
 	f.formToggles = append(f.formToggles, checked)
-	f.formToggleLbl = append(f.formToggleLbl, label)
 	f.formRows = append(f.formRows, formRow{
 		kind:      formRowToggle,
 		label:     label,
@@ -457,13 +448,6 @@ func (m *serverModel) focusInputRow(inputIdx int) tea.Cmd {
 		}
 	}
 	return nil
-}
-
-func (m *serverModel) focusInputKey(key string, fallbackIdx int) int {
-	if idx, ok := m.inputByKey(key); ok {
-		return idx
-	}
-	return fallbackIdx
 }
 
 func (m *serverModel) focusSelectRow(selectIdx int) tea.Cmd {

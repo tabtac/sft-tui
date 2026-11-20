@@ -16,7 +16,6 @@ func (m *Manager) saveRecords(tasks []Task, history bool) error {
 	}
 	if err := m.store.Write(tasks, history); err != nil {
 		m.storageErr = err
-		m.storageText.Store(err.Error())
 		m.hold = true
 		return err
 	}

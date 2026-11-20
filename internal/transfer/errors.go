@@ -19,8 +19,6 @@ var (
 	ErrPaused = queue.ErrPaused
 	// ErrCancelled 表示任务已按控制指令确认取消并清理，复用 queue.ErrCancelled 哨兵值。
 	ErrCancelled = queue.ErrCancelled
-	// ErrAlreadyCompleted 表示服务端上对应任务已经处于终态 COMPLETED。
-	ErrAlreadyCompleted = errors.New("任务已完成，保留已发布文件")
 )
 
 // IsTransient 判断错误是否为可自动重连的瞬态网络错误。

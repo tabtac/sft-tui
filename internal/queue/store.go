@@ -6,10 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 	"time"
-
-	_ "modernc.org/sqlite"
 
 	"sft-tui/internal/pal"
 )
@@ -17,7 +14,6 @@ import (
 type Store struct {
 	db   *sql.DB
 	lock *os.File
-	path string
 }
 
 func OpenStore(dir, identity string) (*Store, error) {
@@ -53,29 +49,6 @@ func OpenStore(dir, identity string) (*Store, error) {
 		}
 	}
 
-	dsn, err := pal.SQLiteDSN(dbPath, "_pragma=journal_mode(WAL)&_pragma=synchronous(FULL)&_pragma=busy_timeout(3000)&_pragma=foreign_keys(ON)")
-	if err != nil {
-		return nil, err
-	}
-	db, err := sql.Open("sqlite", dsn)
-	if err != nil {
-		return nil, err
-	}
-	db.SetMaxOpenConns(1)
-
-	closeFailure := func(e error) (*Store, error) {
-		db.Close()
-		return nil, e
-	}
-
-	var version int
-	if err := db.QueryRow("PRAGMA user_version").Scan(&version); err != nil {
-		return closeFailure(err)
-	}
-	if version > 1 {
-		return closeFailure(fmt.Errorf("queue database is from a newer version (%d > 1)", version))
-	}
-
 	schema := `
 		PRAGMA journal_mode=WAL;
 		PRAGMA synchronous=FULL;
@@ -85,30 +58,24 @@ func OpenStore(dir, identity string) (*Store, error) {
 		CREATE TABLE IF NOT EXISTS history(seq INTEGER PRIMARY KEY AUTOINCREMENT, record BLOB NOT NULL, updated INTEGER NOT NULL);
 		PRAGMA user_version=1;
 	`
-	if _, err := db.Exec(schema); err != nil {
-		return closeFailure(err)
-	}
-
-	var syncMode int
-	if err := db.QueryRow("PRAGMA synchronous;").Scan(&syncMode); err != nil {
-		return closeFailure(err)
-	}
-	if syncMode != 2 && syncMode != 3 {
-		return closeFailure(fmt.Errorf("queue sqlite synchronous pragma failed: expected FULL (2), got %d", syncMode))
-	}
-	var journalMode string
-	if err := db.QueryRow("PRAGMA journal_mode;").Scan(&journalMode); err != nil {
-		return closeFailure(err)
-	}
-	if strings.ToUpper(journalMode) != "WAL" {
-		return closeFailure(fmt.Errorf("queue sqlite journal_mode pragma failed: expected WAL, got %s", journalMode))
+	db, err := pal.OpenVerifiedSQLite(dbPath, "_pragma=journal_mode(WAL)&_pragma=synchronous(FULL)&_pragma=busy_timeout(3000)&_pragma=foreign_keys(ON)", schema, func(db *sql.DB) error {
+		var version int
+		if err := db.QueryRow("PRAGMA user_version").Scan(&version); err != nil {
+			return err
+		}
+		if version > 1 {
+			return fmt.Errorf("queue database is from a newer version (%d > 1)", version)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
 
 	failed = false
 	return &Store{
 		db:   db,
 		lock: lock,
-		path: dbPath,
 	}, nil
 }
 

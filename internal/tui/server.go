@@ -874,16 +874,7 @@ func (m *serverModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		case "g":
 			if len(users) > 0 && m.cursors[1] < len(users) {
 				u := users[m.cursors[1]]
-				m.logEpoch++
-				m.logQuery = monitor.LogQuery{User: u.UserID}
-				m.logMinLevel = ""
-				m.logSinceIdx = 0
-				m.logCursor = 0
-				m.logLost = false
-				m.logEvents = nil
-				m.logPaused = false
-				m.setToast("已按用户过滤并跳转至相关日志：" + u.UserID)
-				return m.switchPage(5)
+				return m.jumpToLogs(monitor.LogQuery{User: u.UserID}, "已按用户过滤并跳转至相关日志："+u.UserID)
 			}
 		case "enter":
 			if len(users) > 0 && m.cursors[1] < len(users) {
@@ -896,16 +887,7 @@ func (m *serverModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		case "g":
 			if len(tasks) > 0 && m.cursors[2] < len(tasks) {
 				t := tasks[m.cursors[2]]
-				m.logEpoch++
-				m.logQuery = monitor.LogQuery{User: t.User, File: t.File}
-				m.logMinLevel = ""
-				m.logSinceIdx = 0
-				m.logCursor = 0
-				m.logLost = false
-				m.logEvents = nil
-				m.logPaused = false
-				m.setToast(fmt.Sprintf("已跳转至 %s / %s 的相关日志", t.User, t.File))
-				return m.switchPage(5)
+				return m.jumpToLogs(monitor.LogQuery{User: t.User, File: t.File}, fmt.Sprintf("已跳转至 %s / %s 的相关日志", t.User, t.File))
 			}
 		case "enter":
 			if m.cursors[2] < len(tasks) {
@@ -1045,6 +1027,19 @@ func (m *serverModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 	}
 	return m, nil
+}
+
+func (m *serverModel) jumpToLogs(q monitor.LogQuery, toast string) (tea.Model, tea.Cmd) {
+	m.logEpoch++
+	m.logQuery = q
+	m.logMinLevel = ""
+	m.logSinceIdx = 0
+	m.logCursor = 0
+	m.logLost = false
+	m.logEvents = nil
+	m.logPaused = false
+	m.setToast(toast)
+	return m.switchPage(5)
 }
 
 func (m *serverModel) switchPage(idx int) (tea.Model, tea.Cmd) {
@@ -1340,13 +1335,16 @@ func (m *serverModel) showUserDetailModal(u config.AuthorizedClient) {
 	m.modal = srvModalDetail
 }
 
+func scrollInfoModalStep(width, height int, th theme, title string, lines []string, footer string, scroll *int, k string) {
+	_, maxScroll := renderModalScrollBox(width, height, th, title, lines, footer, *scroll)
+	if next, ok := modalScrollStep(k, *scroll, maxScroll, modalScrollBoxPageRows(height, footer)); ok {
+		*scroll = next
+	}
+}
+
 func (m *serverModel) scrollServerInfoModal(k string) {
 	title, lines, footer := m.infoModalData()
-	_, maxScroll := renderModalScrollBox(m.width, m.height, m.th, title, lines, footer, m.infoScroll)
-	next, ok := modalScrollStep(k, m.infoScroll, maxScroll, modalScrollBoxPageRows(m.height, footer))
-	if ok {
-		m.infoScroll = next
-	}
+	scrollInfoModalStep(m.width, m.height, m.th, title, lines, footer, &m.infoScroll, k)
 }
 
 func (m *serverModel) handleModalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {

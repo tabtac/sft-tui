@@ -1,11 +1,14 @@
 package pal
 
 import (
+	"database/sql"
 	"fmt"
 	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
+
+	_ "modernc.org/sqlite"
 )
 
 // SQLiteDSN constructs a cross-platform SQLite file: URI for modernc.org/sqlite.
@@ -91,4 +94,50 @@ func hasWindowsDrivePrefix(p string) bool {
 
 func hasWindowsLongPathPrefix(p string) bool {
 	return strings.HasPrefix(p, `\\?\`)
+}
+
+// OpenVerifiedSQLite 以单连接 WAL + FULL 持久性打开 SQLite 数据库并验证关键 PRAGMA 生效。
+func OpenVerifiedSQLite(dbPath, dsnQuery, schemaSQL string, preExec func(*sql.DB) error) (*sql.DB, error) {
+	dsn, err := SQLiteDSN(dbPath, dsnQuery)
+	if err != nil {
+		return nil, fmt.Errorf("failed to build sqlite dsn: %w", err)
+	}
+	db, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open sqlite database: %w", err)
+	}
+	// 保持连接池单连接写，避免多连接并发写入锁争用
+	db.SetMaxOpenConns(1)
+
+	fail := func(e error) (*sql.DB, error) {
+		db.Close()
+		return nil, e
+	}
+	if preExec != nil {
+		if err := preExec(db); err != nil {
+			return fail(err)
+		}
+	}
+	if _, err := db.Exec(schemaSQL); err != nil {
+		return fail(fmt.Errorf("failed to execute schema: %w", err))
+	}
+
+	var syncMode int
+	if err := db.QueryRow("PRAGMA synchronous;").Scan(&syncMode); err != nil {
+		return fail(fmt.Errorf("failed to verify pragma synchronous: %w", err))
+	}
+	// 2 == FULL, 3 == EXTRA (部分系统)
+	if syncMode != 2 && syncMode != 3 {
+		return fail(fmt.Errorf("sqlite synchronous pragma failed: expected FULL (2), got %d", syncMode))
+	}
+
+	var journalMode string
+	if err := db.QueryRow("PRAGMA journal_mode;").Scan(&journalMode); err != nil {
+		return fail(fmt.Errorf("failed to verify pragma journal_mode: %w", err))
+	}
+	if strings.ToUpper(journalMode) != "WAL" {
+		return fail(fmt.Errorf("sqlite journal_mode pragma failed: expected WAL, got %s", journalMode))
+	}
+
+	return db, nil
 }
