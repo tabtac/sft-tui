@@ -86,6 +86,12 @@ func NewMux(c *Conn, limit uint16, window uint32, incoming func(*Stream, protoco
 
 func (m *Mux) Context() context.Context { return m.ctx }
 
+func (m *Mux) Draining() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.draining
+}
+
 func (m *Mux) Error() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()

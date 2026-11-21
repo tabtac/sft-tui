@@ -157,7 +157,13 @@ func (c *Client) Close() error {
 func (c *Client) Connected() bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return !c.closed && c.mux != nil && c.mux.Context().Err() == nil
+	return !c.closed && c.mux != nil && c.mux.Context().Err() == nil && !c.mux.Draining()
+}
+
+func (c *Client) Draining() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.mux != nil && c.mux.Draining()
 }
 
 func (c *Client) Identity() string { return c.identity }

@@ -284,7 +284,7 @@ func (r *QueueRunner) Run(ctx context.Context, task queue.Task, op *queue.Operat
 			}
 		}
 
-		if !IsTransient(err) || attempt == 3 {
+		if (!IsTransient(err) && !isReconnectableRemote(err)) || attempt == 3 {
 			var remote *protocol.RemoteError
 			if task.HasCheckpoint() && errors.As(err, &remote) &&
 				(remote.Code == protocol.CodeTransferExpired || remote.Code == protocol.CodeNotFound) {
@@ -299,7 +299,10 @@ func (r *QueueRunner) Run(ctx context.Context, task queue.Task, op *queue.Operat
 			r.client = nil
 		}
 		r.mu.Unlock()
-		_ = c.Close()
+		// 若连接仅处于 GOAWAY 排空状态，保留旧连接让其上已有活跃流自然完成，仅由后续重试建立新连接。
+		if !c.Draining() {
+			_ = c.Close()
+		}
 
 		if r.manager != nil {
 			_ = r.manager.UpdateTask(task.ID, func(cur *queue.Task) {

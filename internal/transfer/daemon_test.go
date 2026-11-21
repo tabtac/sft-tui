@@ -250,3 +250,53 @@ func TestDaemonEmitsStructuredTransferLogsForUserAndFile(t *testing.T) {
 		t.Fatalf("expected completed transfer log for alice/audit-log.txt, got %+v", page.Events)
 	}
 }
+
+func TestDaemonGracefulStopBroadcastsGoAwayAndRespectsDrainTimeout(t *testing.T) {
+	srvCfg, aliceCfg, _ := daemonFixture(t)
+	d, err := NewDaemon(srvCfg)
+	if err != nil {
+		t.Fatalf("NewDaemon: %v", err)
+	}
+	defer d.Close()
+
+	ln, err := net.Listen("tcp", srvCfg.Listen)
+	if err != nil {
+		t.Fatal(err)
+	}
+	aliceCfg.ServerAddress = ln.Addr().String()
+
+	serveDone := make(chan error, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { serveDone <- d.Serve(ctx, ln) }()
+
+	opCtx, opCancel := context.WithTimeout(ctx, 10*time.Second)
+	defer opCancel()
+	cli, err := Dial(opCtx, aliceCfg)
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	defer cli.Close()
+
+	if !cli.Connected() {
+		t.Fatal("expected client to be connected before Stop")
+	}
+
+	d.Stop(false)
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) && cli.Connected() {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if cli.Connected() {
+		t.Fatal("expected idle client to become disconnected/draining after graceful Stop GOAWAY")
+	}
+
+	select {
+	case err := <-serveDone:
+		if err != nil {
+			t.Fatalf("Serve returned error: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("daemon did not exit after graceful Stop")
+	}
+}

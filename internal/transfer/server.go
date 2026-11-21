@@ -89,6 +89,8 @@ type connGate struct {
 	acquireHandshake func() (release func(), accepted bool)
 	onAuthenticate   func(raw net.Conn, user string) (connID uint64, ok bool)
 	onDisconnect     func(raw net.Conn, connID uint64)
+	onMuxOpen        func(m *session.Mux)
+	onMuxClose       func(m *session.Mux)
 }
 
 // HandleConn 对单条已接受的 TCP 连接执行 mTLS 1.3 握手、身份绑定与多路复用流调度。
@@ -223,6 +225,13 @@ func (s *Server) handleConn(ctx context.Context, raw net.Conn, gate *connGate) {
 			}
 		}()
 	})
+
+	if gate != nil && gate.onMuxOpen != nil {
+		gate.onMuxOpen(mux)
+		if gate.onMuxClose != nil {
+			defer gate.onMuxClose(mux)
+		}
+	}
 
 	stopConn := context.AfterFunc(ctx, func() {
 		mux.Close(ctx.Err())

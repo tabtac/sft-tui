@@ -799,6 +799,30 @@ func TestIsTransientRejectsDeadlineExceeded(t *testing.T) {
 	}
 }
 
+func TestTempUnavailableClassification(t *testing.T) {
+	rateErr := &protocol.RemoteError{Code: protocol.CodeTempUnavailable, Message: "用户任务初始化频率超限"}
+	if !IsRateLimited(rateErr) || isReconnectableRemote(rateErr) {
+		t.Fatalf("rate-limit error misclassified: rate=%v reconnect=%v", IsRateLimited(rateErr), isReconnectableRemote(rateErr))
+	}
+
+	for _, msg := range []string{"连接正在关闭", "新流未被服务端接受", "连接流历史已满，请重新连接", "连接空闲超时"} {
+		err := &protocol.RemoteError{Code: protocol.CodeTempUnavailable, Message: msg}
+		if IsRateLimited(err) {
+			t.Errorf("reconnectable error %q must not be classified as rate limit", msg)
+		}
+		if !isReconnectableRemote(err) {
+			t.Errorf("error %q must be classified as reconnectable", msg)
+		}
+	}
+
+	for _, msg := range []string{"服务正在排空，不再接收新任务", "服务端正在关闭", "对端未能完成文件操作", "流控制队列已满"} {
+		err := &protocol.RemoteError{Code: protocol.CodeTempUnavailable, Message: msg}
+		if IsRateLimited(err) || isReconnectableRemote(err) {
+			t.Errorf("non-retryable temp error %q misclassified: rate=%v reconnect=%v", msg, IsRateLimited(err), isReconnectableRemote(err))
+		}
+	}
+}
+
 func TestRunnerCloseNeverReturnsNilClientWithoutError(t *testing.T) {
 	r := NewQueueRunner(config.Client{}, nil)
 	origCancel := r.cancel

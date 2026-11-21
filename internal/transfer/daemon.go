@@ -7,30 +7,36 @@ import (
 	"net"
 	"slices"
 	"sync"
+	"syscall"
 	"time"
 
 	"sft-tui/internal/config"
 	"sft-tui/internal/monitor"
+	"sft-tui/internal/protocol"
 	"sft-tui/internal/ratelimit"
 	"sft-tui/internal/security"
+	"sft-tui/internal/session"
 	"sft-tui/internal/storage"
 )
 
 // Daemon 集成存储引擎、mTLS 授权器、全球/单用户令牌桶限流、运行监控与配置热重载，
 // 复用 Server 的 SFT/1 连接处理与传输协议逻辑，实现完整的 sftd 服务端生命周期。
 type Daemon struct {
-	cfg       config.Server
-	server    *Server
-	store     *storage.Store
-	auth      *security.Authorizer
-	rates     *ratelimit.Users
-	runtime   *monitor.Runtime
-	logger    *slog.Logger
-	reloadMu  sync.Mutex
-	lifecycle sync.Mutex
-	listener  net.Listener
-	force     chan struct{}
-	forceOnce sync.Once
+	cfg          config.Server
+	server       *Server
+	store        *storage.Store
+	auth         *security.Authorizer
+	rates        *ratelimit.Users
+	runtime      *monitor.Runtime
+	logger       *slog.Logger
+	reloadMu     sync.Mutex
+	lifecycle    sync.Mutex
+	listener     net.Listener
+	muxMu        sync.Mutex
+	muxes        map[*session.Mux]struct{}
+	drainTimeout time.Duration
+	force        chan struct{}
+	forceOnce    sync.Once
 }
 
 func NewDaemon(c config.Server) (*Daemon, error) {
@@ -82,8 +88,16 @@ func NewDaemonWithLogger(c config.Server, logger *slog.Logger) (*Daemon, error) 
 		rates:   rates,
 		runtime: rt,
 		logger:  logger,
+		muxes:   make(map[*session.Mux]struct{}),
 		force:   make(chan struct{}),
 	}, nil
+}
+
+// SetDrainTimeout 设置优雅停服排空超时；为 0 表示等待活动流自然完成或空闲超时。
+func (d *Daemon) SetDrainTimeout(timeout time.Duration) {
+	d.lifecycle.Lock()
+	d.drainTimeout = timeout
+	d.lifecycle.Unlock()
 }
 
 func (d *Daemon) Close() error {
@@ -180,9 +194,24 @@ func (d *Daemon) Serve(ctx context.Context, listener net.Listener) error {
 	defer func() {
 		_ = listener.Close()
 		drained := d.runtime.Drain(false)
-		select {
-		case <-drained:
-		case <-d.force:
+		d.broadcastGoAway()
+		d.lifecycle.Lock()
+		drainTimeout := d.drainTimeout
+		d.lifecycle.Unlock()
+		if drainTimeout > 0 {
+			timer := time.NewTimer(drainTimeout)
+			select {
+			case <-drained:
+			case <-d.force:
+			case <-timer.C:
+				d.logger.Warn("优雅停服排空超时，强制关闭剩余连接", "timeout", drainTimeout)
+			}
+			timer.Stop()
+		} else {
+			select {
+			case <-drained:
+			case <-d.force:
+			}
 		}
 		mu.Lock()
 		for conn := range active {
@@ -230,17 +259,54 @@ func (d *Daemon) Serve(ctx context.Context, listener net.Listener) error {
 		onDisconnect: func(_ net.Conn, cid uint64) {
 			d.runtime.Disconnect(cid)
 		},
+		onMuxOpen: func(m *session.Mux) {
+			d.muxMu.Lock()
+			if d.muxes == nil {
+				d.muxes = make(map[*session.Mux]struct{})
+			}
+			d.muxes[m] = struct{}{}
+			d.muxMu.Unlock()
+			if d.runtime.Snapshot().State != "running" {
+				go func() { _ = m.GoAway(protocol.CodeTempUnavailable, 0) }()
+			}
+		},
+		onMuxClose: func(m *session.Mux) {
+			d.muxMu.Lock()
+			delete(d.muxes, m)
+			d.muxMu.Unlock()
+		},
 	}
 
+	var acceptDelay time.Duration
 	for {
 		raw, err := listener.Accept()
 		if err != nil {
 			if ctx.Err() != nil || errors.Is(err, net.ErrClosed) {
 				return nil
 			}
+			if isTemporaryAcceptError(err) {
+				if acceptDelay == 0 {
+					acceptDelay = 5 * time.Millisecond
+				} else {
+					acceptDelay = min(acceptDelay*2, time.Second)
+				}
+				d.logger.Warn("接受 TCP 连接遇到临时错误，稍后重试", "error", err, "backoff", acceptDelay)
+				timer := time.NewTimer(acceptDelay)
+				select {
+				case <-timer.C:
+					continue
+				case <-ctx.Done():
+					timer.Stop()
+					return nil
+				case <-d.force:
+					timer.Stop()
+					return nil
+				}
+			}
 			d.Stop(true)
 			return err
 		}
+		acceptDelay = 0
 		select {
 		case connections <- struct{}{}:
 		default:
@@ -343,6 +409,28 @@ func (d *Daemon) Snapshot() monitor.Snapshot {
 	return snap
 }
 
+func (d *Daemon) broadcastGoAway() {
+	d.muxMu.Lock()
+	list := make([]*session.Mux, 0, len(d.muxes))
+	for m := range d.muxes {
+		list = append(list, m)
+	}
+	d.muxMu.Unlock()
+	for _, m := range list {
+		go func(mux *session.Mux) {
+			_ = mux.GoAway(protocol.CodeTempUnavailable, 0)
+		}(m)
+	}
+}
+
+func isTemporaryAcceptError(err error) bool {
+	if errors.Is(err, syscall.EMFILE) || errors.Is(err, syscall.ENFILE) || errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.ECONNABORTED) {
+		return true
+	}
+	var ne net.Error
+	return errors.As(err, &ne) && ne.Timeout()
+}
+
 func (d *Daemon) Stop(immediate bool) {
 	d.lifecycle.Lock()
 	d.runtime.Drain(immediate)
@@ -353,5 +441,8 @@ func (d *Daemon) Stop(immediate bool) {
 		_ = d.listener.Close()
 	}
 	d.lifecycle.Unlock()
+	if !immediate {
+		d.broadcastGoAway()
+	}
 	d.logger.Info("收到服务停止指令", "immediate", immediate)
 }

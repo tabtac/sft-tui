@@ -49,16 +49,27 @@ func IsTransient(err error) bool {
 		errors.Is(err, net.ErrClosed)
 }
 
-// IsRateLimited 判断错误是否为服务端临时限流（CodeTempUnavailable 且非排空停机），可经有界退避后重试。
+// IsRateLimited 判断错误是否为服务端限流（如任务初始化频率超限），可保持当前连接按有界退避重试。
 func IsRateLimited(err error) bool {
 	var remote *protocol.RemoteError
-	if !errors.As(err, &remote) {
+	if !errors.As(err, &remote) || remote.Code != protocol.CodeTempUnavailable {
 		return false
 	}
-	if remote.Code != protocol.CodeTempUnavailable {
+	return strings.Contains(remote.Message, "频率超限") || strings.Contains(remote.Message, "限流")
+}
+
+// isReconnectableRemote 判断远端临时错误是否属于连接关闭/轮换/空闲超时，应切换新连接重连。
+func isReconnectableRemote(err error) bool {
+	var remote *protocol.RemoteError
+	if !errors.As(err, &remote) || remote.Code != protocol.CodeTempUnavailable {
 		return false
 	}
-	return !strings.Contains(remote.Message, "排空")
+	switch remote.Message {
+	case "连接正在关闭", "新流未被服务端接受", "连接流历史已满，请重新连接", "连接空闲超时":
+		return true
+	default:
+		return false
+	}
 }
 
 func isFatalTransfer(err error) bool {
