@@ -5,14 +5,20 @@ import (
 	"time"
 )
 
-// Snapshot 获取队列当前状态的一致性只读快照。
-// 专为 TUI 60FPS 渲染设计：当主锁被写事务占用时通过 TryLock 立即返回上一个安全视图，绝不阻塞渲染主循环。
+// Snapshot 获取队列当前状态的强一致性只读快照（阻塞加锁），适用于 CLI、IPC 控制与测试断言。
 func (m *Manager) Snapshot(history bool) []Task {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.snapshotLocked(history)
+}
+
+// TrySnapshot 以非阻塞方式获取队列快照，专为 TUI 60FPS 渲染设计：
+// 当主锁被写事务占用时通过 TryLock 立即返回上一个安全缓存视图，绝不阻塞界面主循环。
+func (m *Manager) TrySnapshot(history bool) []Task {
 	cache := &m.currentView
 	if history {
 		cache = &m.historyView
 	}
-
 	if !m.mu.TryLock() {
 		if last := cache.Load(); last != nil {
 			return append([]Task(nil), (*last)...)
@@ -20,6 +26,14 @@ func (m *Manager) Snapshot(history bool) []Task {
 		return nil
 	}
 	defer m.mu.Unlock()
+	return m.snapshotLocked(history)
+}
+
+func (m *Manager) snapshotLocked(history bool) []Task {
+	cache := &m.currentView
+	if history {
+		cache = &m.historyView
+	}
 
 	if now := time.Now(); !now.Before(m.nextPrune) {
 		m.pruneRecords(now)

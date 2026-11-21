@@ -52,6 +52,58 @@ func TestSnapshotReuseInvalidationAndIsolation(t *testing.T) {
 	}
 }
 
+func TestSnapshotBlockingVsTrySnapshotNonBlocking(t *testing.T) {
+	m, dir := newTestManager(t)
+
+	srcFile := filepath.Join(dir, "lock-test.bin")
+	_ = os.WriteFile(srcFile, []byte("abcd"), 0600)
+
+	tasks, err := m.Enqueue([]Spec{
+		{Direction: protocol.DirectionUpload, Remote: "lock-test.bin", Path: srcFile, Size: 4},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 先预热一次缓存
+	if got := m.Snapshot(false); len(got) != 1 || got[0].Done != 0 {
+		t.Fatalf("unexpected initial snapshot: %+v", got)
+	}
+
+	// 模拟写事务持有 m.mu 并更新内存状态
+	m.mu.Lock()
+	m.tasks[tasks[0].ID].Done = 4
+	m.currentDirty = true
+
+	// TrySnapshot 不应阻塞，且应返回旧缓存副本
+	trySnap := m.TrySnapshot(false)
+	if len(trySnap) != 1 || trySnap[0].Done != 0 {
+		m.mu.Unlock()
+		t.Fatalf("expected TrySnapshot to return cached snapshot without blocking, got %+v", trySnap)
+	}
+
+	// Snapshot 必须等待锁释放并返回最新一致状态
+	snapDone := make(chan []Task, 1)
+	go func() {
+		snapDone <- m.Snapshot(false)
+	}()
+	select {
+	case got := <-snapDone:
+		m.mu.Unlock()
+		t.Fatalf("Snapshot returned while mutex was still held: %+v", got)
+	case <-time.After(30 * time.Millisecond):
+	}
+
+	m.mu.Unlock()
+	select {
+	case got := <-snapDone:
+		if len(got) != 1 || got[0].Done != 4 {
+			t.Fatalf("expected consistent updated snapshot after unlock, got %+v", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Snapshot did not complete after mutex release")
+	}
+}
+
 func TestActiveSnapshotSpeedAndETA(t *testing.T) {
 	m, dir := newTestManager(t)
 

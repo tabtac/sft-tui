@@ -2375,8 +2375,12 @@ func (m *model) refreshQueueSnapshots() bool {
 	if m.manager == nil {
 		return false
 	}
-	m.activeTasks = m.manager.Snapshot(false)
-	m.historyTasks = m.manager.Snapshot(true)
+	if snap := m.manager.TrySnapshot(false); snap != nil {
+		m.activeTasks = snap
+	}
+	if hist := m.manager.TrySnapshot(true); hist != nil {
+		m.historyTasks = hist
+	}
 	hasUnfinished := false
 	for _, t := range m.activeTasks {
 		if !t.Terminal() {
