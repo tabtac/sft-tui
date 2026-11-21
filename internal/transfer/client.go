@@ -373,6 +373,37 @@ func decodeDigestHex(s string) (protocol.Digest, error) {
 	return out, nil
 }
 
+// ensureUploadInitCheckpoint 在发送 PUT 前一次性原子持久化 RequestID、文件大小与摘要，
+// 避免在两次持久化之间中断留下仅有 RequestID 而缺少摘要的不可取消任务。
+func ensureUploadInitCheckpoint(t *queue.Task, size uint64, hashHex string, update CheckpointUpdater) (protocol.RequestID, error) {
+	var reqID protocol.RequestID
+	var reqHex string
+	if t.RequestID != "" {
+		id, err := decodeHex16(t.RequestID)
+		if err != nil {
+			return reqID, fmt.Errorf("持久化请求 ID 无效：%w", err)
+		}
+		reqID = protocol.RequestID(id)
+		reqHex = t.RequestID
+	} else {
+		if _, err := io.ReadFull(rand.Reader, reqID[:]); err != nil {
+			return reqID, err
+		}
+		reqHex = hex.EncodeToString(reqID[:])
+	}
+	if err := update(func(cur *queue.Task) {
+		cur.RequestID = reqHex
+		cur.Size = size
+		cur.SHA256 = hashHex
+	}); err != nil {
+		return reqID, err
+	}
+	t.RequestID = reqHex
+	t.Size = size
+	t.SHA256 = hashHex
+	return reqID, nil
+}
+
 func ensureRequestID(t *queue.Task, update CheckpointUpdater) (protocol.RequestID, error) {
 	if t.RequestID != "" {
 		id, err := decodeHex16(t.RequestID)
@@ -458,17 +489,10 @@ func (c *Client) executeUpload(ctx context.Context, task *queue.Task, op *queue.
 		return result, &protocol.RemoteError{Code: protocol.CodeMetadataMismatch, Message: "源文件摘要与断点检查点不符"}
 	}
 
-	reqID, err := ensureRequestID(task, update)
+	reqID, err := ensureUploadInitCheckpoint(task, size, hashHex, update)
 	if err != nil {
 		return result, err
 	}
-	if err = update(func(cur *queue.Task) {
-		cur.Size = size
-		cur.SHA256 = hashHex
-	}); err != nil {
-		return result, err
-	}
-	task.Size, task.SHA256 = size, hashHex
 	result = Result{FileName: task.Remote, Size: size, SHA256: hash}
 
 	st, release, err := c.openStream(runCtx, protocol.DirectionUpload)
@@ -1173,18 +1197,18 @@ func applyCancelAck(payload []byte, mode protocol.CancelMode, task *queue.Task, 
 	return ErrPaused
 }
 
-func (c *Client) abortCheckpoint(parent context.Context, task *queue.Task, update CheckpointUpdater) error {
+func (c *Client) abortCheckpoint(parent context.Context, task *queue.Task, update CheckpointUpdater) (err error) {
 	if !task.HasCheckpoint() {
 		return nil
 	}
 	var dlRoot *pal.Root
 	if task.Direction == protocol.DirectionDownload && task.Path != "" {
-		r, err := pal.OpenUserRoot(filepath.Dir(task.Path))
-		if err == nil {
+		r, openErr := pal.OpenUserRoot(filepath.Dir(task.Path))
+		if openErr == nil {
 			dlRoot = r
 			defer dlRoot.Close()
-		} else if !os.IsNotExist(err) && task.TempName != "" {
-			return err
+		} else if !os.IsNotExist(openErr) && task.TempName != "" {
+			return openErr
 		}
 	}
 
@@ -1203,6 +1227,10 @@ func (c *Client) abortCheckpoint(parent context.Context, task *queue.Task, updat
 	if task.TransferID == "" && task.RequestID == "" {
 		return discardLocal()
 	}
+	// 上传任务若仅有 RequestID 而尚未保存摘要，则 PUT 必然尚未发出，可直接安全放弃本地检查点。
+	if task.Direction == protocol.DirectionUpload && task.TransferID == "" && task.SHA256 == "" {
+		return discardLocal()
+	}
 
 	st, release, err := c.openStream(ctx, task.Direction)
 	if err != nil {
@@ -1210,9 +1238,35 @@ func (c *Client) abortCheckpoint(parent context.Context, task *queue.Task, updat
 	}
 	defer release()
 
+	requestSent := false
+	settled := false
+	defer func() {
+		if err == nil || !requestSent || settled || st.PeerFailed() {
+			return
+		}
+		cleanCtx, cleanCancel := context.WithTimeout(st.Context(), 2*time.Second)
+		defer cleanCancel()
+		if sendErr := st.SendContext(cleanCtx, protocol.TypeCancel, protocol.Cancel{Mode: protocol.CancelPause}); sendErr == nil {
+			for {
+				f, recvErr := st.ReceiveContext(cleanCtx)
+				if recvErr != nil {
+					st.Report(err)
+					_ = c.Close()
+					return
+				}
+				if f.Header.Type == protocol.TypeCancelAck {
+					return
+				}
+			}
+		}
+		st.Report(err)
+		_ = c.Close()
+	}()
+
 	var handleRemoteCleanup = func(e error) error {
 		var remote *protocol.RemoteError
 		if errors.As(e, &remote) {
+			settled = true
 			switch remote.Code {
 			case protocol.CodeNotFound,
 				protocol.CodeTransferExpired,
@@ -1247,6 +1301,7 @@ func (c *Client) abortCheckpoint(parent context.Context, task *queue.Task, updat
 		if task.Direction == protocol.DirectionDownload {
 			offset = task.Done
 		}
+		requestSent = true
 		if err = st.SendContext(ctx, protocol.TypeResumeReq, protocol.ResumeRequest{
 			TransferID:   protocol.TransferID(tid),
 			Direction:    task.Direction,
@@ -1260,6 +1315,7 @@ func (c *Client) abortCheckpoint(parent context.Context, task *queue.Task, updat
 			return handleRemoteCleanup(err)
 		}
 		if resp.State == protocol.ResponseCompleted {
+			settled = true
 			return discardLocal()
 		}
 	} else {
@@ -1272,6 +1328,7 @@ func (c *Client) abortCheckpoint(parent context.Context, task *queue.Task, updat
 			if e != nil {
 				return e
 			}
+			requestSent = true
 			if err = st.SendContext(ctx, protocol.TypePutReq, protocol.PutRequest{
 				RequestID:  protocol.RequestID(reqID),
 				FileName:   task.Remote,
@@ -1285,12 +1342,16 @@ func (c *Client) abortCheckpoint(parent context.Context, task *queue.Task, updat
 				return handleRemoteCleanup(err)
 			}
 			if resp.State == protocol.ResponseCompleted {
+				settled = true
 				return discardLocal()
 			}
 			tidHex := hex.EncodeToString(resp.TransferID[:])
-			_ = update(func(cur *queue.Task) { cur.TransferID = tidHex })
+			if err = update(func(cur *queue.Task) { cur.TransferID = tidHex }); err != nil {
+				return err
+			}
 			task.TransferID = tidHex
 		} else {
+			requestSent = true
 			if err = st.SendContext(ctx, protocol.TypeGetReq, protocol.GetRequest{
 				RequestID: protocol.RequestID(reqID),
 				FileName:  task.Remote,
@@ -1302,11 +1363,21 @@ func (c *Client) abortCheckpoint(parent context.Context, task *queue.Task, updat
 				return handleRemoteCleanup(err)
 			}
 			if resp.State == protocol.ResponseCompleted {
+				settled = true
 				return discardLocal()
 			}
 			tidHex := hex.EncodeToString(resp.TransferID[:])
-			_ = update(func(cur *queue.Task) { cur.TransferID = tidHex })
+			shaHex := hex.EncodeToString(resp.FileSHA256[:])
+			if err = update(func(cur *queue.Task) {
+				cur.TransferID = tidHex
+				cur.Size = resp.FileSize
+				cur.SHA256 = shaHex
+			}); err != nil {
+				return err
+			}
 			task.TransferID = tidHex
+			task.Size = resp.FileSize
+			task.SHA256 = shaHex
 		}
 	}
 
@@ -1314,9 +1385,9 @@ func (c *Client) abortCheckpoint(parent context.Context, task *queue.Task, updat
 		return err
 	}
 	for {
-		frame, err := st.ReceiveContext(ctx)
-		if err != nil {
-			return handleRemoteCleanup(err)
+		frame, recvErr := st.ReceiveContext(ctx)
+		if recvErr != nil {
+			return handleRemoteCleanup(recvErr)
 		}
 		if frame.Header.Type == protocol.TypeData || frame.Header.Type == protocol.TypeAck {
 			continue
@@ -1324,6 +1395,7 @@ func (c *Client) abortCheckpoint(parent context.Context, task *queue.Task, updat
 		if frame.Header.Type != protocol.TypeCancelAck {
 			return fmt.Errorf("取消确认收到非预期帧类型 %d", frame.Header.Type)
 		}
+		settled = true
 		err = applyCancelAck(frame.Payload, protocol.CancelAbort, task, dlRoot, update)
 		if errors.Is(err, ErrCancelled) {
 			return nil

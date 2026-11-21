@@ -798,3 +798,116 @@ func TestIsTransientRejectsDeadlineExceeded(t *testing.T) {
 		t.Fatal("wrapped context.DeadlineExceeded must not be treated as transient")
 	}
 }
+
+func TestRunnerCloseNeverReturnsNilClientWithoutError(t *testing.T) {
+	r := NewQueueRunner(config.Client{}, nil)
+	origCancel := r.cancel
+	entered := make(chan struct{})
+	resume := make(chan struct{})
+	done := make(chan struct{})
+	r.cancel = func() {
+		close(entered)
+		<-resume
+		origCancel()
+	}
+	go func() {
+		defer close(done)
+		_ = r.Close()
+	}()
+	<-entered
+	c, err := r.GetClient(context.Background())
+	if c != nil || err == nil {
+		t.Fatalf("expected non-nil error during close transition, got client=%v err=%v", c, err)
+	}
+	if _, listErr := r.List(context.Background()); listErr == nil {
+		t.Fatal("expected List during close transition to return error without panicking")
+	}
+	close(resume)
+	<-done
+}
+
+func TestAbortTimeoutReleasesRemoteLeaseAndSavesFullDownloadMetadata(t *testing.T) {
+	h := startTestServer(t)
+	c, err := Dial(context.Background(), h.cliCfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	// 1. 取消流程超时后必须释放远端租约，后续取消不得报 Busy
+	var req protocol.RequestID
+	req[0] = 91
+	digest := sha256.Sum256([]byte("abcdefgh"))
+	upTask := queue.Task{
+		Direction:  protocol.DirectionUpload,
+		Remote:     "orphan.txt",
+		Path:       filepath.Join(t.TempDir(), "src.txt"),
+		Size:       8,
+		SHA256:     hex.EncodeToString(digest[:]),
+		WantCancel: true,
+		RequestID:  hex.EncodeToString(req[:]),
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 80*time.Millisecond)
+	defer cancel()
+	_, firstErr := c.Execute(ctx, upTask, nil, nil, func(fn func(*queue.Task)) error {
+		fn(&upTask)
+		if upTask.TransferID != "" {
+			<-ctx.Done()
+		}
+		return nil
+	})
+	if upTask.TransferID == "" || firstErr == nil {
+		t.Fatalf("fixture did not trigger timeout after transfer response: tid=%q err=%v", upTask.TransferID, firstErr)
+	}
+	if _, secondErr := c.Execute(context.Background(), upTask, nil, nil, func(fn func(*queue.Task)) error { fn(&upTask); return nil }); secondErr != nil {
+		t.Fatalf("retry abort failed after timeout (stale remote lease): %v", secondErr)
+	}
+
+	// 2. 下载取消恢复必须一并保存 TransferID、Size、SHA256，中断后重试仍可取消
+	src := filepath.Join(t.TempDir(), "src.txt")
+	if err := os.WriteFile(src, []byte("remote content"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.UploadFile(context.Background(), src, "remote.txt", nil); err != nil {
+		t.Fatal(err)
+	}
+	var dlReq protocol.RequestID
+	dlReq[0] = 42
+	dlTask := queue.Task{
+		Direction:  protocol.DirectionDownload,
+		Remote:     "remote.txt",
+		Path:       filepath.Join(t.TempDir(), "out.txt"),
+		WantCancel: true,
+		RequestID:  hex.EncodeToString(dlReq[:]),
+	}
+	_, _ = c.Execute(context.Background(), dlTask, nil, nil, func(fn func(*queue.Task)) error {
+		fn(&dlTask)
+		if dlTask.TransferID != "" {
+			_ = c.Close()
+		}
+		return nil
+	})
+	if dlTask.TransferID == "" || dlTask.SHA256 == "" || dlTask.Size == 0 {
+		t.Fatalf("download abort recovery persisted incomplete metadata: %+v", dlTask)
+	}
+	next, err := Dial(context.Background(), h.cliCfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer next.Close()
+	if _, retryErr := next.Execute(context.Background(), dlTask, nil, nil, func(fn func(*queue.Task)) error { fn(&dlTask); return nil }); retryErr != nil {
+		t.Fatalf("retry download abort failed: %v", retryErr)
+	}
+
+	// 3. 上传原子保存 RequestID+Size+SHA256，且遗留无摘要 RequestID 任务在源文件删除后也可安全取消
+	legacy := queue.Task{
+		Direction:  protocol.DirectionUpload,
+		Remote:     "never-sent.txt",
+		Path:       filepath.Join(t.TempDir(), "deleted.txt"),
+		RequestID:  hex.EncodeToString(req[:]),
+		WantCancel: true,
+	}
+	if _, err := next.Execute(context.Background(), legacy, nil, nil, func(fn func(*queue.Task)) error { fn(&legacy); return nil }); err != nil {
+		t.Fatalf("upload task with RequestID but no SHA256 should cancel cleanly: %v", err)
+	}
+}

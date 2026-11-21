@@ -80,8 +80,12 @@ func (r *QueueRunner) GetClient(ctx context.Context) (*Client, error) {
 		}
 		r.mu.Lock()
 		if r.closed || r.ctx.Err() != nil {
+			err := r.ctx.Err()
 			r.mu.Unlock()
-			return nil, r.ctx.Err()
+			if err == nil {
+				err = context.Canceled
+			}
+			return nil, err
 		}
 		if r.client != nil && r.client.Connected() {
 			c := r.client
@@ -149,10 +153,13 @@ func (r *QueueRunner) dial(wait chan struct{}) {
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if r.ctx.Err() != nil && c != nil {
+	if (r.closed || r.ctx.Err() != nil) && c != nil {
 		_ = c.Close()
 		c = nil
 		err = r.ctx.Err()
+		if err == nil {
+			err = context.Canceled
+		}
 	}
 	r.client = c
 	r.dialErr = err
