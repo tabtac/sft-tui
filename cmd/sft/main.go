@@ -497,9 +497,10 @@ func runTransfers(mgr *queue.Manager, cfg config.Client, jobs []cliJob, outDir, 
 		if prevPath, dup := seenTargets[key]; dup {
 			if !sameTransferPath(prevPath, localPath) {
 				fmt.Fprintf(errOut, "sft：同一批次中存在同名但路径不同的目标 %s（%s 与 %s）\n", remote, prevPath, localPath)
-				return 1
+			} else {
+				fmt.Fprintf(errOut, "sft：同一批次中重复指定了目标 %s\n", remote)
 			}
-			continue
+			return 1
 		}
 		seenTargets[key] = localPath
 
