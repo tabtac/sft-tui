@@ -328,3 +328,49 @@ func TestMuxRejectTruncatesOversizedErrorMessage(t *testing.T) {
 		t.Fatalf("oversized mux.reject broke shared mux connection: %v", cli.Error())
 	}
 }
+
+func TestMuxOneSecondIdleTimeoutKeepsHealthyTCPAlive(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	srvConnCh := make(chan net.Conn, 1)
+	go func() {
+		c, err := ln.Accept()
+		if err == nil {
+			srvConnCh <- c
+		}
+	}()
+
+	cliNet, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	srvNet := <-srvConnCh
+
+	timeouts := testTimeouts()
+	timeouts.IdleSeconds = 1
+	timeouts.WriteSeconds = 2
+
+	cli := NewMux(&Conn{Net: cliNet, Chunk: 4096, Timeouts: timeouts}, 2, 65536, nil)
+	srv := NewMux(&Conn{Net: srvNet, Chunk: 4096, Timeouts: timeouts}, 2, 65536, func(st *Stream, f protocol.Frame) {
+		st.Release()
+	})
+	defer func() {
+		cli.Close(io.EOF)
+		srv.Close(io.EOF)
+		cli.Wait()
+		srv.Wait()
+	}()
+
+	// 跨越 3 个以上的 1 秒空闲超时周期，健康连接必须保持活跃
+	select {
+	case <-cli.Context().Done():
+		t.Fatalf("healthy idle client disconnected with idle_seconds=1: %v", cli.Error())
+	case <-srv.Context().Done():
+		t.Fatalf("healthy idle server disconnected with idle_seconds=1: %v", srv.Error())
+	case <-time.After(3500 * time.Millisecond):
+	}
+}

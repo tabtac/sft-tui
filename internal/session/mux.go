@@ -684,13 +684,20 @@ func (m *Mux) reader() {
 	}
 }
 
+func heartbeatInterval(idle uint16) time.Duration {
+	if idle == 0 {
+		idle = 1
+	}
+	interval := min(30*time.Second, time.Duration(idle)*time.Second/3)
+	if interval < 250*time.Millisecond {
+		interval = 250 * time.Millisecond
+	}
+	return interval
+}
+
 func (m *Mux) heartbeat() {
 	defer m.wg.Done()
-	idle := m.idleSeconds()
-	interval := min(30*time.Second, time.Duration(idle)*time.Second/3)
-	if interval < time.Second {
-		interval = time.Second
-	}
+	interval := heartbeatInterval(m.idleSeconds())
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {

@@ -6,6 +6,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -100,4 +101,32 @@ func TestReviewUnixIPCSecondListenerPreservesFirst(t *testing.T) {
 	if err != nil {
 		t.Errorf("failed second listener damaged first endpoint: %v", err)
 	}
+}
+
+func TestUnixIPCLongChineseStoragePathUsesShortRuntimeSocket(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), strings.Repeat("深", 30), "storage")
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	endpoint := GetIPCPath(dir)
+	if len(endpoint) > maxUnixSocketPathBytes {
+		t.Fatalf("expected short socket path <= %d bytes, got %d (%q)", maxUnixSocketPathBytes, len(endpoint), endpoint)
+	}
+	if endpoint != GetIPCPath(filepath.Join(dir, ".")) {
+		t.Fatalf("equivalent long paths produced different endpoints: %q vs %q", endpoint, GetIPCPath(filepath.Join(dir, ".")))
+	}
+	listener, err := ListenIPC(endpoint)
+	if err != nil {
+		t.Fatalf("ListenIPC(%q) failed: %v", endpoint, err)
+	}
+	defer func() {
+		_ = listener.Close()
+		_ = os.Remove(endpoint)
+	}()
+
+	conn, err := DialIPC(endpoint, time.Second)
+	if err != nil {
+		t.Fatalf("DialIPC(%q) failed: %v", endpoint, err)
+	}
+	_ = conn.Close()
 }
