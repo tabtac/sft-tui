@@ -3,6 +3,7 @@ package transfer
 import (
 	"context"
 	"crypto/tls"
+	"encoding/hex"
 	"errors"
 	"io"
 	"net"
@@ -303,14 +304,65 @@ func (s *Server) progress(taskID uint64, offset uint64, phase string) {
 	}
 }
 
+type transferLogMeta struct {
+	file       string
+	transferID string
+	size       uint64
+	offset     uint64
+}
+
+func extractInitialFileName(initial protocol.Frame) string {
+	switch initial.Header.Type {
+	case protocol.TypePutReq:
+		var req protocol.PutRequest
+		if protocol.Unmarshal(initial.Payload, &req) == nil {
+			return req.FileName
+		}
+	case protocol.TypeGetReq:
+		var req protocol.GetRequest
+		if protocol.Unmarshal(initial.Payload, &req) == nil {
+			return req.FileName
+		}
+	}
+	return ""
+}
+
 func (s *Server) runStream(user string, st *session.Stream, initial protocol.Frame, monID uint64) (resultErr error) {
 	outcome := "completed"
+	isTransfer := initial.Header.Type != protocol.TypeListReq
+	opName := "upload"
+	meta := &transferLogMeta{file: extractInitialFileName(initial)}
 	defer func() {
 		if resultErr != nil && outcome == "completed" {
 			outcome = "failed"
 		}
 		if s.hooks.OnStreamEnd != nil {
 			s.hooks.OnStreamEnd(monID, outcome, resultErr)
+		}
+		if !isTransfer {
+			return
+		}
+		attrs := []any{
+			"user", user,
+			"file", meta.file,
+			"direction", opName,
+			"result", outcome,
+			"size", meta.size,
+			"offset", meta.offset,
+		}
+		if meta.transferID != "" {
+			attrs = append(attrs, "transfer_id", meta.transferID)
+		}
+		if resultErr != nil {
+			attrs = append(attrs, "error", resultErr.Error())
+		}
+		switch outcome {
+		case "completed":
+			s.logger.Info("传输完成", attrs...)
+		case "paused", "cancelled":
+			s.logger.Info("传输结束", attrs...)
+		default:
+			s.logger.Warn("传输失败", attrs...)
 		}
 	}()
 
@@ -334,7 +386,6 @@ func (s *Server) runStream(user string, st *session.Stream, initial protocol.Fra
 		dir = resume.Direction
 	}
 
-	opName := "upload"
 	if dir == protocol.DirectionDownload {
 		opName = "download"
 	}
@@ -354,10 +405,10 @@ func (s *Server) runStream(user string, st *session.Stream, initial protocol.Fra
 	defer release()
 
 	if dir == protocol.DirectionUpload {
-		outcome, err = s.handleUpload(user, principal.Bandwidth, st, initial, resume, monID, release)
+		outcome, err = s.handleUpload(user, principal.Bandwidth, st, initial, resume, monID, release, meta)
 		return err
 	}
-	outcome, err = s.handleDownload(user, principal.Bandwidth, st, initial, resume, monID, release)
+	outcome, err = s.handleDownload(user, principal.Bandwidth, st, initial, resume, monID, release, meta)
 	return err
 }
 
@@ -401,7 +452,7 @@ func (s *Server) runList(user string, st *session.Stream, initial protocol.Frame
 	}
 }
 
-func (s *Server) handleUpload(user string, bw config.Bandwidth, st *session.Stream, initial protocol.Frame, resume protocol.ResumeRequest, monID uint64, release func()) (outcome string, resultErr error) {
+func (s *Server) handleUpload(user string, bw config.Bandwidth, st *session.Stream, initial protocol.Frame, resume protocol.ResumeRequest, monID uint64, release func(), meta *transferLogMeta) (outcome string, resultErr error) {
 	outcome = "completed"
 	var task storage.Task
 	var lease uint64
@@ -419,7 +470,20 @@ func (s *Server) handleUpload(user string, bw config.Bandwidth, st *session.Stre
 		return "failed", err
 	}
 
+	meta.file = task.FileName
+	meta.transferID = hex.EncodeToString(task.ID[:])
+	meta.size = task.FileSize
+	meta.offset = task.Offset
 	s.describe(monID, task.FileName, task.FileSize, task.Offset)
+	s.logger.Info("传输开始",
+		"user", user,
+		"file", task.FileName,
+		"direction", "upload",
+		"transfer_id", meta.transferID,
+		"size", task.FileSize,
+		"offset", task.Offset,
+		"resumed", initial.Header.Type == protocol.TypeResumeReq,
+	)
 
 	settled := false
 	defer func() {
@@ -476,6 +540,7 @@ func (s *Server) handleUpload(user string, bw config.Bandwidth, st *session.Stre
 			return err
 		}
 		committedOffset = committed
+		meta.offset = committedOffset
 		lastFlush = time.Now()
 		s.progress(monID, committedOffset, "传输")
 		return st.Send(protocol.TypeAck, protocol.Ack{NextOffset: committedOffset})
@@ -563,6 +628,7 @@ func (s *Server) handleUpload(user string, bw config.Bandwidth, st *session.Stre
 				return "failed", err
 			}
 			settled = true
+			meta.offset = task.FileSize
 			release()
 			return "completed", st.Send(protocol.TypeFinish, protocol.Finish{
 				TransferID: task.ID,
@@ -593,6 +659,7 @@ func (s *Server) handleUpload(user string, bw config.Bandwidth, st *session.Stre
 				return "failed", err
 			}
 			settled = true
+			meta.offset = committedOffset
 			release()
 			return outcome, st.Send(protocol.TypeCancelAck, protocol.CancelAck{
 				Mode:           c.Mode,
@@ -605,7 +672,7 @@ func (s *Server) handleUpload(user string, bw config.Bandwidth, st *session.Stre
 	}
 }
 
-func (s *Server) handleDownload(user string, bw config.Bandwidth, st *session.Stream, initial protocol.Frame, resume protocol.ResumeRequest, monID uint64, release func()) (outcome string, resultErr error) {
+func (s *Server) handleDownload(user string, bw config.Bandwidth, st *session.Stream, initial protocol.Frame, resume protocol.ResumeRequest, monID uint64, release func(), meta *transferLogMeta) (outcome string, resultErr error) {
 	outcome = "completed"
 	var task storage.Task
 	var file interface {
@@ -631,7 +698,20 @@ func (s *Server) handleDownload(user string, bw config.Bandwidth, st *session.St
 		defer file.Close()
 	}
 
+	meta.file = task.FileName
+	meta.transferID = hex.EncodeToString(task.ID[:])
+	meta.size = task.FileSize
+	meta.offset = task.Offset
 	s.describe(monID, task.FileName, task.FileSize, task.Offset)
+	s.logger.Info("传输开始",
+		"user", user,
+		"file", task.FileName,
+		"direction", "download",
+		"transfer_id", meta.transferID,
+		"size", task.FileSize,
+		"offset", task.Offset,
+		"resumed", initial.Header.Type == protocol.TypeResumeReq,
+	)
 
 	var ackAtomic atomic.Uint64
 	ackAtomic.Store(task.Offset)
@@ -641,6 +721,7 @@ func (s *Server) handleDownload(user string, bw config.Bandwidth, st *session.St
 			return
 		}
 		curAck := ackAtomic.Load()
+		meta.offset = curAck
 		if curAck > task.Offset {
 			_ = s.store.CheckpointDownloadSession(context.Background(), task.ID, lease, curAck)
 		}
@@ -694,6 +775,7 @@ func (s *Server) handleDownload(user string, bw config.Bandwidth, st *session.St
 			return "failed", &protocol.RemoteError{Code: protocol.CodeBadFrame, Message: "非法取消模式"}
 		}
 		curAck := ackAtomic.Load()
+		meta.offset = curAck
 		if curAck > task.Offset {
 			if err := s.store.CheckpointDownloadSession(st.Context(), task.ID, lease, curAck); err != nil {
 				return "failed", err
@@ -709,6 +791,7 @@ func (s *Server) handleDownload(user string, bw config.Bandwidth, st *session.St
 			return "failed", err
 		}
 		settled = true
+		meta.offset = curAck
 		release()
 		return out, st.Send(protocol.TypeCancelAck, protocol.CancelAck{
 			Mode:           c.Mode,
@@ -919,6 +1002,7 @@ func (s *Server) handleDownload(user string, bw config.Bandwidth, st *session.St
 				return "failed", err
 			}
 			settled = true
+			meta.offset = task.FileSize
 			release()
 			return "completed", st.Send(protocol.TypeFinish, protocol.Finish{
 				TransferID: task.ID,

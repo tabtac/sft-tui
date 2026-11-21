@@ -2,13 +2,17 @@ package transfer
 
 import (
 	"context"
+	"io"
+	"log/slog"
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"sft-tui/internal/config"
+	"sft-tui/internal/monitor"
 	"sft-tui/internal/protocol"
 	"sft-tui/internal/testcert"
 )
@@ -192,5 +196,57 @@ func TestDaemonListDoesNotConsumeNewTaskQuota(t *testing.T) {
 	}
 	if _, err := cli.UploadFile(opCtx, src, "ok2.bin", nil); err == nil {
 		t.Fatal("expected second UploadFile to hit MaxNewTasksPerMinute=1 quota")
+	}
+}
+
+func TestDaemonEmitsStructuredTransferLogsForUserAndFile(t *testing.T) {
+	srvCfg, aliceCfg, _ := daemonFixture(t)
+	var logs monitor.Logs
+	logger := slog.New(logs.Handler(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelInfo})))
+
+	d, err := NewDaemonWithLogger(srvCfg, logger)
+	if err != nil {
+		t.Fatalf("NewDaemonWithLogger: %v", err)
+	}
+	defer d.Close()
+
+	ln, err := net.Listen("tcp", srvCfg.Listen)
+	if err != nil {
+		t.Fatal(err)
+	}
+	aliceCfg.ServerAddress = ln.Addr().String()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = d.Serve(ctx, ln) }()
+
+	opCtx, opCancel := context.WithTimeout(ctx, 10*time.Second)
+	defer opCancel()
+	cli, err := Dial(opCtx, aliceCfg)
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	defer cli.Close()
+
+	src := filepath.Join(t.TempDir(), "audit-log.txt")
+	if err := os.WriteFile(src, []byte("hello audit log"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := cli.UploadFile(opCtx, src, "audit-log.txt", nil); err != nil {
+		t.Fatalf("UploadFile: %v", err)
+	}
+
+	page := logs.Query(monitor.LogQuery{User: "alice", File: "audit-log.txt"})
+	if len(page.Events) < 2 {
+		t.Fatalf("expected structured transfer start and completion logs, got %+v", page.Events)
+	}
+	foundCompleted := false
+	for _, ev := range page.Events {
+		if ev.User == "alice" && ev.File == "audit-log.txt" && strings.Contains(ev.Detail, "result=completed") {
+			foundCompleted = true
+		}
+	}
+	if !foundCompleted {
+		t.Fatalf("expected completed transfer log for alice/audit-log.txt, got %+v", page.Events)
 	}
 }
