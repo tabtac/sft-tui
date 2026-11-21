@@ -374,3 +374,162 @@ func TestMuxOneSecondIdleTimeoutKeepsHealthyTCPAlive(t *testing.T) {
 	case <-time.After(3500 * time.Millisecond):
 	}
 }
+
+type pingBarrierConn struct {
+	net.Conn
+	ready *sync.WaitGroup
+}
+
+func (c pingBarrierConn) Write(p []byte) (int, error) {
+	if len(p) > 5 && p[5] == byte(protocol.TypePing) {
+		c.ready.Done()
+		c.ready.Wait()
+	}
+	return c.Conn.Write(p)
+}
+
+func TestMuxSimultaneousPingPongUnderBackpressure(t *testing.T) {
+	a, b := net.Pipe()
+	var barrier sync.WaitGroup
+	barrier.Add(2)
+	timeouts := testTimeouts()
+	timeouts.WriteSeconds = 1
+	timeouts.IdleSeconds = 60
+
+	left := NewMux(&Conn{Net: pingBarrierConn{a, &barrier}, Chunk: 4096, Timeouts: timeouts}, 1, 65536, nil)
+	right := NewMux(&Conn{Net: pingBarrierConn{b, &barrier}, Chunk: 4096, Timeouts: timeouts}, 1, 65536, nil)
+	defer func() {
+		left.Close(io.EOF)
+		right.Close(io.EOF)
+		left.Wait()
+		right.Wait()
+	}()
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() { defer wg.Done(); _ = left.Control(protocol.TypePing, [8]byte{1}) }()
+	go func() { defer wg.Done(); _ = right.Control(protocol.TypePing, [8]byte{2}) }()
+	wg.Wait()
+
+	select {
+	case <-left.Context().Done():
+		t.Fatalf("left mux closed after simultaneous PING under backpressure: %v", left.Error())
+	case <-right.Context().Done():
+		t.Fatalf("right mux closed after simultaneous PING under backpressure: %v", right.Error())
+	case <-time.After(1500 * time.Millisecond):
+	}
+}
+
+func TestMuxBidirectionalTCPTrafficWithFrequentHeartbeats(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	srvConnCh := make(chan net.Conn, 1)
+	go func() {
+		if c, err := ln.Accept(); err == nil {
+			srvConnCh <- c
+		}
+	}()
+
+	cliNet, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	srvNet := <-srvConnCh
+
+	timeouts := testTimeouts()
+	timeouts.IdleSeconds = 2
+	timeouts.WriteSeconds = 2
+
+	srv := NewMux(&Conn{Net: srvNet, Chunk: 4096, Timeouts: timeouts}, 4, 65536, func(st *Stream, f protocol.Frame) {
+		go func() {
+			defer st.Release()
+			st.EnableReceive(0)
+			if err := st.Send(protocol.TypePutResp, protocol.PutResponse{State: protocol.ResponseActive}); err != nil {
+				return
+			}
+			var got uint64
+			for got < 256*1024 {
+				fr, err := st.Receive()
+				if err != nil {
+					return
+				}
+				var d protocol.Data
+				if err := protocol.Unmarshal(fr.Payload, &d); err != nil {
+					return
+				}
+				got += uint64(len(d.Bytes))
+				_ = st.Send(protocol.TypeAck, protocol.Ack{NextOffset: got})
+			}
+			_ = st.Send(protocol.TypeFinish, protocol.Finish{FileSize: got})
+		}()
+	})
+	cli := NewMux(&Conn{Net: cliNet, Chunk: 4096, Timeouts: timeouts}, 4, 65536, nil)
+	defer func() {
+		cli.Close(io.EOF)
+		srv.Close(io.EOF)
+		cli.Wait()
+		srv.Wait()
+	}()
+
+	// 并发高频互发 PING 与批量数据流
+	donePing := make(chan struct{})
+	var pingWG sync.WaitGroup
+	pingWG.Add(2)
+	go func() {
+		defer pingWG.Done()
+		for i := 0; i < 10; i++ {
+			select {
+			case <-donePing:
+				return
+			default:
+			}
+			_ = cli.Control(protocol.TypePing, [8]byte{byte(i)})
+			time.Sleep(15 * time.Millisecond)
+		}
+	}()
+	go func() {
+		defer pingWG.Done()
+		for i := 0; i < 10; i++ {
+			select {
+			case <-donePing:
+				return
+			default:
+			}
+			_ = srv.Control(protocol.TypePing, [8]byte{byte(i)})
+			time.Sleep(15 * time.Millisecond)
+		}
+	}()
+
+	st, err := cli.Open(protocol.DirectionUpload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Release()
+	if err := st.Send(protocol.TypePutReq, protocol.PutRequest{FileName: "stress.bin", FileSize: 256 * 1024}); err != nil {
+		t.Fatal(err)
+	}
+	var resp protocol.PutResponse
+	if err := st.Expect(protocol.TypePutResp, &resp); err != nil {
+		t.Fatal(err)
+	}
+	chunk := make([]byte, 4096)
+	for off := uint64(0); off < 256*1024; off += 4096 {
+		if err := st.Send(protocol.TypeData, protocol.Data{FileOffset: off, Bytes: chunk}); err != nil {
+			t.Fatalf("send data at %d: %v", off, err)
+		}
+		var ack protocol.Ack
+		if err := st.Expect(protocol.TypeAck, &ack); err != nil {
+			t.Fatalf("expect ack at %d: %v", off, err)
+		}
+	}
+	var fin protocol.Finish
+	if err := st.Expect(protocol.TypeFinish, &fin); err != nil {
+		t.Fatalf("expect finish: %v", err)
+	}
+	close(donePing)
+	pingWG.Wait()
+}

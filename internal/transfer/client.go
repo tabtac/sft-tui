@@ -725,6 +725,9 @@ func (c *Client) executeDownload(ctx context.Context, task *queue.Task, op *queu
 		return result, err
 	}
 	parent, base := filepath.Dir(absPath), filepath.Base(absPath)
+	if err = pal.ValidateLocalFilename(base); err != nil {
+		return result, err
+	}
 	root, err := pal.OpenUserRoot(parent)
 	if err != nil {
 		return result, err

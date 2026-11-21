@@ -20,6 +20,7 @@ import (
 	"sft-tui/internal/config"
 	"sft-tui/internal/console"
 	"sft-tui/internal/identity"
+	"sft-tui/internal/pal"
 	"sft-tui/internal/progress"
 	"sft-tui/internal/prompt"
 	"sft-tui/internal/protocol"
@@ -32,6 +33,7 @@ import (
 type cliJob struct {
 	upload bool
 	target string
+	saveAs string
 }
 
 func main() {
@@ -72,6 +74,7 @@ func runCommandWithInput(args []string, in io.Reader, out, errOut io.Writer) int
 	cfgPath := flags.String("config", "", "客户端 JSON 配置；省略时使用已记住身份或自动扫描")
 	dirPath := flags.String("dir", "", "导入并激活该目录下的客户端配置")
 	outDir := flags.String("out", "downloads", "下载输出目录（严禁覆盖已有文件）")
+	saveAs := flags.String("save-as", "", "单文件下载时另存为指定的本地文件名（用于跨平台兼容命名）")
 	parallel := flags.Int("parallel", 3, "并发传输任务数（1–64）")
 	progressMode := flags.String("progress", "auto", "终端进度条模式：auto、always、never")
 	version := flags.Bool("version", false, "显示版本信息")
@@ -200,14 +203,32 @@ func runCommandWithInput(args []string, in io.Reader, out, errOut io.Writer) int
 			fmt.Fprintln(errOut, "sft：", err)
 			return 1
 		}
+		if *saveAs != "" {
+			if op != "download" || len(jobs) != 1 {
+				fmt.Fprintln(errOut, "sft：-save-as 仅支持单文件 download 命令")
+				return 2
+			}
+			if err := pal.ValidateLocalFilename(*saveAs); err != nil {
+				fmt.Fprintln(errOut, "sft：", err)
+				return 1
+			}
+			jobs[0].saveAs = *saveAs
+		}
 		if op == "download" || op == "transfer" {
 			for _, j := range jobs {
 				if !j.upload {
+					localName := j.target
+					if j.saveAs != "" {
+						localName = j.saveAs
+					}
+					if err := pal.ValidateLocalFilename(localName); err != nil {
+						fmt.Fprintln(errOut, "sft：", err)
+						return 1
+					}
 					if mkErr := os.MkdirAll(*outDir, 0750); mkErr != nil {
 						fmt.Fprintln(errOut, "sft：", mkErr)
 						return 1
 					}
-					break
 				}
 			}
 		}
@@ -461,7 +482,11 @@ func runTransfers(mgr *queue.Manager, cfg config.Client, jobs []cliJob, outDir, 
 			dir = protocol.DirectionDownload
 			dirLabel = "download"
 			remote = j.target
-			abs, err := filepath.Abs(filepath.Join(outDir, j.target))
+			localName := j.target
+			if j.saveAs != "" {
+				localName = j.saveAs
+			}
+			abs, err := filepath.Abs(filepath.Join(outDir, localName))
 			if err != nil {
 				fmt.Fprintln(errOut, "sft：", err)
 				return 1

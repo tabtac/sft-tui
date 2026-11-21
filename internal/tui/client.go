@@ -19,6 +19,7 @@ import (
 
 	"sft-tui/internal/config"
 	"sft-tui/internal/identity"
+	"sft-tui/internal/pal"
 	"sft-tui/internal/progress"
 	"sft-tui/internal/protocol"
 	"sft-tui/internal/queue"
@@ -2302,7 +2303,11 @@ func (m *model) handleQueueKey(k string) (tea.Model, tea.Cmd) {
 			if t.Direction == protocol.DirectionUpload {
 				m.renameInput.SetValue(t.Remote)
 			} else {
-				m.renameInput.SetValue(filepath.Base(t.Path))
+				base := filepath.Base(t.Path)
+				if pal.ValidateLocalFilename(base) != nil {
+					base = pal.SanitizeWindowsFilename(base)
+				}
+				m.renameInput.SetValue(base)
 			}
 			m.clearToast()
 			m.renameInput.Focus()

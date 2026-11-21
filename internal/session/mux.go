@@ -371,6 +371,20 @@ func (m *Mux) Control(typ protocol.Type, v any) error {
 	return m.send(m.ctx, typ, 0, payload, true)
 }
 
+func (m *Mux) enqueueControlNonBlocking(typ protocol.Type, id protocol.StreamID, p []byte) bool {
+	if m.ctx.Err() != nil {
+		return false
+	}
+	payloadCopy := append([]byte(nil), p...)
+	job := outbound{typ: typ, id: id, payload: payloadCopy, ctx: m.ctx}
+	select {
+	case m.controlQueue <- job:
+		return true
+	default:
+		return false
+	}
+}
+
 func (m *Mux) send(ctx context.Context, typ protocol.Type, id protocol.StreamID, p []byte, control bool) error {
 	if ctx.Err() != nil {
 		if m.ctx.Err() != nil {
@@ -439,7 +453,9 @@ func (m *Mux) writer() {
 			}
 		}
 		if job.ctx.Err() != nil {
-			job.done <- io.ErrClosedPipe
+			if job.done != nil {
+				job.done <- io.ErrClosedPipe
+			}
 			continue
 		}
 		terminal := job.typ == protocol.TypeFinish || job.typ == protocol.TypeCancelAck ||
@@ -463,7 +479,9 @@ func (m *Mux) writer() {
 			}
 		}
 		err := m.conn.SendPayload(job.typ, job.id, job.payload)
-		job.done <- err
+		if job.done != nil {
+			job.done <- err
+		}
 		if err != nil {
 			m.Close(err)
 			return
@@ -523,8 +541,8 @@ func (m *Mux) reader() {
 		if f.Header.StreamID == 0 {
 			switch f.Header.Type {
 			case protocol.TypePing:
-				if err = m.send(m.ctx, protocol.TypePong, 0, f.Payload, true); err != nil {
-					m.Close(err)
+				if !m.enqueueControlNonBlocking(protocol.TypePong, 0, f.Payload) {
+					m.Close(&protocol.RemoteError{Code: protocol.CodeTempUnavailable, Message: "控制发送队列拥塞"})
 					return
 				}
 				continue
