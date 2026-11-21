@@ -64,10 +64,11 @@ type running struct {
 
 // Config 队列配置
 type Config struct {
-	StateDir     string
-	Identity     string
-	MaxFileBytes uint64
-	MaxStreams   uint16
+	StateDir       string
+	Identity       string
+	LegacyIdentity string
+	MaxFileBytes   uint64
+	MaxStreams     uint16
 }
 
 // Manager 客户端任务队列管理器
@@ -132,6 +133,12 @@ func Open(cfg Config) (*Manager, error) {
 	fail := func(e error) (*Manager, error) {
 		s.Close()
 		return nil, e
+	}
+
+	if cfg.LegacyIdentity != "" && cfg.LegacyIdentity != cfg.Identity {
+		if _, err := s.MigrateUnfinishedFrom(cfg.StateDir, cfg.LegacyIdentity, cfg.Identity); err != nil {
+			return fail(err)
+		}
 	}
 
 	tasks, err := s.Load(false)

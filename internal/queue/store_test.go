@@ -201,3 +201,76 @@ func TestQueueStorePathsWithSpacesUnicodeAndURICharacters(t *testing.T) {
 		})
 	}
 }
+
+func TestQueueMigrateUnfinishedAcrossDirsAndLegacyIdentity(t *testing.T) {
+	srcDir := filepath.Join(t.TempDir(), "old-state")
+	dstDir := filepath.Join(t.TempDir(), "new-state")
+	legacyID := "legacy-id-v1"
+	newID := "stable-id-v2"
+	srcPath := filepath.Join(t.TempDir(), "resume.bin")
+	legacyKey, err := StateKeyForIdentity(legacyID, protocol.DirectionUpload, "resume.bin", srcPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	sOld, err := OpenStore(srcDir, legacyID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sOld.Write([]Task{{
+		ID:         "task-mig-1",
+		Batch:      "batch-1",
+		Identity:   legacyID,
+		StateKey:   legacyKey,
+		Direction:  protocol.DirectionUpload,
+		Remote:     "resume.bin",
+		Path:       srcPath,
+		State:      Paused,
+		Done:       65536,
+		Size:       262144,
+		RequestID:  "req-1",
+		TransferID: "tr-1",
+		Created:    time.Now(),
+		Updated:    time.Now(),
+	}}, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := sOld.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	n, err := MigrateUnfinished(srcDir, legacyID, dstDir, newID)
+	if err != nil || n != 1 {
+		t.Fatalf("MigrateUnfinished: n=%d err=%v", n, err)
+	}
+
+	mgr, err := Open(Config{
+		StateDir:     dstDir,
+		Identity:     newID,
+		MaxFileBytes: 1 << 20,
+		MaxStreams:   2,
+	})
+	if err != nil {
+		t.Fatalf("Open migrated queue: %v", err)
+	}
+	defer mgr.Close()
+
+	got := mgr.Task("task-mig-1")
+	if got == nil {
+		t.Fatal("migrated task not found in destination queue")
+	}
+	if got.Identity != newID || got.Done != 65536 || got.TransferID != "tr-1" {
+		t.Fatalf("unexpected migrated task: %+v", got)
+	}
+
+	// 源库中已迁移的任务应已被清除
+	sOld2, err := OpenStore(srcDir, legacyID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sOld2.Close()
+	remaining, err := sOld2.Load(false)
+	if err != nil || len(remaining) != 0 {
+		t.Fatalf("expected source tasks cleared after migration, got %d (err=%v)", len(remaining), err)
+	}
+}

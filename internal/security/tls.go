@@ -1,12 +1,15 @@
 package security
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/hex"
+	"encoding/pem"
 	"fmt"
 	"strings"
+	"time"
 
 	"sft-tui/internal/config"
 	"sft-tui/internal/pal"
@@ -162,8 +165,94 @@ func ClientTLS(c config.Client) (*tls.Config, error) {
 	return cfg, nil
 }
 
-// ClientIdentityKey 根据客户端证书、公钥指纹与目标服务端生成确定性的身份标识，用于队列与断点隔离。
+func issuerRootKeyFingerprint(caRaw []byte, leaf *x509.Certificate, intermediates *x509.CertPool) ([32]byte, error) {
+	caPool := x509.NewCertPool()
+	var caCerts []*x509.Certificate
+	rest := caRaw
+	for {
+		var blk *pem.Block
+		blk, rest = pem.Decode(rest)
+		if blk == nil {
+			break
+		}
+		if blk.Type != "CERTIFICATE" {
+			continue
+		}
+		cert, err := x509.ParseCertificate(blk.Bytes)
+		if err != nil {
+			continue
+		}
+		caPool.AddCert(cert)
+		caCerts = append(caCerts, cert)
+	}
+	if len(caCerts) == 0 {
+		return [32]byte{}, fmt.Errorf("CA 文件中没有有效证书")
+	}
+
+	verifyAt := func(at time.Time) ([][]*x509.Certificate, error) {
+		return leaf.Verify(x509.VerifyOptions{
+			Roots:         caPool,
+			Intermediates: intermediates,
+			CurrentTime:   at,
+			KeyUsages:     []x509.ExtKeyUsage{x509.ExtKeyUsageAny},
+		})
+	}
+	chains, err := verifyAt(leaf.NotBefore)
+	if err != nil {
+		chains, err = verifyAt(leaf.NotBefore.Add(time.Second))
+	}
+	if err != nil {
+		chains, err = verifyAt(time.Now())
+	}
+	if err != nil || len(chains) == 0 {
+		return [32]byte{}, fmt.Errorf("无法确定客户端证书的信任根 CA：%w", err)
+	}
+
+	var best [32]byte
+	for i, ch := range chains {
+		if len(ch) == 0 {
+			continue
+		}
+		fp := PubKeyFingerprint(ch[len(ch)-1])
+		if i == 0 || bytes.Compare(fp[:], best[:]) < 0 {
+			best = fp
+		}
+	}
+	return best, nil
+}
+
+// ClientIdentityKey 根据受信任 CA 公钥、客户端证书主体与目标服务端生成确定性的身份标识，
+// 用于队列与断点隔离，并在同一用户续期证书（服务端重签或 CSR 续期）后保持断点连续性。
 func ClientIdentityKey(c config.Client) (string, error) {
+	caRaw, err := pal.ReadSmall(c.TLS.CACertificate, MaxCertFileBytes)
+	if err != nil {
+		return "", err
+	}
+	pair, err := tls.LoadX509KeyPair(c.TLS.Certificate, c.TLS.PrivateKey)
+	if err != nil {
+		return "", err
+	}
+	leaf, intermediates, err := parseIntermediates(pair.Certificate)
+	if err != nil {
+		return "", err
+	}
+	rootKeyFP, err := issuerRootKeyFingerprint(caRaw, leaf, intermediates)
+	if err != nil {
+		return "", err
+	}
+	h := sha256.New()
+	h.Write([]byte("sft-identity-v2\x00"))
+	h.Write(rootKeyFP[:])
+	h.Write(leaf.RawSubject)
+	h.Write([]byte{0})
+	h.Write([]byte(c.ServerAddress))
+	h.Write([]byte{0})
+	h.Write([]byte(c.ServerName))
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+// LegacyClientIdentityKey 返回旧版基于完整叶证书与公钥指纹的身份标识，仅用于迁移历史队列检查点。
+func LegacyClientIdentityKey(c config.Client) (string, error) {
 	pair, err := tls.LoadX509KeyPair(c.TLS.Certificate, c.TLS.PrivateKey)
 	if err != nil {
 		return "", err

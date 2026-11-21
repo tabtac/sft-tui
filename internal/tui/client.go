@@ -483,11 +483,13 @@ func openIdentityStack(cfg config.Client, customLabel string) identityActivatedM
 			err:    fmt.Errorf("TLS 证书初始化失败：%w", err),
 		}
 	}
+	legacyKey, _ := security.LegacyClientIdentityKey(cfg)
 	mgr, err := queue.Open(queue.Config{
-		StateDir:     cfg.StateDir,
-		Identity:     idKey,
-		MaxFileBytes: cfg.MaxFileBytes,
-		MaxStreams:   cfg.Limits.MaxStreams,
+		StateDir:       cfg.StateDir,
+		Identity:       idKey,
+		LegacyIdentity: legacyKey,
+		MaxFileBytes:   cfg.MaxFileBytes,
+		MaxStreams:     cfg.Limits.MaxStreams,
 	})
 	if err != nil {
 		return identityActivatedMsg{
@@ -646,10 +648,32 @@ func (m *model) testIdentityConnCmd(ch identityChoice) tea.Cmd {
 	}
 }
 
+func sameClientDir(a, b string) bool {
+	if a == "" || b == "" {
+		return false
+	}
+	absA, errA := filepath.Abs(a)
+	absB, errB := filepath.Abs(b)
+	if errA != nil {
+		absA = filepath.Clean(a)
+	}
+	if errB != nil {
+		absB = filepath.Clean(b)
+	}
+	if runtime.GOOS == "windows" {
+		return strings.EqualFold(absA, absB)
+	}
+	return absA == absB
+}
+
 func (m *model) activateChoiceCmd(ch identityChoice, customPath string) tea.Cmd {
 	oldMgr := m.manager
 	oldRunner := m.runner
 	oldIDKey := m.idKey
+	oldStateDir := ""
+	if m.cfg != nil {
+		oldStateDir = m.cfg.StateDir
+	}
 	exeDir := m.opts.ExecutableDir
 	return func() tea.Msg {
 		wd, _ := os.Getwd()
@@ -708,12 +732,13 @@ func (m *model) activateChoiceCmd(ch identityChoice, customPath string) tea.Cmd 
 			}
 		}
 
-		// 先完成身份索引与持久化校验，再暂停/关闭旧队列与连接，避免后续失败导致现有队列不可用。
+		// 先在不修改磁盘 active 的前提下校验目标身份、证书材料和标签元数据，
+		// 避免后续打开新队列或静默旧队列失败时导致界面与磁盘 active 不一致。
 		var cfg config.Client
 		if useSel {
-			cfg, err = identity.Select(exeDir, prof.ID, prof.Label)
+			cfg, err = identity.ValidateSelect(exeDir, prof.ID, prof.Label)
 		} else {
-			cfg, err = identity.SelectPrepared(exeDir, prof, prof.Label)
+			cfg, err = identity.ValidateSelectPrepared(exeDir, prof, prof.Label)
 		}
 		if err != nil {
 			return identityActivatedMsg{
@@ -725,9 +750,42 @@ func (m *model) activateChoiceCmd(ch identityChoice, customPath string) tea.Cmd 
 			}
 		}
 
+		commitActive := func() error {
+			if useSel {
+				_, err := identity.Select(exeDir, prof.ID, prof.Label)
+				return err
+			}
+			_, err := identity.SelectPrepared(exeDir, prof, prof.Label)
+			return err
+		}
+
 		newIDKey, idErr := security.ClientIdentityKey(cfg)
+		legacyKey, _ := security.LegacyClientIdentityKey(cfg)
+
+		// 情况 1：新旧身份键不同（各自使用独立队列文件），先打开新引擎，确认可用且旧队列静默后再提交 active
 		if idErr == nil && newIDKey != oldIDKey {
-			// 新旧身份状态库锁不同时，先打开新引擎，确认可用后再优雅关闭旧实例
+			if prof.SourceStateDir != "" && !sameClientDir(prof.SourceStateDir, cfg.StateDir) {
+				if _, migErr := queue.MigrateUnfinished(prof.SourceStateDir, newIDKey, cfg.StateDir, newIDKey); migErr != nil {
+					return identityActivatedMsg{
+						cfg:    cfg,
+						hasCfg: true,
+						label:  prof.Label,
+						stage:  identityStageQueue,
+						err:    fmt.Errorf("迁移原状态目录队列失败：%w", migErr),
+					}
+				}
+				if legacyKey != "" && legacyKey != newIDKey {
+					if _, migErr := queue.MigrateUnfinished(prof.SourceStateDir, legacyKey, cfg.StateDir, newIDKey); migErr != nil {
+						return identityActivatedMsg{
+							cfg:    cfg,
+							hasCfg: true,
+							label:  prof.Label,
+							stage:  identityStageQueue,
+							err:    fmt.Errorf("迁移历史队列失败：%w", migErr),
+						}
+					}
+				}
+			}
 			res := openIdentityStack(cfg, prof.Label)
 			if res.err != nil {
 				return res
@@ -751,6 +809,26 @@ func (m *model) activateChoiceCmd(ch identityChoice, customPath string) tea.Cmd 
 						err:    fmt.Errorf("切换身份前暂停当前任务失败：%w", err),
 					}
 				}
+			}
+			if err := commitActive(); err != nil {
+				if res.runner != nil {
+					_ = res.runner.Close()
+				}
+				if res.manager != nil {
+					_ = res.manager.Close()
+				}
+				if oldMgr != nil {
+					oldMgr.ReleaseHold()
+				}
+				return identityActivatedMsg{
+					cfg:    cfg,
+					hasCfg: true,
+					label:  prof.Label,
+					stage:  identityStageLookup,
+					err:    err,
+				}
+			}
+			if oldMgr != nil {
 				if oldRunner != nil {
 					_ = oldRunner.Close()
 				}
@@ -760,6 +838,78 @@ func (m *model) activateChoiceCmd(ch identityChoice, customPath string) tea.Cmd 
 			return res
 		}
 
+		// 情况 2：同一身份但状态目录发生变化（例如将 -config 启动的身份导入便携 .sft 目录），
+		// 先锁定新队列确认无冲突，再静默关闭旧队列并将未完成任务迁移到新目录，最后提交 active。
+		if idErr == nil && newIDKey == oldIDKey && oldMgr != nil && oldStateDir != "" && !sameClientDir(oldStateDir, cfg.StateDir) {
+			dstStore, err := queue.OpenStore(cfg.StateDir, newIDKey)
+			if err != nil {
+				return identityActivatedMsg{
+					cfg:    cfg,
+					hasCfg: true,
+					label:  prof.Label,
+					stage:  identityStageQueue,
+					err:    fmt.Errorf("队列初始化失败：%w", err),
+				}
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			err = oldMgr.Quiesce(ctx)
+			cancel()
+			if err != nil {
+				_ = dstStore.Close()
+				return identityActivatedMsg{
+					cfg:    cfg,
+					hasCfg: true,
+					label:  prof.Label,
+					stage:  identityStageQueue,
+					err:    fmt.Errorf("切换身份前暂停当前任务失败：%w", err),
+				}
+			}
+			if oldRunner != nil {
+				_ = oldRunner.Close()
+			}
+			_ = oldMgr.Close()
+
+			_, migErr := dstStore.MigrateUnfinishedFrom(oldStateDir, oldIDKey, newIDKey)
+			if migErr == nil && legacyKey != "" && legacyKey != newIDKey {
+				_, migErr = dstStore.MigrateUnfinishedFrom(oldStateDir, legacyKey, newIDKey)
+			}
+			_ = dstStore.Close()
+			if migErr != nil {
+				return identityActivatedMsg{
+					cfg:      cfg,
+					hasCfg:   true,
+					label:    prof.Label,
+					stage:    identityStageQueue,
+					resetOld: true,
+					err:      fmt.Errorf("迁移原状态目录队列失败：%w", migErr),
+				}
+			}
+			res := openIdentityStack(cfg, prof.Label)
+			if res.err != nil {
+				res.resetOld = true
+				return res
+			}
+			if err := commitActive(); err != nil {
+				if res.runner != nil {
+					_ = res.runner.Close()
+				}
+				if res.manager != nil {
+					_ = res.manager.Close()
+				}
+				return identityActivatedMsg{
+					cfg:      cfg,
+					hasCfg:   true,
+					label:    prof.Label,
+					stage:    identityStageLookup,
+					resetOld: true,
+					err:      err,
+				}
+			}
+			res.activeID = prof.ID
+			return res
+		}
+
+		// 情况 3：同一身份同一状态目录，或当前尚未加载旧身份
 		if oldMgr != nil {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			err = oldMgr.Quiesce(ctx)
@@ -778,10 +928,53 @@ func (m *model) activateChoiceCmd(ch identityChoice, customPath string) tea.Cmd 
 			}
 			_ = oldMgr.Close()
 		}
+		if idErr == nil && prof.SourceStateDir != "" && !sameClientDir(prof.SourceStateDir, cfg.StateDir) {
+			if _, migErr := queue.MigrateUnfinished(prof.SourceStateDir, newIDKey, cfg.StateDir, newIDKey); migErr != nil {
+				return identityActivatedMsg{
+					cfg:      cfg,
+					hasCfg:   true,
+					label:    prof.Label,
+					stage:    identityStageQueue,
+					resetOld: oldMgr != nil,
+					err:      fmt.Errorf("迁移原状态目录队列失败：%w", migErr),
+				}
+			}
+			if legacyKey != "" && legacyKey != newIDKey {
+				if _, migErr := queue.MigrateUnfinished(prof.SourceStateDir, legacyKey, cfg.StateDir, newIDKey); migErr != nil {
+					return identityActivatedMsg{
+						cfg:      cfg,
+						hasCfg:   true,
+						label:    prof.Label,
+						stage:    identityStageQueue,
+						resetOld: oldMgr != nil,
+						err:      fmt.Errorf("迁移历史队列失败：%w", migErr),
+					}
+				}
+			}
+		}
 		res := openIdentityStack(cfg, prof.Label)
 		res.activeID = prof.ID
-		if res.err != nil && oldMgr != nil {
-			res.resetOld = true
+		if res.err != nil {
+			if oldMgr != nil {
+				res.resetOld = true
+			}
+			return res
+		}
+		if err := commitActive(); err != nil {
+			if res.runner != nil {
+				_ = res.runner.Close()
+			}
+			if res.manager != nil {
+				_ = res.manager.Close()
+			}
+			return identityActivatedMsg{
+				cfg:      cfg,
+				hasCfg:   true,
+				label:    prof.Label,
+				stage:    identityStageLookup,
+				resetOld: oldMgr != nil,
+				err:      err,
+			}
 		}
 		return res
 	}

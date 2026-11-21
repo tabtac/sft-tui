@@ -20,6 +20,7 @@ import (
 	"sft-tui/internal/monitor"
 	"sft-tui/internal/protocol"
 	"sft-tui/internal/queue"
+	"sft-tui/internal/security"
 	"sft-tui/internal/testcert"
 )
 
@@ -340,5 +341,145 @@ func TestRegressionFileLogTailHandlesFilesAbove64KiB(t *testing.T) {
 				t.Errorf("log tail exceeded its 64 KiB read limit: %d bytes", len(got))
 			}
 		})
+	}
+}
+
+func TestRegressionFailedIdentitySwitchPreservesDiskActive(t *testing.T) {
+	root := t.TempDir()
+	certDir := filepath.Join(root, "certs")
+	if err := testcert.Generate(certDir); err != nil {
+		t.Fatal(err)
+	}
+	if err := testcert.IssueClient(certDir, "alice"); err != nil {
+		t.Fatal(err)
+	}
+	if err := testcert.IssueClient(certDir, "bob"); err != nil {
+		t.Fatal(err)
+	}
+
+	exeDir := t.TempDir()
+	makeProfile := func(name, addr string) identity.Profile {
+		cfg := config.DefaultClient()
+		cfg.ServerAddress = addr
+		cfg.StateDir = filepath.Join(root, "state-"+name)
+		cfg.TLS = config.TLSFiles{
+			CACertificate: filepath.Join(certDir, "ca.pem"),
+			Certificate:   filepath.Join(certDir, name+".pem"),
+			PrivateKey:    filepath.Join(certDir, name+"-key.pem"),
+		}
+		p := filepath.Join(root, "client."+name+".json")
+		if err := config.SaveJSON(p, cfg); err != nil {
+			t.Fatal(err)
+		}
+		prof, err := identity.PrepareImport(exeDir, root, p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return prof
+	}
+
+	profA := makeProfile("alice", "127.0.0.1:7443")
+	profB := makeProfile("bob", "127.0.0.1:7444")
+
+	cfgA, err := identity.SelectPrepared(exeDir, profA, "alice@A")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 预先占用身份 B 的队列锁
+	keyB, err := security.ClientIdentityKey(profB.Config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lockB, err := queue.OpenStore(profB.Config.StateDir, keyB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lockB.Close()
+
+	m := newModel(Options{ExecutableDir: exeDir, Directory: root})
+	t.Cleanup(m.cleanup)
+	opened := openIdentityStack(cfgA, "alice@A")
+	if opened.err != nil {
+		t.Fatal(opened.err)
+	}
+	m.Update(opened)
+
+	res, ok := m.activateChoiceCmd(identityChoice{profile: profB, imported: true}, "")().(identityActivatedMsg)
+	if !ok || res.err == nil {
+		t.Fatal("expected switching to locked identity B to fail")
+	}
+	m.Update(res)
+
+	activeCfg, err := identity.Active(exeDir)
+	if err != nil {
+		t.Fatalf("identity.Active: %v", err)
+	}
+	if activeCfg.ServerAddress != "127.0.0.1:7443" {
+		t.Fatalf("failed switch mutated persisted active identity to %s", activeCfg.ServerAddress)
+	}
+	if m.cfg == nil || m.cfg.ServerAddress != "127.0.0.1:7443" {
+		t.Fatalf("in-memory identity changed unexpectedly: %+v", m.cfg)
+	}
+}
+
+func TestRegressionSameIdentityImportMigratesPausedQueue(t *testing.T) {
+	root := t.TempDir()
+	certDir := filepath.Join(root, "certs")
+	if err := testcert.Generate(certDir); err != nil {
+		t.Fatal(err)
+	}
+	if err := testcert.IssueClient(certDir, "alice"); err != nil {
+		t.Fatal(err)
+	}
+
+	origState := filepath.Join(root, "explicit-state")
+	cfg := config.DefaultClient()
+	cfg.StateDir = origState
+	cfg.TLS = config.TLSFiles{
+		CACertificate: filepath.Join(certDir, "ca.pem"),
+		Certificate:   filepath.Join(certDir, "alice.pem"),
+		PrivateKey:    filepath.Join(certDir, "alice-key.pem"),
+	}
+	cfgPath := filepath.Join(root, "client.alice.json")
+	if err := config.SaveJSON(cfgPath, cfg); err != nil {
+		t.Fatal(err)
+	}
+
+	exeDir := t.TempDir()
+	m := newModel(Options{ExecutableDir: exeDir, Directory: root, ConfigPath: cfgPath})
+	t.Cleanup(m.cleanup)
+	opened := openIdentityStack(cfg, "alice")
+	if opened.err != nil {
+		t.Fatal(opened.err)
+	}
+	m.Update(opened)
+	m.manager.SetRunner(nil)
+
+	srcFile := filepath.Join(root, "identity.bin")
+	if err := os.WriteFile(srcFile, []byte("hello-migrate"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	tasks, err := m.manager.Enqueue([]queue.Spec{{Direction: protocol.DirectionUpload, Remote: "identity.bin", Path: srcFile}})
+	if err != nil || len(tasks) != 1 {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	if err := m.manager.Pause(tasks[0].ID); err != nil {
+		t.Fatalf("Pause: %v", err)
+	}
+
+	// 导入同一份配置文件（切换为便携 .sft/state/... 目录）
+	res, ok := m.activateChoiceCmd(identityChoice{}, cfgPath)().(identityActivatedMsg)
+	if !ok || res.err != nil {
+		t.Fatalf("import same identity failed: ok=%v err=%v", ok, res.err)
+	}
+	m.Update(res)
+
+	migrated := m.manager.Task(tasks[0].ID)
+	if migrated == nil {
+		t.Fatal("expected paused task to remain visible after importing same identity")
+	}
+	if migrated.State != queue.Paused || migrated.Remote != "identity.bin" {
+		t.Fatalf("unexpected migrated task state: %+v", migrated)
 	}
 }

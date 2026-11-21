@@ -296,6 +296,16 @@ func (m *Manager) UpdateTask(id string, fn func(*Task)) error {
 	return nil
 }
 
+// ReleaseHold 解除静默保持状态（用于切换身份提交失败后的安全回滚）
+func (m *Manager) ReleaseHold() {
+	m.mu.Lock()
+	if !m.closed && m.storageErr == nil {
+		m.hold = false
+	}
+	m.mu.Unlock()
+	m.signal()
+}
+
 // Quiesce 安全静默当前队列，切换身份前排空所有进行中任务
 func (m *Manager) Quiesce(ctx context.Context) error {
 	err := m.PauseAll(ctx)

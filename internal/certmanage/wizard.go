@@ -162,6 +162,13 @@ func UsersDialog(in io.Reader, out io.Writer, o Options) (string, Options, error
 		return "export", o, err
 	case 3:
 		o.ExpectedUser = &uCopy
+		if u.ExternalKey {
+			csrPath, err := d.Text("该用户使用外部私钥，请输入续期用 CSR 文件路径", o.CSR, prompt.Nonempty)
+			if err != nil {
+				return "user", o, err
+			}
+			o.CSR = csrPath
+		}
 		days := uint64(o.Days)
 		if days == 0 {
 			days = 30

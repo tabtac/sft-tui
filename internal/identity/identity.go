@@ -22,6 +22,7 @@ import (
 	"sft-tui/internal/config"
 	"sft-tui/internal/pal"
 	"sft-tui/internal/prompt"
+	"sft-tui/internal/queue"
 	"sft-tui/internal/security"
 )
 
@@ -29,13 +30,14 @@ import (
 var ErrNotFound = errors.New("未找到客户端配置")
 
 type Profile struct {
-	ID          string
-	Label       string
-	Path        string
-	User        string
-	Fingerprint string
-	Expires     time.Time
-	Config      config.Client
+	ID             string
+	Label          string
+	Path           string
+	User           string
+	Fingerprint    string
+	Expires        time.Time
+	Config         config.Client
+	SourceStateDir string
 }
 
 type material struct {
@@ -110,7 +112,7 @@ func ResolveInteractive(executableDir, workingDir, sourceDir, explicitConfig str
 		}
 	}
 
-	c, err := importSnapshot(home, target, workingDir, true)
+	c, _, err := importSnapshot(home, target, workingDir, true)
 	if err != nil {
 		return c, err
 	}
@@ -232,7 +234,7 @@ func Preview(path, workingDir string) (Profile, error) {
 // PrepareImport 将身份包安全导入到 .sft/profiles/<id> 中供切换或预览使用，但不立即切换 active。
 func PrepareImport(executableDir, workingDir, path string) (Profile, error) {
 	home := filepath.Join(executableDir, ".sft")
-	c, err := importSnapshot(home, path, workingDir, false)
+	c, sourceStateDir, err := importSnapshot(home, path, workingDir, false)
 	if err != nil {
 		return Profile{}, err
 	}
@@ -247,6 +249,7 @@ func PrepareImport(executableDir, workingDir, path string) (Profile, error) {
 	}
 	p.ID = id
 	p.Config = c
+	p.SourceStateDir = sourceStateDir
 	return p, nil
 }
 
@@ -300,11 +303,21 @@ func Profiles(executableDir string) ([]Profile, error) {
 }
 
 func Select(executableDir, id, label string) (config.Client, error) {
-	return selectExpected(executableDir, id, label, nil)
+	return selectExpected(executableDir, id, label, nil, true)
 }
 
 func SelectPrepared(executableDir string, p Profile, label string) (config.Client, error) {
-	return selectExpected(executableDir, p.ID, label, &p.Config)
+	return selectExpected(executableDir, p.ID, label, &p.Config, true)
+}
+
+// ValidateSelect 在不写入磁盘 active 或标签的前提下，校验目标已导入身份及标签元数据是否可用。
+func ValidateSelect(executableDir, id, label string) (config.Client, error) {
+	return selectExpected(executableDir, id, label, nil, false)
+}
+
+// ValidateSelectPrepared 在不写入磁盘 active 或标签的前提下，校验待激活的预导入身份。
+func ValidateSelectPrepared(executableDir string, p Profile, label string) (config.Client, error) {
+	return selectExpected(executableDir, p.ID, label, &p.Config, false)
 }
 
 func Active(executableDir string) (config.Client, error) {
@@ -377,7 +390,7 @@ func UpdateLabel(executableDir, id, label string) error {
 	})
 }
 
-func selectExpected(executableDir, id, label string, expected *config.Client) (config.Client, error) {
+func selectExpected(executableDir, id, label string, expected *config.Client, commit bool) (config.Client, error) {
 	cleanLabel, err := normalizeLabel(label)
 	if err != nil {
 		return config.Client{}, err
@@ -402,6 +415,13 @@ func selectExpected(executableDir, id, label string, expected *config.Client) (c
 		}
 		if expected != nil && c != *expected {
 			return fmt.Errorf("身份配置在预览后发生变化，请重新选择")
+		}
+		if !commit {
+			if _, err := readLabels(home); err != nil {
+				return err
+			}
+			out = c
+			return nil
 		}
 		if err := writeProfileLabelLocked(home, id, cleanLabel); err != nil {
 			return err
@@ -556,19 +576,24 @@ func readMaterial(path, workingDir string) (material, error) {
 	return material{cfg: c, ca: ca, cert: cert, key: key, leaf: leaf}, nil
 }
 
-func importSnapshot(home, path, workingDir string, selectActive bool) (config.Client, error) {
+func importSnapshot(home, path, workingDir string, selectActive bool) (config.Client, string, error) {
 	m, err := readMaterial(path, workingDir)
 	if err != nil {
-		return config.Client{}, err
+		return config.Client{}, "", err
 	}
 	c, ca, cert, key, leaf := m.cfg, m.ca, m.cert, m.key, m.leaf
-	leafID := security.CertFingerprintHex(leaf)
+	sourceStateDir := m.cfg.StateDir
+	stateID, keyErr := security.ClientIdentityKey(m.cfg)
+	if keyErr != nil || stateID == "" {
+		stateID = security.CertFingerprintHex(leaf)
+	}
+	legacyID, _ := security.LegacyClientIdentityKey(m.cfg)
 	c.TLS = config.TLSFiles{CACertificate: "ca.pem", Certificate: "cert.pem", PrivateKey: "key.pem"}
-	c.StateDir = filepath.Join("..", "..", "state", leafID)
+	c.StateDir = filepath.Join("..", "..", "state", stateID)
 
 	canonical, err := json.Marshal(c)
 	if err != nil {
-		return c, err
+		return c, "", err
 	}
 	h := sha256.New()
 	h.Write(canonical)
@@ -577,7 +602,7 @@ func importSnapshot(home, path, workingDir string, selectActive bool) (config.Cl
 	id := hex.EncodeToString(h.Sum(nil))
 	pPath, err := profilePath(home, id)
 	if err != nil {
-		return c, err
+		return c, "", err
 	}
 
 	err = withIdentityLock(home, func() error {
@@ -633,12 +658,24 @@ func importSnapshot(home, path, workingDir string, selectActive bool) (config.Cl
 		}
 
 		if selectActive {
+			targetStateDir := filepath.Join(targetDir, c.StateDir)
+			if sourceStateDir != "" {
+				if _, err := queue.MigrateUnfinished(sourceStateDir, stateID, targetStateDir, stateID); err != nil {
+					return err
+				}
+				if legacyID != "" && legacyID != stateID {
+					if _, err := queue.MigrateUnfinished(sourceStateDir, legacyID, targetStateDir, stateID); err != nil {
+						return err
+					}
+				}
+			}
 			return pal.StageAndReplaceMode(filepath.Join(home, "active"), []byte(id+"\n"), 0600, false)
 		}
 		return nil
 	})
 	if err != nil {
-		return config.Client{}, err
+		return config.Client{}, "", err
 	}
-	return loadProfile(pPath)
+	loaded, err := loadProfile(pPath)
+	return loaded, sourceStateDir, err
 }

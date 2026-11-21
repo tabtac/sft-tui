@@ -385,3 +385,109 @@ func TestInteractivePolicyDialogProtectsAgainstConcurrentRevoke(t *testing.T) {
 		t.Fatal("concurrent revocation was undone by stale interactive policy save")
 	}
 }
+
+func TestExternalKeyUserRenewalRequiresCSRAndPreservesExternalKey(t *testing.T) {
+	o := testOptions(t)
+	if _, err := Execute("init", o); err != nil {
+		t.Fatal(err)
+	}
+	// 创建 CSR 外部私钥用户 external
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	csrDER, err := x509.CreateCertificateRequest(rand.Reader, &x509.CertificateRequest{Subject: pkix.Name{CommonName: "external"}}, priv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	csrPath := filepath.Join(t.TempDir(), "external.csr")
+	if err := os.WriteFile(csrPath, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE REQUEST", Bytes: csrDER}), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	addOpt := o
+	addOpt.Name = "external"
+	addOpt.CSR = csrPath
+	if _, err := Execute("user", addOpt); err != nil {
+		t.Fatalf("create CSR user: %v", err)
+	}
+
+	// 将权限收紧为 download-only，确保续期保留原策略
+	polOpt := o
+	polOpt.Name = "external"
+	polOpt.Policy = &UserPolicy{Disabled: false, Permissions: []string{"download"}}
+	if _, err := Execute("policy", polOpt); err != nil {
+		t.Fatalf("set policy: %v", err)
+	}
+
+	beforeCfg, err := config.LoadServer(o.ServerConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var beforeCert string
+	for _, u := range beforeCfg.AuthorizedClients {
+		if u.UserID == "external" {
+			beforeCert = u.Certificate
+			if !u.ExternalKey {
+				t.Fatal("expected external_key=true after CSR creation")
+			}
+		}
+	}
+
+	// 1. 不带 CSR 续期外部私钥用户必须失败，且不改变配置或生成服务端私钥
+	badRenew := o
+	badRenew.Name = "external"
+	badRenew.Renew = true
+	badRenew.Days = 30
+	if _, err := Execute("user", badRenew); err == nil {
+		t.Fatal("expected renewing ExternalKey user without CSR to fail")
+	}
+	afterBad, err := config.LoadServer(o.ServerConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, u := range afterBad.AuthorizedClients {
+		if u.UserID == "external" {
+			if !u.ExternalKey || u.Certificate != beforeCert {
+				t.Fatalf("failed renewal altered user metadata: %+v", u)
+			}
+		}
+	}
+
+	// 2. 通过交互向导 UsersDialog 选择“4. 刷新用户证书”时必须提示输入 CSR，且续期后保持 ExternalKey=true 且不产生 key.pem
+	var prompts bytes.Buffer
+	dialogOpt := o
+	dialogOpt.Name = "external"
+	action, renewOpt, err := UsersDialog(strings.NewReader("4\n"+csrPath+"\n45\n"), &prompts, dialogOpt)
+	if err != nil {
+		t.Fatalf("UsersDialog CSR renew: %v", err)
+	}
+	if action != "user" || !renewOpt.Renew || renewOpt.CSR != csrPath {
+		t.Fatalf("unexpected dialog result: action=%q opt=%+v", action, renewOpt)
+	}
+	if _, err := Execute(action, renewOpt); err != nil {
+		t.Fatalf("Execute CSR renew: %v", err)
+	}
+
+	afterGood, err := config.LoadServer(o.ServerConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, u := range afterGood.AuthorizedClients {
+		if u.UserID == "external" {
+			if !u.ExternalKey {
+				t.Fatal("CSR renewal cleared ExternalKey")
+			}
+			if u.Certificate == beforeCert {
+				t.Fatal("CSR renewal did not issue a new certificate")
+			}
+			if len(u.Permissions) != 1 || u.Permissions[0] != "download" {
+				t.Fatalf("CSR renewal altered permissions: %+v", u.Permissions)
+			}
+			keyFile := filepath.Join(filepath.Dir(u.Certificate), "key.pem")
+			if _, err := os.Stat(keyFile); !os.IsNotExist(err) {
+				t.Fatalf("CSR renewal unexpectedly created server private key %s", keyFile)
+			}
+		}
+	}
+}

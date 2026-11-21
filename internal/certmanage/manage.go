@@ -516,6 +516,9 @@ func (p *certificatePlan) issue(action string) error {
 		if o.Enable && !o.Renew {
 			return fmt.Errorf("-enable 必须与 -renew 一起使用")
 		}
+		if o.Renew && p.server.AuthorizedClients[p.index].ExternalKey && o.CSR == "" {
+			return fmt.Errorf("用户 %s 使用外部私钥（CSR 签发），续期必须提供 -csr 参数；服务端不会为其生成私钥", o.Name)
+		}
 		user = o.Name
 	}
 	if _, err := os.Stat(p.server.TLS.CACertificate); err == nil {

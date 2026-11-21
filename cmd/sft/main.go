@@ -144,11 +144,13 @@ func runCommandWithInput(args []string, in io.Reader, out, errOut io.Writer) int
 	if uint16(*parallel) < streams {
 		streams = uint16(*parallel)
 	}
+	legacyKey, _ := security.LegacyClientIdentityKey(cfg)
 	mgr, err := queue.Open(queue.Config{
-		StateDir:     cfg.StateDir,
-		Identity:     idKey,
-		MaxFileBytes: cfg.MaxFileBytes,
-		MaxStreams:   streams,
+		StateDir:       cfg.StateDir,
+		Identity:       idKey,
+		LegacyIdentity: legacyKey,
+		MaxFileBytes:   cfg.MaxFileBytes,
+		MaxStreams:     streams,
 	})
 	if err != nil {
 		fmt.Fprintln(errOut, "sft：", err)

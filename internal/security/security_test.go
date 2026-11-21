@@ -444,3 +444,120 @@ func TestValidationRejectsSingleWildcardAndInvalidConnectAddresses(t *testing.T)
 		t.Fatal("PrepareServerTLS accepted CA certificate as server certificate")
 	}
 }
+
+func TestClientIdentityKeyStableAcrossRenewalAndIsolatedByUserCAAndServer(t *testing.T) {
+	dir := t.TempDir()
+	ca1, err := NewCA(30, "", "", "ca-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ca1Cert, ca1Key := writeCertificateMaterial(t, ca1)
+
+	leaf1, err := NewLeafFromCA(ca1, "alice", "", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cert1, key1 := writeCertificateMaterial(t, leaf1)
+
+	// 1. 服务端生成新密钥续期（新序列号 + 新公钥）
+	leaf2, err := NewLeafFromCA(ca1, "alice", "", 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cert2, key2 := writeCertificateMaterial(t, leaf2)
+
+	// 2. CSR 续期（不同外部密钥 + 相同用户 CN）
+	_, extPriv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	csrDER, err := x509.CreateCertificateRequest(rand.Reader, &x509.CertificateRequest{Subject: pkix.Name{CommonName: "alice"}}, extPriv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	csrPath := filepath.Join(dir, "alice.csr")
+	if err := os.WriteFile(csrPath, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE REQUEST", Bytes: csrDER}), 0600); err != nil {
+		t.Fatal(err)
+	}
+	leaf3, err := SignCSRExpected(ca1Cert, ca1Key, "alice", csrPath, 25, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	extKeyDER, err := x509.MarshalPKCS8PrivateKey(extPriv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	leaf3.PrivateKey = pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: extKeyDER})
+	cert3, key3 := writeCertificateMaterial(t, leaf3)
+
+	// 3. CA 自身续期（保持 CA 公钥不变）
+	ca1Renewed, err := NewCA(60, ca1Cert, ca1Key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ca1RenewedCert, _ := writeCertificateMaterial(t, ca1Renewed)
+
+	// 4. 不同用户 bob 与不同 CA
+	bobLeaf, err := NewLeafFromCA(ca1, "bob", "", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bobCert, bobKey := writeCertificateMaterial(t, bobLeaf)
+
+	ca2, err := NewCA(30, "", "", "ca-2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ca2Cert, _ := writeCertificateMaterial(t, ca2)
+	aliceCA2Leaf, err := NewLeafFromCA(ca2, "alice", "", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	aliceCA2Cert, aliceCA2Key := writeCertificateMaterial(t, aliceCA2Leaf)
+
+	makeCfg := func(caPath, certPath, keyPath, addr, serverName string) config.Client {
+		c := config.DefaultClient()
+		c.ServerAddress = addr
+		c.ServerName = serverName
+		c.TLS = config.TLSFiles{CACertificate: caPath, Certificate: certPath, PrivateKey: keyPath}
+		return c
+	}
+
+	kBase, err := ClientIdentityKey(makeCfg(ca1Cert, cert1, key1, "127.0.0.1:7443", "localhost"))
+	if err != nil {
+		t.Fatalf("ClientIdentityKey base: %v", err)
+	}
+	kRenewManaged, err := ClientIdentityKey(makeCfg(ca1Cert, cert2, key2, "127.0.0.1:7443", "localhost"))
+	if err != nil {
+		t.Fatalf("ClientIdentityKey managed renew: %v", err)
+	}
+	kRenewCSR, err := ClientIdentityKey(makeCfg(ca1Cert, cert3, key3, "127.0.0.1:7443", "localhost"))
+	if err != nil {
+		t.Fatalf("ClientIdentityKey CSR renew: %v", err)
+	}
+	kRenewCA, err := ClientIdentityKey(makeCfg(ca1RenewedCert, cert2, key2, "127.0.0.1:7443", "localhost"))
+	if err != nil {
+		t.Fatalf("ClientIdentityKey CA renew: %v", err)
+	}
+
+	if kBase != kRenewManaged || kBase != kRenewCSR || kBase != kRenewCA {
+		t.Fatalf("expected stable identity key across renewals: base=%s managed=%s csr=%s ca=%s", kBase, kRenewManaged, kRenewCSR, kRenewCA)
+	}
+
+	kBob, err := ClientIdentityKey(makeCfg(ca1Cert, bobCert, bobKey, "127.0.0.1:7443", "localhost"))
+	if err != nil || kBob == kBase {
+		t.Fatalf("expected different user bob to have distinct identity key (bob=%s, err=%v)", kBob, err)
+	}
+	kOtherCA, err := ClientIdentityKey(makeCfg(ca2Cert, aliceCA2Cert, aliceCA2Key, "127.0.0.1:7443", "localhost"))
+	if err != nil || kOtherCA == kBase {
+		t.Fatalf("expected different CA to have distinct identity key (otherCA=%s, err=%v)", kOtherCA, err)
+	}
+	kOtherAddr, err := ClientIdentityKey(makeCfg(ca1Cert, cert1, key1, "127.0.0.1:7444", "localhost"))
+	if err != nil || kOtherAddr == kBase {
+		t.Fatalf("expected different server address to have distinct identity key (otherAddr=%s, err=%v)", kOtherAddr, err)
+	}
+	kOtherSNI, err := ClientIdentityKey(makeCfg(ca1Cert, cert1, key1, "127.0.0.1:7443", "other.local"))
+	if err != nil || kOtherSNI == kBase {
+		t.Fatalf("expected different server name to have distinct identity key (otherSNI=%s, err=%v)", kOtherSNI, err)
+	}
+}
