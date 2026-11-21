@@ -418,11 +418,11 @@ func TestServerSettingsEditAllFieldsAndPolicyRateDropdowns(t *testing.T) {
 	if m.modal != srvModalEditPolicy || len(m.formInputs) != 0 {
 		t.Fatalf("policy modal should hide custom bandwidth inputs while inherit=true: modal=%v inputs=%d", m.modal, len(m.formInputs))
 	}
-	// 聚焦到“继承默认带宽”并按 Enter（不再误提交，而是切换勾选并展开自定义限速框）
+	// 聚焦到“继承默认带宽”并按 Space 切换勾选并展开自定义限速框
 	m.setRowFocus(3, 0)
-	m.Update(keyType(tea.KeyEnter))
+	m.Update(keyRune(' '))
 	if m.modal != srvModalEditPolicy || len(m.formUnits) < 3 {
-		t.Fatalf("Enter on inherit-bandwidth toggle should expand custom unit dropdowns without submitting: modal=%v units=%d", m.modal, len(m.formUnits))
+		t.Fatalf("Space on inherit-bandwidth toggle should expand custom unit dropdowns without submitting: modal=%v units=%d", m.modal, len(m.formUnits))
 	}
 	m.formInputs[0].SetValue("4")
 	m.formUnits[0].selected = 2 // MB/s
@@ -1298,7 +1298,7 @@ func TestServerFormToggleEnterDynamicBandwidthAndWizardEscCapture(t *testing.T) 
 		t.Fatalf("expected wizard step bar visible:\n%s", ansi.Strip(wm.View()))
 	}
 
-	// 2. 新建用户弹窗默认折叠自定义带宽；聚焦复选框按 Enter 切换勾选而非误提交
+	// 2. 新建用户弹窗默认折叠自定义带宽；聚焦复选框按 Space 切换勾选展开 3 个自定义限速框并保留用户名
 	m := regressionServer(t, 110, 32)
 	m.openNewUserModal()
 	if len(m.formInputs) != 2 {
@@ -1306,9 +1306,9 @@ func TestServerFormToggleEnterDynamicBandwidthAndWizardEscCapture(t *testing.T) 
 	}
 	m.formInputs[0].SetValue("dave")
 	m.setRowFocus(4, 0) // "继承默认带宽"
-	m.Update(keyType(tea.KeyEnter))
+	m.Update(keyRune(' '))
 	if m.modal != srvModalNewUser || len(m.formInputs) != 5 || m.formInputs[0].Value() != "dave" {
-		t.Fatalf("expected Enter on inheritBW toggle to expand 3 custom bandwidth rows preserving name, modal=%v inputs=%d", m.modal, len(m.formInputs))
+		t.Fatalf("expected Space on inheritBW toggle to expand 3 custom bandwidth rows preserving name, modal=%v inputs=%d", m.modal, len(m.formInputs))
 	}
 }
 

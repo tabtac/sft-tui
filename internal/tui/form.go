@@ -699,13 +699,6 @@ func (m *serverModel) handleFormKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if m.formFocus >= 0 && m.formFocus < nRows {
 			r := m.formRows[m.formFocus]
 			switch r.kind {
-			case formRowToggle:
-				val := !m.formToggles[r.toggleIdx]
-				m.formToggles[r.toggleIdx] = val
-				if r.onToggle != nil {
-					r.onToggle(val)
-				}
-				return m, nil
 			case formRowSelect:
 				m.openDropdownAt(m.formFocus)
 				return m, nil
@@ -1088,7 +1081,7 @@ func (m *serverModel) buildFormViewAndHits(innerW int) ([]string, string, []form
 		hits = append(hits, btnHits...)
 	}
 
-	footer := "Tab/↑↓ 切项 · Space/Enter 勾选或下拉 · ←→ 切单位 · Esc 返回"
+	footer := "Tab/↑↓ 切项 · Space 勾选/下拉 · ←→ 切单位 · Enter 提交 · Esc 返回"
 	if m.dropdownOpen {
 		footer = "下拉选择：↑↓ 选择项 · Enter / Space 确认 · Esc 收起"
 	}
