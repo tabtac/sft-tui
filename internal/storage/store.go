@@ -3,7 +3,6 @@ package storage
 import (
 	"context"
 	"crypto/rand"
-	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
 	"errors"
@@ -31,6 +30,7 @@ type Store struct {
 	leases       map[string]uint64
 	nextLease    uint64
 	stageHandles map[string]*stageWriter
+	onCommitHash func()
 }
 
 // OpenStore 打开并初始化存储引擎，强制执行目录句柄锚定与子目录排他权限收紧。
@@ -520,19 +520,136 @@ func (s *Store) writeChunkLocked(ctx context.Context, taskID protocol.TransferID
 }
 
 // CommitUpload 校验最终 SHA-256 并原子发布文件。
-// 修复 Windows 句柄冲突与防 TOCTOU 替换：
-// 1. 流式校验实际字节数与 SHA-256。
-// 2. 校验完成后及时关闭读取句柄，再执行移除或备用原子重命名，彻底避免 Windows MoveFileEx 句柄自阻塞。
+// 兼顾并发吞吐、Windows 句柄约束与防 TOCTOU 替换：
+// 1. 先在锁内完成状态、租约与文件身份快照，随后释放全局存储锁流式计算 SHA-256（支持 ctx 取消），避免大文件校验阻塞其他用户。
+// 2. 校验完成后立即关闭读取句柄，再重新加锁复核文件身份（dev/ino/size）并执行硬链接或备用原子重命名发布。
 // 3. 优先通过硬链接 (Link) 原子连接到 objects/，保证校验文件与发布文件物理一致，且失败时保留暂存文件供恢复。
 func (s *Store) CommitUpload(ctx context.Context, taskID protocol.TransferID, fileSize uint64, declaredSHA protocol.Digest) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.commitUploadLocked(ctx, taskID, fileSize, declaredSHA)
+	return s.commitUpload(ctx, taskID, 0, false, fileSize, declaredSHA)
 }
 
-func (s *Store) commitUploadLocked(ctx context.Context, taskID protocol.TransferID, fileSize uint64, declaredSHA protocol.Digest) error {
+func (s *Store) commitUpload(ctx context.Context, taskID protocol.TransferID, lease uint64, useLease bool, fileSize uint64, declaredSHA protocol.Digest) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	idHex := IDToHex(taskID)
+
+	// 阶段 1：持锁检查租约、任务状态与暂存文件，打开只读句柄并记录底层文件身份，随后释放全局锁。
+	s.mu.Lock()
+	if s.closed || s.db == nil || s.root == nil {
+		s.mu.Unlock()
+		return ErrStoreClosed
+	}
+	if useLease {
+		if err := s.checkLeaseLocked(idHex, lease); err != nil {
+			s.mu.Unlock()
+			return err
+		}
+		if err := s.closeStageHandleLocked(idHex); err != nil {
+			s.mu.Unlock()
+			return err
+		}
+	}
 
 	task, err := s.getTaskLocked(ctx, taskID)
+	if err != nil {
+		s.mu.Unlock()
+		return err
+	}
+	if task.Status != TaskActive {
+		s.mu.Unlock()
+		return fmt.Errorf("task cannot be committed: current status is %s", task.Status)
+	}
+	if task.Offset != fileSize || fileSize != task.FileSize {
+		s.mu.Unlock()
+		return ErrOffsetMismatch
+	}
+
+	partRel := stagingRelPath(taskID)
+	objRel := objectRelPath(task.ObjectID)
+
+	info, err := s.root.Lstat(partRel)
+	if err != nil {
+		s.mu.Unlock()
+		return err
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+		s.mu.Unlock()
+		return fmt.Errorf("security violation: staging part file is a symlink or irregular")
+	}
+
+	// 检查目标不可变对象是否已存在，防止被意外覆盖
+	if _, err := s.root.Lstat(objRel); err == nil {
+		s.mu.Unlock()
+		return fmt.Errorf("object %s already exists", task.ObjectID)
+	}
+
+	f, err := s.root.OpenFile(partRel, os.O_RDONLY, 0)
+	if err != nil {
+		s.mu.Unlock()
+		return err
+	}
+	dev, ino, _, idErr := pal.FileIdentity(f)
+	if idErr != nil {
+		_ = f.Close()
+		s.mu.Unlock()
+		return idErr
+	}
+
+	var tempLease uint64
+	if !useLease && s.leases[idHex] == 0 {
+		tempLease = s.nextLeaseLocked(idHex)
+	}
+	hashHook := s.onCommitHash
+	s.mu.Unlock()
+
+	releaseTempLease := func() {
+		if tempLease == 0 {
+			return
+		}
+		s.mu.Lock()
+		if s.leases[idHex] == tempLease {
+			delete(s.leases, idHex)
+		}
+		s.mu.Unlock()
+		tempLease = 0
+	}
+
+	// 阶段 2：在全局锁外流式计算 SHA-256 与实际字节数，并响应 ctx 取消。
+	if hashHook != nil {
+		hashHook()
+	}
+	actualDigest, actualSize, hashErr := pal.DigestReaderContext(ctx, f)
+	closeErr := f.Close()
+	if hashErr != nil {
+		releaseTempLease()
+		return hashErr
+	}
+	if closeErr != nil {
+		releaseTempLease()
+		return closeErr
+	}
+
+	// 阶段 3：重新加锁，复核租约、文件身份并原子发布。
+	s.mu.Lock()
+	defer func() {
+		if tempLease != 0 && s.leases[idHex] == tempLease {
+			delete(s.leases, idHex)
+		}
+		s.mu.Unlock()
+	}()
+
+	if s.closed || s.db == nil || s.root == nil {
+		return ErrStoreClosed
+	}
+	if useLease {
+		if err := s.checkLeaseLocked(idHex, lease); err != nil {
+			return err
+		}
+	}
+
+	task, err = s.getTaskLocked(ctx, taskID)
 	if err != nil {
 		return err
 	}
@@ -542,47 +659,47 @@ func (s *Store) commitUploadLocked(ctx context.Context, taskID protocol.Transfer
 	if task.Offset != fileSize || fileSize != task.FileSize {
 		return ErrOffsetMismatch
 	}
+	if actualSize != fileSize || actualSize != task.FileSize {
+		return ErrOffsetMismatch
+	}
 
-	partRel := stagingRelPath(taskID)
-	objRel := objectRelPath(task.ObjectID)
-
-	info, err := s.root.Lstat(partRel)
+	// 复核暂存文件在无锁哈希期间未被替换或篡改长度
+	info, err = s.root.Lstat(partRel)
 	if err != nil {
 		return err
 	}
 	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
 		return fmt.Errorf("security violation: staging part file is a symlink or irregular")
 	}
+	if uint64(info.Size()) != actualSize {
+		return ErrOffsetMismatch
+	}
+	verifyF, err := s.root.OpenFile(partRel, os.O_RDONLY, 0)
+	if err != nil {
+		return err
+	}
+	curDev, curIno, _, curIDErr := pal.FileIdentity(verifyF)
+	verifyCloseErr := verifyF.Close()
+	if curIDErr != nil {
+		return curIDErr
+	}
+	if verifyCloseErr != nil {
+		return verifyCloseErr
+	}
+	if curDev != dev || curIno != ino {
+		return ErrTaskConflict
+	}
 
-	// 检查目标不可变对象是否已存在，防止被意外覆盖
 	if _, err := s.root.Lstat(objRel); err == nil {
 		return fmt.Errorf("object %s already exists", task.ObjectID)
 	}
 
-	// 打开暂存文件流式计算 SHA-256 并严格校验实际读取字节数
-	f, err := s.root.OpenFile(partRel, os.O_RDONLY, 0)
-	if err != nil {
-		return err
-	}
-
-	hasher := sha256.New()
-	n, copyErr := io.Copy(hasher, f)
-	closeErr := f.Close()
-	if copyErr != nil {
-		return copyErr
-	}
-	if closeErr != nil {
-		return closeErr
-	}
-	if uint64(n) != fileSize || uint64(n) != task.FileSize {
-		return ErrOffsetMismatch
-	}
-
-	actualDigest := hasher.Sum(nil)
-	if hex.EncodeToString(actualDigest) != hex.EncodeToString(declaredSHA[:]) ||
-		hex.EncodeToString(actualDigest) != hex.EncodeToString(task.FileSHA256[:]) {
-		_, _ = s.db.ExecContext(ctx, "UPDATE tasks SET status=?, updated_at=? WHERE id=?", string(TaskFailed), time.Now().Unix(), IDToHex(taskID))
+	if actualDigest != declaredSHA || actualDigest != task.FileSHA256 {
+		_, _ = s.db.ExecContext(ctx, "UPDATE tasks SET status=?, updated_at=? WHERE id=?", string(TaskFailed), time.Now().Unix(), idHex)
 		_ = s.root.Remove(partRel)
+		if useLease {
+			delete(s.leases, idHex)
+		}
 		return ErrHashMismatch
 	}
 
@@ -629,7 +746,7 @@ func (s *Store) commitUploadLocked(ctx context.Context, taskID protocol.Transfer
 
 	_, err = tx.ExecContext(ctx, `
 		UPDATE tasks SET status=?, updated_at=? WHERE id=?
-	`, string(TaskCompleted), now, IDToHex(taskID))
+	`, string(TaskCompleted), now, idHex)
 	if err != nil {
 		rollbackPublish()
 		return err
@@ -640,9 +757,12 @@ func (s *Store) commitUploadLocked(ctx context.Context, taskID protocol.Transfer
 		return err
 	}
 
-	// 事务提交成功后，从 staging 移除入口
+	// 事务提交成功后，从 staging 移除入口并释放会话租约
 	if linkErr == nil {
 		_ = s.root.Remove(partRel)
+	}
+	if useLease {
+		delete(s.leases, idHex)
 	}
 
 	return nil

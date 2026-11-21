@@ -474,24 +474,7 @@ func (s *Store) FlushUploadCheckpoint(ctx context.Context, taskID protocol.Trans
 
 // CommitUploadSession 校验租约并完成最终 SHA-256 校验与原子发布，发布成功后释放租约。
 func (s *Store) CommitUploadSession(ctx context.Context, taskID protocol.TransferID, lease uint64, fileSize uint64, declaredSHA protocol.Digest) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	idHex := IDToHex(taskID)
-	if err := s.checkLeaseLocked(idHex, lease); err != nil {
-		return err
-	}
-	if err := s.closeStageHandleLocked(idHex); err != nil {
-		return err
-	}
-	if err := s.commitUploadLocked(ctx, taskID, fileSize, declaredSHA); err != nil {
-		if errors.Is(err, ErrHashMismatch) {
-			delete(s.leases, idHex)
-		}
-		return err
-	}
-	delete(s.leases, idHex)
-	return nil
+	return s.commitUpload(ctx, taskID, lease, true, fileSize, declaredSHA)
 }
 
 func (s *Store) claimDownloadLocked(ctx context.Context, t Task, offset uint64) (Task, *os.File, uint64, error) {

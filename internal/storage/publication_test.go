@@ -243,3 +243,81 @@ func TestReviewMissingTaskCommit(t *testing.T) {
 		t.Errorf("missing task commit=%v", err)
 	}
 }
+
+func TestCommitUploadReleasesStoreLockDuringHashingAndRespectsCancel(t *testing.T) {
+	root := t.TempDir()
+	s := reviewOpenStore(t, root)
+	content := []byte("verify-concurrent-hashing-does-not-block-store")
+	task, lease, err := s.BeginUploadSession(context.Background(), "alice", reviewRequest("big.bin", content, 10))
+	if err != nil {
+		t.Fatalf("BeginUploadSession: %v", err)
+	}
+	if _, err := s.StageUploadChunk(context.Background(), task.ID, lease, 0, content); err != nil {
+		t.Fatalf("StageUploadChunk: %v", err)
+	}
+	if _, err := s.FlushUploadCheckpoint(context.Background(), task.ID, lease); err != nil {
+		t.Fatalf("FlushUploadCheckpoint: %v", err)
+	}
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	s.onCommitHash = func() {
+		close(entered)
+		<-release
+	}
+
+	commitDone := make(chan error, 1)
+	go func() {
+		commitDone <- s.CommitUploadSession(context.Background(), task.ID, lease, task.FileSize, task.FileSHA256)
+	}()
+
+	<-entered
+
+	// 在哈希阶段，其他用户的读取与写入不应被全局锁阻塞
+	otherTask, otherLease, err := s.BeginUploadSession(context.Background(), "bob", reviewRequest("other.bin", []byte("hi"), 11))
+	if err != nil {
+		close(release)
+		t.Fatalf("concurrent BeginUploadSession blocked or failed: %v", err)
+	}
+	if _, _, err := s.ListPublishedFiles(context.Background(), "bob", "", 12); err != nil {
+		close(release)
+		t.Fatalf("concurrent ListPublishedFiles failed: %v", err)
+	}
+	if _, _, err := s.PublishedUsage(context.Background()); err != nil {
+		close(release)
+		t.Fatalf("concurrent PublishedUsage failed: %v", err)
+	}
+	if err := s.ReleaseTask(context.Background(), otherTask.ID, otherLease, TaskCancelled); err != nil {
+		close(release)
+		t.Fatalf("concurrent ReleaseTask failed: %v", err)
+	}
+
+	close(release)
+	if err := <-commitDone; err != nil {
+		t.Fatalf("CommitUploadSession failed: %v", err)
+	}
+	if reviewCount(t, s, "published_files") != 1 {
+		t.Fatalf("expected 1 published file after commit")
+	}
+
+	// 验证 ctx 取消时能中止无锁哈希阶段而不阻塞或误发布
+	s.onCommitHash = nil
+	cancelTask, cancelLease, err := s.BeginUploadSession(context.Background(), "alice", reviewRequest("cancel.bin", content, 12))
+	if err != nil {
+		t.Fatalf("BeginUploadSession(cancel): %v", err)
+	}
+	if _, err := s.StageUploadChunk(context.Background(), cancelTask.ID, cancelLease, 0, content); err != nil {
+		t.Fatalf("StageUploadChunk(cancel): %v", err)
+	}
+	if _, err := s.FlushUploadCheckpoint(context.Background(), cancelTask.ID, cancelLease); err != nil {
+		t.Fatalf("FlushUploadCheckpoint(cancel): %v", err)
+	}
+	cctx, cancel := context.WithCancel(context.Background())
+	s.onCommitHash = cancel
+	if err := s.CommitUploadSession(cctx, cancelTask.ID, cancelLease, cancelTask.FileSize, cancelTask.FileSHA256); !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context.Canceled, got %v", err)
+	}
+	if reviewCount(t, s, "published_files") != 1 {
+		t.Fatalf("cancelled commit must not publish file")
+	}
+}
