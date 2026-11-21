@@ -342,7 +342,12 @@ func (s *Server) runStream(user string, st *session.Stream, initial protocol.Fra
 	if err != nil {
 		return err
 	}
-	release, err := s.acquireStream(user, principal.Bandwidth)
+	var release func()
+	if initial.Header.Type == protocol.TypeResumeReq {
+		release, err = s.acquireList(user, principal.Bandwidth)
+	} else {
+		release, err = s.acquireStream(user, principal.Bandwidth)
+	}
 	if err != nil {
 		return err
 	}

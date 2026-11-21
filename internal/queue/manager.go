@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"path/filepath"
 	"sort"
@@ -96,6 +97,9 @@ type Manager struct {
 	activeCount  atomic.Int64
 	nextPrune    time.Time
 	runner       TaskRunner
+	ipcLn        net.Listener
+	ipcEndpoint  string
+	ipcWG        sync.WaitGroup
 }
 
 func randomID() (string, error) {
@@ -204,6 +208,7 @@ func Open(cfg Config) (*Manager, error) {
 	m.currentDirty = true
 	m.historyDirty = true
 	m.pruneRecords(time.Now())
+	m.startIPC()
 
 	go m.loop()
 	return m, nil
@@ -396,6 +401,7 @@ func (m *Manager) close() error {
 	m.mu.Unlock()
 
 	m.cancel()
+	m.stopIPC()
 	m.signal()
 	<-m.loopDone
 	m.wg.Wait()

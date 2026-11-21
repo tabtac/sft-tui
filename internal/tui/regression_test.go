@@ -483,3 +483,45 @@ func TestRegressionSameIdentityImportMigratesPausedQueue(t *testing.T) {
 		t.Fatalf("unexpected migrated task state: %+v", migrated)
 	}
 }
+
+func TestRegressionStaleSnapshotDoesNotPrematurelyCompleteBatch(t *testing.T) {
+	mgr, err := queue.Open(queue.Config{StateDir: t.TempDir(), Identity: "batch-stale", MaxStreams: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mgr.Close()
+
+	m := newModel(Options{ExecutableDir: t.TempDir(), Directory: t.TempDir()})
+	m.manager = mgr
+	m.refreshQueueSnapshots()
+
+	tasks, err := mgr.Enqueue([]queue.Spec{{
+		Direction: protocol.DirectionDownload,
+		Remote:    "remote.txt",
+		Path:      filepath.Join(t.TempDir(), "remote.txt"),
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	locked := make(chan struct{})
+	release := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = mgr.UpdateTask(tasks[0].ID, func(_ *queue.Task) {
+			close(locked)
+			<-release
+		})
+	}()
+	<-locked
+	m.Update(batchOpResultMsg{enqueued: tasks})
+	premature := m.lastBatch != nil
+	tracked := len(m.activeBatches)
+	close(release)
+	<-done
+
+	if premature || tracked != 1 {
+		t.Fatalf("stale snapshot prematurely completed unstarted batch: premature=%v tracked=%d", premature, tracked)
+	}
+}

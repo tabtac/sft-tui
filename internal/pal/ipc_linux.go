@@ -14,7 +14,12 @@ import (
 
 // GetIPCPath 返回 Linux 下基于 Unix Domain Socket 的 IPC 端点路径
 func GetIPCPath(baseDir string) string {
-	return filepath.Join(baseDir, ".sftd.sock")
+	return GetNamedIPCPath(baseDir, "sftd")
+}
+
+// GetNamedIPCPath 返回指定名称的本地 IPC 端点路径。
+func GetNamedIPCPath(baseDir, name string) string {
+	return filepath.Join(baseDir, "."+name+".sock")
 }
 
 // ListenIPC 监听 Unix Domain Socket，设置安全权限 0600

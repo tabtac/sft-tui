@@ -153,6 +153,30 @@ func runCommandWithInput(args []string, in io.Reader, out, errOut io.Writer) int
 		MaxStreams:     streams,
 	})
 	if err != nil {
+		if errors.Is(err, queue.ErrQueueLocked) {
+			switch op {
+			case "status":
+				if tasks, ipcErr := queue.RemoteStatus(cfg.StateDir, idKey); ipcErr == nil {
+					return printStatusTasks(tasks, out)
+				}
+			case "pause":
+				if t, ipcErr := queue.RemotePause(cfg.StateDir, idKey, pos[1]); ipcErr == nil {
+					fmt.Fprintf(out, "已暂停 %s (%s)\n", t.ID, t.Remote)
+					return 0
+				} else {
+					fmt.Fprintln(errOut, "sft：", ipcErr)
+					return 1
+				}
+			case "abort":
+				if t, ipcErr := queue.RemoteAbort(cfg.StateDir, idKey, pos[1]); ipcErr == nil {
+					fmt.Fprintf(out, "已取消并清理 %s (%s)\n", t.ID, t.Remote)
+					return 0
+				} else {
+					fmt.Fprintln(errOut, "sft：", ipcErr)
+					return 1
+				}
+			}
+		}
 		fmt.Fprintln(errOut, "sft：", err)
 		return 1
 	}
@@ -321,7 +345,10 @@ func runList(cfg config.Client, out, errOut io.Writer) int {
 }
 
 func runStatus(mgr *queue.Manager, out io.Writer) int {
-	tasks := mgr.Snapshot(false)
+	return printStatusTasks(mgr.Snapshot(false), out)
+}
+
+func printStatusTasks(tasks []queue.Task, out io.Writer) int {
 	var unfinished []queue.Task
 	for _, t := range tasks {
 		if !t.Terminal() {
@@ -414,6 +441,8 @@ func runTransfers(mgr *queue.Manager, cfg config.Client, jobs []cliJob, outDir, 
 	var tracked []trackedJob
 	var toEnqueue []queue.Spec
 	var enqueueJobIdx []int
+	seenTargets := make(map[string]string, len(jobs))
+	seenTaskIDs := make(map[string]bool, len(jobs))
 
 	for idx, j := range jobs {
 		var dir protocol.Direction
@@ -440,6 +469,15 @@ func runTransfers(mgr *queue.Manager, cfg config.Client, jobs []cliJob, outDir, 
 			localPath = abs
 		}
 		key := queue.TargetKey(dir, remote, localPath)
+		if prevPath, dup := seenTargets[key]; dup {
+			if !sameTransferPath(prevPath, localPath) {
+				fmt.Fprintf(errOut, "sft：同一批次中存在同名但路径不同的目标 %s（%s 与 %s）\n", remote, prevPath, localPath)
+				return 1
+			}
+			continue
+		}
+		seenTargets[key] = localPath
+
 		if old, ok := existingByKey[key]; ok {
 			if !sameTransferPath(old.Path, localPath) || old.Remote != remote {
 				shortID := old.ID[:min(12, len(old.ID))]
@@ -451,10 +489,14 @@ func runTransfers(mgr *queue.Manager, cfg config.Client, jobs []cliJob, outDir, 
 				fmt.Fprintf(errOut, "sft：任务 %s 正在等待取消确认，请先完成取消或执行 status 查看状态\n", remote)
 				return 1
 			}
+			if seenTaskIDs[old.ID] {
+				continue
+			}
 			if err := mgr.Resume(old.ID); err != nil {
 				fmt.Fprintf(errOut, "sft：恢复任务 %s 失败：%v\n", remote, err)
 				return 1
 			}
+			seenTaskIDs[old.ID] = true
 			display.Start(idx, dirLabel+" "+remote)
 			tracked = append(tracked, trackedJob{idx: idx, id: old.ID, dir: dirLabel, label: remote})
 		} else {
@@ -493,12 +535,21 @@ type trackedJob struct {
 }
 
 func waitTrackedTransfers(ctx context.Context, mgr *queue.Manager, tracked []trackedJob, display *progress.Display) int {
-	finished := make(map[string]bool, len(tracked))
+	uniqueTracked := make([]trackedJob, 0, len(tracked))
+	seen := make(map[string]bool, len(tracked))
+	for _, tr := range tracked {
+		if tr.id == "" || seen[tr.id] {
+			continue
+		}
+		seen[tr.id] = true
+		uniqueTracked = append(uniqueTracked, tr)
+	}
+	finished := make(map[string]bool, len(uniqueTracked))
 	failed := false
 	ticker := time.NewTicker(40 * time.Millisecond)
 	defer ticker.Stop()
 
-	for len(finished) < len(tracked) {
+	for len(finished) < len(uniqueTracked) {
 		select {
 		case <-ctx.Done():
 			pauseCtx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
@@ -506,7 +557,7 @@ func waitTrackedTransfers(ctx context.Context, mgr *queue.Manager, tracked []tra
 			cancel()
 			return 1
 		case <-ticker.C:
-			for _, tr := range tracked {
+			for _, tr := range uniqueTracked {
 				if finished[tr.id] {
 					continue
 				}

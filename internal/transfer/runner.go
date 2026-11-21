@@ -212,7 +212,11 @@ func (r *QueueRunner) Run(ctx context.Context, task queue.Task, op *queue.Operat
 		return r.manager.UpdateTask(task.ID, fn)
 	}
 
-	for attempt := 0; attempt < 4; attempt++ {
+	const maxRateWait = 65 * time.Second
+	var rateStart time.Time
+	rateAttempt := 0
+
+	for attempt := 0; attempt < 4; {
 		if op != nil && op.Mode() != 0 {
 			if mapped := preDialControlErr(context.Canceled, task, op); mapped != context.Canceled {
 				return mapped
@@ -234,7 +238,53 @@ func (r *QueueRunner) Run(ctx context.Context, task queue.Task, op *queue.Operat
 		}
 
 		_, err = c.Execute(ctx, task, op, progress, update)
-		if err == nil || (op != nil && op.Mode() != 0) || r.ctx.Err() != nil || !IsTransient(err) || attempt == 3 {
+		if err == nil {
+			return nil
+		}
+		if (op != nil && op.Mode() != 0) || r.ctx.Err() != nil {
+			return err
+		}
+
+		// 服务端临时限流：保持健康连接，按有界退避可中断等待后重试
+		if IsRateLimited(err) {
+			if rateStart.IsZero() {
+				rateStart = time.Now()
+			}
+			if time.Since(rateStart) >= maxRateWait {
+				return err
+			}
+			delay := 250 * time.Millisecond * time.Duration(1<<min(rateAttempt, 3))
+			if delay > 2*time.Second {
+				delay = 2 * time.Second
+			}
+			rateAttempt++
+			if r.manager != nil {
+				_ = r.manager.UpdateTask(task.ID, func(cur *queue.Task) {
+					cur.State = queue.Waiting
+					cur.Error = "服务端限流，等待配额后自动重试"
+				})
+			}
+			var opDone <-chan struct{}
+			if op != nil {
+				opDone = op.Context().Done()
+			}
+			timer := time.NewTimer(delay)
+			select {
+			case <-timer.C:
+				continue
+			case <-ctx.Done():
+				timer.Stop()
+				return preDialControlErr(ctx.Err(), task, op)
+			case <-r.ctx.Done():
+				timer.Stop()
+				return preDialControlErr(r.ctx.Err(), task, op)
+			case <-opDone:
+				timer.Stop()
+				return preDialControlErr(context.Canceled, task, op)
+			}
+		}
+
+		if !IsTransient(err) || attempt == 3 {
 			var remote *protocol.RemoteError
 			if task.HasCheckpoint() && errors.As(err, &remote) &&
 				(remote.Code == protocol.CodeTransferExpired || remote.Code == protocol.CodeNotFound) {
@@ -242,6 +292,7 @@ func (r *QueueRunner) Run(ctx context.Context, task queue.Task, op *queue.Operat
 			}
 			return err
 		}
+		attempt++
 
 		r.mu.Lock()
 		if r.client == c {

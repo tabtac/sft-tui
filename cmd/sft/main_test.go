@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"net"
 	"os"
 	"path/filepath"
@@ -337,5 +338,122 @@ func TestCLIUploadSameBasenameDifferentPathRejectsWrongSourceResume(t *testing.T
 	errOut.Reset()
 	if code := runCommand([]string{"-config", cfgPath, "-progress", "never", "upload", oldPath}, &out, &errOut); code != 0 {
 		t.Fatalf("same-path resume should succeed, code=%d err=%q", code, errOut.String())
+	}
+}
+
+func TestCLIWaitTrackedDeduplicatesRepeatedTaskIDs(t *testing.T) {
+	mgr, err := queue.Open(queue.Config{StateDir: t.TempDir(), Identity: "dup-wait", MaxStreams: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mgr.Close()
+
+	src := filepath.Join(t.TempDir(), "x.txt")
+	if err := os.WriteFile(src, []byte("x"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	tasks, err := mgr.Enqueue([]queue.Spec{{Direction: protocol.DirectionUpload, Remote: "x.txt", Path: src}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := mgr.UpdateTask(tasks[0].ID, func(tk *queue.Task) {
+		tk.State = queue.Completed
+		tk.Done = tk.Size
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	var out, errOut bytes.Buffer
+	disp, err := progress.New("never", &errOut, &out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer disp.Close()
+
+	tracked := []trackedJob{
+		{idx: 0, id: tasks[0].ID, dir: "upload", label: "x.txt"},
+		{idx: 1, id: tasks[0].ID, dir: "upload", label: "x.txt"},
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if code := waitTrackedTransfers(ctx, mgr, tracked, disp); code != 0 {
+		t.Fatalf("expected deduplicated wait to finish with exit 0, got %d", code)
+	}
+	if got := strings.Count(out.String(), "upload 完成"); got != 1 {
+		t.Fatalf("expected exactly 1 completion line, got %d (%q)", got, out.String())
+	}
+}
+
+func TestCLILiveStatusPauseAbortViaQueueIPC(t *testing.T) {
+	cfgPath, cleanup := setupCLIFixture(t)
+	defer cleanup()
+
+	cfg, err := config.LoadClient(cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	idKey, err := security.ClientIdentityKey(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mgr, err := queue.Open(queue.Config{StateDir: cfg.StateDir, Identity: idKey, MaxStreams: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mgr.Close()
+
+	started := make(chan struct{})
+	mgr.SetRunner(func(ctx context.Context, _ queue.Task, _ *queue.Operation, _ func(uint64, uint64, queue.State)) error {
+		close(started)
+		<-ctx.Done()
+		return ctx.Err()
+	})
+
+	src := filepath.Join(t.TempDir(), "live.txt")
+	if err := os.WriteFile(src, []byte("hello"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	tasks, err := mgr.Enqueue([]queue.Spec{{Direction: protocol.DirectionUpload, Remote: "live.txt", Path: src}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	<-started
+
+	for _, op := range []string{"status", "pause", "abort"} {
+		args := []string{"-config", cfgPath, op}
+		if op != "status" {
+			args = append(args, tasks[0].ID[:12])
+		}
+		var out, errOut bytes.Buffer
+		if code := runCommand(args, &out, &errOut); code != 0 {
+			t.Fatalf("live %s failed: code=%d out=%q err=%q", op, code, out.String(), errOut.String())
+		}
+		if op == "status" && !strings.Contains(out.String(), "live.txt") {
+			t.Fatalf("live status did not include active task: %q", out.String())
+		}
+	}
+}
+
+func TestCLIBulkUploadRecoversFromTemporaryRateLimit(t *testing.T) {
+	cfgPath, cleanup := setupCLIFixture(t)
+	defer cleanup()
+
+	// 默认 MaxNewTasksPerMinute=30，上传 32 个小文件验证自动有界退避重试（需等待约 4 秒补足 2 个令牌）
+	dir := t.TempDir()
+	args := []string{"-config", cfgPath, "-progress", "never", "upload"}
+	for i := 0; i < 32; i++ {
+		p := filepath.Join(dir, fmt.Sprintf("f%02d.txt", i))
+		if err := os.WriteFile(p, []byte("abc"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		args = append(args, p)
+	}
+	var out, errOut bytes.Buffer
+	code := runCommand(args, &out, &errOut)
+	if code != 0 {
+		t.Fatalf("bulk upload under default rate limit failed: code=%d out=%q err=%q", code, out.String(), errOut.String())
+	}
+	if got := strings.Count(out.String(), "upload 完成"); got != 32 {
+		t.Fatalf("expected 32 completed uploads, got %d", got)
 	}
 }

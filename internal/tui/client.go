@@ -2438,7 +2438,8 @@ func (m *model) evaluateBatches() {
 		for _, tid := range bt.taskIDs {
 			t, ok := byID[tid]
 			if !ok {
-				continue
+				settled = false
+				break
 			}
 			switch {
 			case t.Terminal():

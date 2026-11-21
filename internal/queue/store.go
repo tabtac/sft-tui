@@ -3,6 +3,7 @@ package queue
 import (
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -10,6 +11,9 @@ import (
 
 	"sft-tui/internal/pal"
 )
+
+// ErrQueueLocked 表示该身份的队列正被另一个运行中的客户端实例独占锁定。
+var ErrQueueLocked = errors.New("queue locked by another instance")
 
 type Store struct {
 	db   *sql.DB
@@ -28,7 +32,7 @@ func OpenStore(dir, identity string) (*Store, error) {
 	}
 	if err := pal.LockFile(lock); err != nil {
 		lock.Close()
-		return nil, fmt.Errorf("queue for identity %q is locked by another instance: %w", identity, err)
+		return nil, fmt.Errorf("queue for identity %q is locked by another instance (%w): %w", identity, ErrQueueLocked, err)
 	}
 
 	failed := true

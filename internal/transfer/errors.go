@@ -49,6 +49,18 @@ func IsTransient(err error) bool {
 		errors.Is(err, net.ErrClosed)
 }
 
+// IsRateLimited 判断错误是否为服务端临时限流（CodeTempUnavailable 且非排空停机），可经有界退避后重试。
+func IsRateLimited(err error) bool {
+	var remote *protocol.RemoteError
+	if !errors.As(err, &remote) {
+		return false
+	}
+	if remote.Code != protocol.CodeTempUnavailable {
+		return false
+	}
+	return !strings.Contains(remote.Message, "排空")
+}
+
 func isFatalTransfer(err error) bool {
 	var remote *protocol.RemoteError
 	if !errors.As(err, &remote) {

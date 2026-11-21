@@ -18,12 +18,21 @@ import (
 
 // GetIPCPath 返回 Windows 命名管道路径 \\.\pipe\sftd-<hash>
 func GetIPCPath(baseDir string) string {
+	return GetNamedIPCPath(baseDir, "sftd")
+}
+
+// GetNamedIPCPath 返回指定名称的 Windows 命名管道路径。
+func GetNamedIPCPath(baseDir, name string) string {
 	abs, err := filepath.Abs(baseDir)
 	if err != nil {
 		abs = baseDir
 	}
-	h := sha256.Sum256([]byte(strings.ToLower(abs)))
-	return fmt.Sprintf(`\\.\pipe\sftd-%s`, hex.EncodeToString(h[:8]))
+	if name == "" || name == "sftd" {
+		h := sha256.Sum256([]byte(strings.ToLower(abs)))
+		return fmt.Sprintf(`\\.\pipe\sftd-%s`, hex.EncodeToString(h[:8]))
+	}
+	h := sha256.Sum256([]byte(strings.ToLower(abs) + "\x00" + name))
+	return fmt.Sprintf(`\\.\pipe\sft-%s`, hex.EncodeToString(h[:12]))
 }
 
 // ListenIPC 监听 Windows Named Pipe，配置仅当前用户与 SYSTEM 可访问的私有 DACL
