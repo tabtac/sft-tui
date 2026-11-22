@@ -249,6 +249,8 @@ func classifyStreamDirection(f protocol.Frame) string {
 		return "download"
 	case protocol.TypeListReq:
 		return "list"
+	case protocol.TypeDeleteReq:
+		return "delete"
 	case protocol.TypeResumeReq:
 		var req protocol.ResumeRequest
 		if protocol.Unmarshal(f.Payload, &req) == nil && req.Direction == protocol.DirectionDownload {
@@ -355,7 +357,7 @@ func extractInitialFileName(initial protocol.Frame) string {
 
 func (s *Server) runStream(user string, st *session.Stream, initial protocol.Frame, monID uint64) (resultErr error) {
 	outcome := "completed"
-	isTransfer := initial.Header.Type != protocol.TypeListReq
+	isTransfer := initial.Header.Type != protocol.TypeListReq && initial.Header.Type != protocol.TypeDeleteReq
 	opName := "upload"
 	meta := &transferLogMeta{file: extractInitialFileName(initial)}
 	defer func() {
@@ -396,6 +398,9 @@ func (s *Server) runStream(user string, st *session.Stream, initial protocol.Fra
 		s.describe(monID, "（文件列表）", 0, 0)
 		s.progress(monID, 0, "浏览列表")
 		return s.runList(user, st, initial)
+	}
+	if initial.Header.Type == protocol.TypeDeleteReq {
+		return s.runDelete(user, st, initial, monID)
 	}
 
 	dir := protocol.DirectionUpload
@@ -476,6 +481,41 @@ func (s *Server) runList(user string, st *session.Stream, initial protocol.Frame
 			return err
 		}
 	}
+}
+
+func (s *Server) runDelete(user string, st *session.Stream, initial protocol.Frame, monID uint64) error {
+	var req protocol.DeleteRequest
+	if err := protocol.Unmarshal(initial.Payload, &req); err != nil {
+		return err
+	}
+	s.describe(monID, req.FileName, 0, 0)
+	s.progress(monID, 0, "删除文件")
+
+	// 删除属于写操作，必须具备 upload 权限且严格绑定当前 mTLS 认证用户，禁止只读用户或跨用户越权删除。
+	principal, err := s.authorize(user, "upload")
+	if err != nil {
+		s.logger.Warn("删除文件被拒绝", "user", user, "file", req.FileName, "error", err.Error())
+		return err
+	}
+	release, err := s.acquireStream(user, principal.Bandwidth)
+	if err != nil {
+		return err
+	}
+	defer release()
+
+	if _, err := s.authorizeBandwidth(user, "upload"); err != nil {
+		s.logger.Warn("删除文件被拒绝", "user", user, "file", req.FileName, "error", err.Error())
+		return err
+	}
+
+	pub, err := s.store.DeletePublishedFile(st.Context(), user, req.FileName)
+	if err != nil {
+		s.logger.Warn("删除文件失败", "user", user, "file", req.FileName, "error", err.Error())
+		return err
+	}
+	s.logger.Info("文件已删除", "user", user, "file", pub.FileName, "size", pub.FileSize, "object_id", pub.ObjectID)
+	release()
+	return st.Send(protocol.TypeDeleteResp, protocol.DeleteResponse{})
 }
 
 func (s *Server) handleUpload(user string, bw config.Bandwidth, st *session.Stream, initial protocol.Frame, resume protocol.ResumeRequest, monID uint64, release func(), meta *transferLogMeta) (outcome string, resultErr error) {

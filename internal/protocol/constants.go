@@ -37,6 +37,8 @@ const (
 	TypeListReq    Type = 0x14
 	TypeListResp   Type = 0x15
 	TypeListNext   Type = 0x16
+	TypeDeleteReq  Type = 0x17
+	TypeDeleteResp Type = 0x18
 	TypeData       Type = 0x20
 	TypeAck        Type = 0x21
 	TypeCommit     Type = 0x22

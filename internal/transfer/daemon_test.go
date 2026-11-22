@@ -300,3 +300,141 @@ func TestDaemonGracefulStopBroadcastsGoAwayAndRespectsDrainTimeout(t *testing.T)
 		t.Fatal("daemon did not exit after graceful Stop")
 	}
 }
+
+func TestDaemonDeleteFileEnforcesACLAndOwnershipIsolation(t *testing.T) {
+	srvCfg, aliceCfg, bobCfg := daemonFixture(t)
+	certsDir := filepath.Dir(srvCfg.TLS.CACertificate)
+	if err := testcert.IssueClient(certsDir, "carol"); err != nil {
+		t.Fatalf("IssueClient carol: %v", err)
+	}
+	srvCfg.AuthorizedClients = append(srvCfg.AuthorizedClients, config.AuthorizedClient{
+		UserID:      "carol",
+		Certificate: filepath.Join(certsDir, "carol.pem"),
+		Permissions: []string{"upload", "download"},
+	})
+	carolCfg := aliceCfg
+	carolCfg.StateDir = filepath.Join(filepath.Dir(aliceCfg.StateDir), "cli-carol")
+	carolCfg.TLS = config.TLSFiles{
+		CACertificate: filepath.Join(certsDir, "ca.pem"),
+		Certificate:   filepath.Join(certsDir, "carol.pem"),
+		PrivateKey:    filepath.Join(certsDir, "carol-key.pem"),
+	}
+
+	var logs monitor.Logs
+	logger := slog.New(logs.Handler(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelInfo})))
+	d, err := NewDaemonWithLogger(srvCfg, logger)
+	if err != nil {
+		t.Fatalf("NewDaemonWithLogger: %v", err)
+	}
+	defer d.Close()
+
+	ln, err := net.Listen("tcp", srvCfg.Listen)
+	if err != nil {
+		t.Fatal(err)
+	}
+	aliceCfg.ServerAddress = ln.Addr().String()
+	bobCfg.ServerAddress = ln.Addr().String()
+	carolCfg.ServerAddress = ln.Addr().String()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = d.Serve(ctx, ln) }()
+
+	opCtx, opCancel := context.WithTimeout(ctx, 10*time.Second)
+	defer opCancel()
+
+	cliAlice, err := Dial(opCtx, aliceCfg)
+	if err != nil {
+		t.Fatalf("Dial alice: %v", err)
+	}
+	defer cliAlice.Close()
+
+	cliBob, err := Dial(opCtx, bobCfg)
+	if err != nil {
+		t.Fatalf("Dial bob: %v", err)
+	}
+	defer cliBob.Close()
+
+	cliCarol, err := Dial(opCtx, carolCfg)
+	if err != nil {
+		t.Fatalf("Dial carol: %v", err)
+	}
+	defer cliCarol.Close()
+
+	aliceSrc := filepath.Join(t.TempDir(), "alice.bin")
+	carolSrc := filepath.Join(t.TempDir(), "carol.bin")
+	if err := os.WriteFile(aliceSrc, []byte("alice-secret-payload"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(carolSrc, []byte("carol-payload"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := cliAlice.UploadFile(opCtx, aliceSrc, "alice-only.bin", nil); err != nil {
+		t.Fatalf("alice upload alice-only.bin: %v", err)
+	}
+	if _, err := cliAlice.UploadFile(opCtx, aliceSrc, "same.bin", nil); err != nil {
+		t.Fatalf("alice upload same.bin: %v", err)
+	}
+	if _, err := cliCarol.UploadFile(opCtx, carolSrc, "same.bin", nil); err != nil {
+		t.Fatalf("carol upload same.bin: %v", err)
+	}
+
+	// 1. 只读用户 bob（无 upload 权限）不得删除任何文件 -> CodeUnauthorized
+	if err := cliBob.DeleteFile(opCtx, "alice-only.bin"); err == nil {
+		t.Fatal("expected read-only user bob to be denied delete")
+	} else if !strings.Contains(err.Error(), "权限") {
+		t.Fatalf("expected unauthorized error for bob, got: %v", err)
+	}
+
+	// 2. 拥有 upload 权限的 carol 试图越权删除 alice 的文件 -> CodeNotFound，alice 文件完好
+	if err := cliCarol.DeleteFile(opCtx, "alice-only.bin"); err == nil {
+		t.Fatal("expected carol deleting alice's file to fail")
+	}
+
+	// 3. carol 删除自己名下的 same.bin，不得影响 alice 名下的同名文件 same.bin
+	if err := cliCarol.DeleteFile(opCtx, "same.bin"); err != nil {
+		t.Fatalf("carol delete own same.bin failed: %v", err)
+	}
+	var carolFiles []string
+	if err := cliCarol.ListFiles(opCtx, func(e protocol.FileEntry) error { carolFiles = append(carolFiles, e.FileName); return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if len(carolFiles) != 0 {
+		t.Fatalf("expected carol's remote list empty after delete, got %v", carolFiles)
+	}
+	dlPath := filepath.Join(t.TempDir(), "alice-same.bin")
+	if _, err := cliAlice.DownloadFile(opCtx, "same.bin", dlPath, nil); err != nil {
+		t.Fatalf("alice's same.bin must remain downloadable after carol deleted hers: %v", err)
+	}
+
+	// 4. alice 删除自己的 alice-only.bin -> 成功，列表消失，且记录审计日志
+	if err := cliAlice.DeleteFile(opCtx, "alice-only.bin"); err != nil {
+		t.Fatalf("alice delete own alice-only.bin failed: %v", err)
+	}
+	var aliceFiles []string
+	if err := cliAlice.ListFiles(opCtx, func(e protocol.FileEntry) error { aliceFiles = append(aliceFiles, e.FileName); return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if len(aliceFiles) != 1 || aliceFiles[0] != "same.bin" {
+		t.Fatalf("expected only same.bin remaining for alice, got %v", aliceFiles)
+	}
+
+	// 5. 路径穿越名称被拒绝
+	if err := cliAlice.DeleteFile(opCtx, "../same.bin"); err == nil {
+		t.Fatal("expected path traversal delete name to be rejected")
+	}
+
+	// 6. 验证结构化审计日志记录了删除事件
+	page := logs.Query(monitor.LogQuery{User: "alice", File: "alice-only.bin"})
+	foundAudit := false
+	for _, ev := range page.Events {
+		if ev.Message == "文件已删除" && ev.User == "alice" && ev.File == "alice-only.bin" {
+			foundAudit = true
+			break
+		}
+	}
+	if !foundAudit {
+		t.Fatalf("expected structured delete audit log for alice/alice-only.bin, got %+v", page.Events)
+	}
+}

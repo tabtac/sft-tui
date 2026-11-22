@@ -249,8 +249,13 @@ func (m *model) renderFooter() string {
 		case m.loadingRemote:
 			refreshReason = "同步中"
 		}
+		delLabel := "删除"
+		if len(m.remoteSelected) > 0 {
+			delLabel = fmt.Sprintf("删除 %d", len(m.remoteSelected))
+		}
 		return renderActionFooter(m.th, m.width, "远端:", []footerChip{
 			{key: "d/F5", label: dnLabel, reason: dnReason, essential: true},
+			{key: "x", label: delLabel, reason: dnReason, essential: true},
 			{key: "Spc", label: "多选", essential: true},
 			{key: "A", label: "全选", essential: true},
 			{key: "Enter", label: "详情"},

@@ -243,7 +243,7 @@ func (m *model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 	if msg.Action != tea.MouseActionPress || m.width <= 0 || m.height <= 0 {
 		return m, nil
 	}
-	if m.modal == modalHelp || m.modal == modalDetail || m.modal == modalBatchSummary || m.modal == modalConflict {
+	if m.modal == modalHelp || m.modal == modalDetail || m.modal == modalBatchSummary || m.modal == modalConflict || m.modal == modalDeleteRemote {
 		switch msg.Button {
 		case tea.MouseButtonWheelUp:
 			m.scrollClientInfoModal("up")
@@ -773,6 +773,32 @@ func (m *model) handleModalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 		}
 		return m, nil
+
+	case modalDeleteRemote:
+		switch k {
+		case "esc", "n":
+			m.modal = modalNone
+			m.pendingDeleteNames = nil
+			m.clearToast()
+		case "enter", "y":
+			if m.opBusy {
+				m.setToast("已有操作正在执行，请稍候…")
+				return m, nil
+			}
+			names := append([]string(nil), m.pendingDeleteNames...)
+			m.modal = modalNone
+			m.pendingDeleteNames = nil
+			if len(names) == 0 {
+				return m, nil
+			}
+			m.opBusy = true
+			m.opLabel = "正在删除远端文件"
+			m.opStart = time.Now()
+			return m, m.deleteRemoteFilesCmd(names)
+		case "up", "k", "down", "j", "pgup", "b", "pgdown", "f", " ", "home", "g", "end", "G":
+			m.scrollClientInfoModal(k)
+		}
+		return m, nil
 	}
 	return m, nil
 }
@@ -976,6 +1002,8 @@ func (m *model) handleRemoteKey(k string) (tea.Model, tea.Cmd) {
 				m.remoteCursor++
 			}
 		}
+	case "x", "delete":
+		m.prepareDeleteRemote()
 	case "enter":
 		if n == 0 && m.remoteErr != "" {
 			m.detailTitle = "远端连接错误详情"
@@ -1000,6 +1028,7 @@ func (m *model) handleRemoteKey(k string) (tea.Model, tea.Cmd) {
 				fmt.Sprintf("SHA-256：%x", f.SHA256),
 				"",
 				"按 d 或 F5 下载至当前本地目录（" + sanitizeInline(m.localDir) + "）",
+				"按 x 或 Del 可永久删除该远端文件",
 			}
 			m.infoScroll = 0
 			m.modal = modalDetail

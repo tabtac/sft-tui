@@ -117,7 +117,7 @@ func runCommandWithInput(args []string, in io.Reader, out, errOut io.Writer) int
 			flags.Usage()
 			return 2
 		}
-	case "upload", "download", "transfer":
+	case "upload", "download", "transfer", "delete":
 		if len(pos) < 2 {
 			flags.Usage()
 			return 2
@@ -135,6 +135,9 @@ func runCommandWithInput(args []string, in io.Reader, out, errOut io.Writer) int
 
 	if op == "list" {
 		return runList(cfg, out, errOut)
+	}
+	if op == "delete" {
+		return runDelete(cfg, pos[1:], out, errOut)
 	}
 
 	// 其余所有 CLI 操作均通过统一 SQLite 队列引擎（queue.Manager）驱动
@@ -242,6 +245,7 @@ func printUsage(w io.Writer) {
       sft [选项] upload FILE...
       sft [选项] download NAME...
       sft [选项] transfer put:FILE get:NAME ...
+      sft [选项] delete NAME...
       sft [选项] list
       sft [选项] status | clean-history
       sft [选项] pause|abort TASK_ID`)
@@ -361,6 +365,44 @@ func runList(cfg config.Client, out, errOut io.Writer) int {
 	}
 	if count == 0 {
 		fmt.Fprintln(out, "（远端无文件）")
+	}
+	return 0
+}
+
+func runDelete(cfg config.Client, names []string, out, errOut io.Writer) int {
+	seen := make(map[string]bool, len(names))
+	for _, name := range names {
+		if err := protocol.ValidateName(name); err != nil {
+			fmt.Fprintln(errOut, "sft：", err)
+			return 1
+		}
+		if seen[name] {
+			fmt.Fprintf(errOut, "sft：同一批次中重复指定了删除目标 %s\n", name)
+			return 1
+		}
+		seen[name] = true
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	client, err := transfer.Dial(ctx, cfg)
+	if err != nil {
+		fmt.Fprintln(errOut, "sft：", err)
+		return 1
+	}
+	defer client.Close()
+
+	failed := false
+	for _, name := range names {
+		if err := client.DeleteFile(ctx, name); err != nil {
+			fmt.Fprintf(errOut, "sft：删除 %s 失败：%v\n", name, err)
+			failed = true
+			continue
+		}
+		fmt.Fprintf(out, "已删除：%s\n", name)
+	}
+	if failed {
+		return 1
 	}
 	return 0
 }

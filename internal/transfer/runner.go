@@ -189,6 +189,16 @@ func (r *QueueRunner) List(ctx context.Context) ([]protocol.FileEntry, error) {
 	return entries, err
 }
 
+// Delete 通过共享 mTLS 连接删除当前用户自己在服务端已发布的单个文件。
+func (r *QueueRunner) Delete(ctx context.Context, remoteName string) error {
+	r.ResetDialError()
+	c, err := r.GetClient(ctx)
+	if err != nil {
+		return err
+	}
+	return c.DeleteFile(ctx, remoteName)
+}
+
 func preDialControlErr(err error, task queue.Task, op *queue.Operation) error {
 	if op != nil && op.Mode() != 0 && errors.Is(err, context.Canceled) {
 		if op.Mode() == protocol.CancelPause {

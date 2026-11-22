@@ -177,6 +177,8 @@ func serverDirectionText(dir string) string {
 		return "↑ 上传"
 	case "download":
 		return "↓ 下载"
+	case "delete":
+		return "✕ 删除"
 	default:
 		return sanitizeInline(dir)
 	}

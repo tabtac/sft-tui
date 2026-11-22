@@ -430,6 +430,9 @@ func (m *Mux) send(ctx context.Context, typ protocol.Type, id protocol.StreamID,
 }
 
 func isTerminalResponse(typ protocol.Type, payload []byte) bool {
+	if typ == protocol.TypeDeleteResp {
+		return true
+	}
 	if typ == protocol.TypeListResp && len(payload) >= 3 && payload[0] == 0 {
 		return true
 	}
@@ -539,7 +542,8 @@ func (m *Mux) reader() {
 		}
 		m.activity.Store(time.Now().UnixNano())
 		initial := f.Header.Type == protocol.TypePutReq || f.Header.Type == protocol.TypeGetReq ||
-			f.Header.Type == protocol.TypeResumeReq || f.Header.Type == protocol.TypeListReq
+			f.Header.Type == protocol.TypeResumeReq || f.Header.Type == protocol.TypeListReq ||
+			f.Header.Type == protocol.TypeDeleteReq
 		if (f.Header.StreamID == 0 || f.Header.Type == protocol.TypeError || initial) && !controls.Allow() {
 			m.Close(&protocol.RemoteError{Code: protocol.CodeTempUnavailable, Message: "连接控制消息频率超限"})
 			return

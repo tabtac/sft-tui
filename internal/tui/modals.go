@@ -24,6 +24,7 @@ const (
 	modalQuit
 	modalClearHistory
 	modalBatchSummary
+	modalDeleteRemote
 )
 
 func modalBoxDimensions(width int) (boxW, innerW int) {
@@ -182,6 +183,7 @@ func (m *model) infoModalData() (title string, lines []string, footer string) {
 			helpKeyRow(m.th, "  ", "[Space] / [A]", "多选单文件 / 全选或取消当前可见文件", kW),
 			helpKeyRow(m.th, "  ", "[Enter] / [Esc]", "打开目录或详情 / 清空筛选或取消多选", kW),
 			helpKeyRow(m.th, "  ", "[u] / [d] / [F5]", "上传所选 / 下载所选 / 执行当前栏传输", kW),
+			helpKeyRow(m.th, "  ", "[x] / [Del]", "删除自己上传的远端文件（需二次确认）", kW),
 			helpKeyRow(m.th, "  ", "[/] / [p]", "筛选搜索文件名 / 输入本地目录跳转", kW),
 			helpKeyRow(m.th, "  ", "[o] / [r]", "切换排序方式 / 刷新本地与远端列表", kW),
 			"",
@@ -199,8 +201,24 @@ func (m *model) infoModalData() (title string, lines []string, footer string) {
 		return m.batchSummaryModalData()
 	case modalConflict:
 		return m.conflictModalData()
+	case modalDeleteRemote:
+		return m.deleteRemoteModalData()
 	}
 	return "", nil, ""
+}
+
+func (m *model) deleteRemoteModalData() (title string, lines []string, footer string) {
+	_, innerW := modalBoxDimensions(m.width)
+	lines = []string{
+		m.th.badgeErr.Render(fmt.Sprintf("⚠ 确认永久删除以下 %d 个远端文件？删除后无法恢复。", len(m.pendingDeleteNames))),
+		m.th.badgeMuted.Render("（仅允许删除当前 mTLS 认证身份名下且具备上传写权限的文件）"),
+		"",
+	}
+	for _, name := range m.pendingDeleteNames {
+		lines = append(lines, "  • "+sanitizeInline(name))
+	}
+	lines = appendModalNoticeLines(lines, m.th, m.statusToast, innerW)
+	return "删除远端文件确认", lines, "Enter / y 确认永久删除 · Esc / n 取消"
 }
 
 func (m *model) conflictModalData() (title string, lines []string, footer string) {
@@ -244,7 +262,7 @@ func appendModalNoticeLines(lines []string, th theme, notice string, innerW int)
 func (m *model) viewModal(base string) string {
 	_, innerW := modalBoxDimensions(m.width)
 	switch m.modal {
-	case modalHelp, modalDetail, modalBatchSummary, modalConflict:
+	case modalHelp, modalDetail, modalBatchSummary, modalConflict, modalDeleteRemote:
 		title, lines, footer := m.infoModalData()
 		view, _ := renderModalScrollBox(m.width, m.height, m.th, title, lines, footer, m.infoScroll)
 		return view

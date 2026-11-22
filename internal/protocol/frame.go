@@ -45,6 +45,10 @@ func ValidateFrame(h Header, negotiatedChunk uint32) error {
 		minLen, maxLen = 3, MaxControlPayload
 	case TypeListNext:
 		minLen, maxLen = 0, 0
+	case TypeDeleteReq:
+		minLen, maxLen = 3, 2+MaxFileNameBytes
+	case TypeDeleteResp:
+		minLen, maxLen = 0, 0
 	case TypeData:
 		minLen, maxLen = 9, DataOffsetSize+negotiatedChunk
 	case TypeAck:

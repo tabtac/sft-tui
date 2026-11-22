@@ -46,6 +46,13 @@ type GetRequest struct {
 	FileName  string
 }
 
+// DeleteRequest 请求删除当前 mTLS 认证用户自己名下的已发布文件（不携带用户字段，防止越权伪造）。
+type DeleteRequest struct {
+	FileName string
+}
+
+type DeleteResponse struct{}
+
 type GetResponse struct {
 	TransferID  TransferID
 	State       ResponseState
@@ -175,6 +182,12 @@ func Marshal(v any) ([]byte, error) {
 		if err := writeName(msg.FileName); err != nil {
 			return nil, err
 		}
+	case DeleteRequest:
+		if err := writeName(msg.FileName); err != nil {
+			return nil, err
+		}
+	case DeleteResponse:
+		return []byte{}, nil
 	case Data:
 		if len(msg.Bytes) < 1 || len(msg.Bytes) > MaxChunkSize {
 			return nil, &RemoteError{Code: CodeBadFrame, Message: "DATA 数据块长度必须在 1 ~ MaxChunkSize 之间"}
@@ -247,6 +260,10 @@ func Unmarshal(payload []byte, out any) error {
 		if err = read(&target.RequestID); err == nil {
 			err = readName(&target.FileName)
 		}
+	case *DeleteRequest:
+		err = readName(&target.FileName)
+	case *DeleteResponse:
+		// 空负载，由末尾 r.Len() == 0 校验
 	case *Data:
 		if err = read(&target.FileOffset); err == nil {
 			rem := r.Len()

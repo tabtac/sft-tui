@@ -256,6 +256,40 @@ func (c *Client) ListFiles(ctx context.Context, visit func(protocol.FileEntry) e
 	}
 }
 
+// DeleteFile 删除当前 mTLS 认证用户自己在服务端已发布的单个文件。
+func (c *Client) DeleteFile(ctx context.Context, remoteName string) (err error) {
+	if err = protocol.ValidateName(remoteName); err != nil {
+		return err
+	}
+	opCtx, err := c.operationContext()
+	if err != nil {
+		return err
+	}
+	mergedCtx, cancel := context.WithCancel(opCtx)
+	defer cancel()
+	stop := context.AfterFunc(ctx, cancel)
+	defer stop()
+
+	st, release, err := c.openStream(mergedCtx, protocol.DirectionUpload)
+	if err != nil {
+		return err
+	}
+	defer release()
+	defer func() {
+		if err != nil {
+			st.Report(err)
+		}
+	}()
+
+	reqCtx, cancelReq := context.WithTimeout(mergedCtx, controlTimeout)
+	defer cancelReq()
+	if err = st.SendContext(reqCtx, protocol.TypeDeleteReq, protocol.DeleteRequest{FileName: remoteName}); err != nil {
+		return err
+	}
+	var resp protocol.DeleteResponse
+	return st.ExpectContext(reqCtx, protocol.TypeDeleteResp, &resp)
+}
+
 // Execute 执行单个队列任务（支持上传、下载、断点续传、暂停/取消确认及清理）。
 func (c *Client) Execute(ctx context.Context, task queue.Task, op *queue.Operation, progress func(transferred, total uint64, phase queue.State), update CheckpointUpdater) (Result, error) {
 	if update == nil {

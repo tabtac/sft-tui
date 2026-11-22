@@ -321,3 +321,72 @@ func TestCommitUploadReleasesStoreLockDuringHashingAndRespectsCancel(t *testing.
 		t.Fatalf("cancelled commit must not publish file")
 	}
 }
+
+func TestDeletePublishedFileSecurityIsolationAndLeaseGuard(t *testing.T) {
+	root := t.TempDir()
+	s := reviewOpenStore(t, root)
+
+	aliceShared := reviewPublish(t, s, "alice", "shared.bin", []byte("alice-data"), 20)
+	aliceSecret := reviewPublish(t, s, "alice", "secret.bin", []byte("top-secret"), 21)
+	bobShared := reviewPublish(t, s, "bob", "shared.bin", []byte("bob-data"), 22)
+
+	// 1. 跨用户越权删除必须失败，且不泄露或影响他人文件
+	if _, err := s.DeletePublishedFile(context.Background(), "bob", "secret.bin"); !errors.Is(err, ErrFileNotFound) {
+		t.Fatalf("bob deleting alice's file = %v, want ErrFileNotFound", err)
+	}
+	// 非法路径穿越名必须拒绝
+	for _, bad := range []string{"../objects/" + aliceSecret.ObjectID, "a/b", "..", "."} {
+		if _, err := s.DeletePublishedFile(context.Background(), "bob", bad); err == nil {
+			t.Fatalf("expected invalid delete name %q to be rejected", bad)
+		}
+	}
+
+	// 2. 同名文件删除仅移除当前用户的记录与物理对象，他人同名文件完好无损
+	deleted, err := s.DeletePublishedFile(context.Background(), "bob", "shared.bin")
+	if err != nil || deleted.ObjectID != bobShared.ObjectID {
+		t.Fatalf("bob DeletePublishedFile(shared.bin) = (%+v, %v)", deleted, err)
+	}
+	if _, err := os.Stat(filepath.Join(root, "objects", bobShared.ObjectID)); !os.IsNotExist(err) {
+		t.Fatalf("expected bob's deleted physical object to be removed, stat err=%v", err)
+	}
+	if f, pub, err := s.OpenPublishedFile(context.Background(), "alice", "shared.bin"); err != nil || pub.ObjectID != aliceShared.ObjectID {
+		t.Fatalf("alice's same-named file must remain intact: pub=%+v err=%v", pub, err)
+	} else {
+		data, _ := io.ReadAll(f)
+		_ = f.Close()
+		if string(data) != "alice-data" {
+			t.Fatalf("alice's shared.bin corrupted: %q", string(data))
+		}
+	}
+
+	// 3. 正在活跃下载（持有租约）的文件必须拒绝删除，释放为暂停后允许删除并自动取消旧下载断点
+	var dlReq protocol.RequestID
+	dlReq[0] = 33
+	dlTask, dlFile, dlLease, err := s.BeginDownloadSession(context.Background(), "alice", protocol.GetRequest{
+		RequestID: dlReq,
+		FileName:  "secret.bin",
+	})
+	if err != nil {
+		t.Fatalf("BeginDownloadSession: %v", err)
+	}
+	if _, err := s.DeletePublishedFile(context.Background(), "alice", "secret.bin"); !errors.Is(err, ErrTaskBusy) {
+		_ = dlFile.Close()
+		t.Fatalf("expected active download lease to block deletion with ErrTaskBusy, got %v", err)
+	}
+	_ = dlFile.Close()
+	if err := s.ReleaseTask(context.Background(), dlTask.ID, dlLease, TaskPaused); err != nil {
+		t.Fatalf("ReleaseTask: %v", err)
+	}
+	if _, err := s.DeletePublishedFile(context.Background(), "alice", "secret.bin"); err != nil {
+		t.Fatalf("DeletePublishedFile after pause release failed: %v", err)
+	}
+	if got := reviewTask(t, s, dlTask.ID); got.Status != TaskCancelled {
+		t.Fatalf("expected stale paused download to be cancelled after file deletion, got %s", got.Status)
+	}
+
+	// 4. 删除后同一用户名可重新上传同名文件
+	reviewPublish(t, s, "bob", "shared.bin", []byte("bob-v2"), 23)
+	if files, _, err := s.ListPublishedFiles(context.Background(), "bob", "", 12); err != nil || len(files) != 1 || files[0].FileName != "shared.bin" {
+		t.Fatalf("bob re-upload after delete failed: files=%+v err=%v", files, err)
+	}
+}

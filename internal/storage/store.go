@@ -869,6 +869,121 @@ func (s *Store) OpenPublishedFile(ctx context.Context, userID, fileName string) 
 	return s.openPublishedLocked(ctx, userID, fileName)
 }
 
+// DeletePublishedFile 严格在已认证用户命名空间内删除其自己上传的已发布文件与底层不可变对象。
+// 安全与一致性保证：
+// 1. 仅匹配 (user_id, file_name)，绝不暴露或删除其他用户的同名或异名文件。
+// 2. 校验文件名合法性与数据库 object_id 格式，并经 pal.Root 验证底层对象为非符号链接的普通文件。
+// 3. 若存在持有活跃租约的传输任务正在使用该对象，拒绝删除并返回 ErrTaskBusy；其余未持租约的暂停下载任务在同一事务中原子标记为 CANCELLED。
+// 4. 先提交 SQLite 事务再移除物理对象，避免数据库回滚导致对象丢失。
+func (s *Store) DeletePublishedFile(ctx context.Context, userID, fileName string) (PublishedFile, error) {
+	if err := ctx.Err(); err != nil {
+		return PublishedFile{}, err
+	}
+	if err := protocol.ValidateName(fileName); err != nil {
+		return PublishedFile{}, fmt.Errorf("invalid logical filename %q: %w", fileName, err)
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed || s.db == nil || s.root == nil {
+		return PublishedFile{}, ErrStoreClosed
+	}
+
+	var pub PublishedFile
+	var shaHex string
+	err := s.db.QueryRowContext(ctx, `
+		SELECT object_id, user_id, file_name, file_size, file_sha256, created_at
+		FROM published_files
+		WHERE user_id=? AND file_name=?
+	`, userID, fileName).Scan(&pub.ObjectID, &pub.UserID, &pub.FileName, &pub.FileSize, &shaHex, &pub.CreatedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return PublishedFile{}, ErrFileNotFound
+	}
+	if err != nil {
+		return PublishedFile{}, err
+	}
+	if pub.UserID != userID || !IsValidHex(pub.ObjectID, 32) {
+		return PublishedFile{}, fmt.Errorf("corrupt published file ownership or object id")
+	}
+	digest, err := parseDigestHex(shaHex)
+	if err != nil {
+		return PublishedFile{}, err
+	}
+	pub.SHA256 = digest
+
+	// 检查是否存在活跃租约正在下载或使用此对象，避免破坏进行中的传输或触发 Windows 打开句柄删除冲突
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id FROM tasks
+		WHERE object_id=? AND status IN ('ACTIVE', 'PAUSED', 'VERIFYING')
+	`, pub.ObjectID)
+	if err != nil {
+		return PublishedFile{}, err
+	}
+	for rows.Next() {
+		var idHex string
+		if scanErr := rows.Scan(&idHex); scanErr != nil {
+			_ = rows.Close()
+			return PublishedFile{}, scanErr
+		}
+		if s.leases[idHex] != 0 {
+			_ = rows.Close()
+			return PublishedFile{}, ErrTaskBusy
+		}
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return PublishedFile{}, err
+	}
+	_ = rows.Close()
+
+	objRel := objectRelPath(pub.ObjectID)
+	if info, statErr := s.root.Lstat(objRel); statErr == nil {
+		if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+			return PublishedFile{}, fmt.Errorf("security violation: published object %q is a symlink or irregular", objRel)
+		}
+	} else if !os.IsNotExist(statErr) {
+		return PublishedFile{}, statErr
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return PublishedFile{}, err
+	}
+	defer tx.Rollback()
+
+	now := time.Now().Unix()
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE tasks SET status=?, updated_at=?
+		WHERE object_id=? AND user_id=? AND direction=? AND status IN ('ACTIVE', 'PAUSED', 'VERIFYING')
+	`, string(TaskCancelled), now, pub.ObjectID, userID, int(protocol.DirectionDownload)); err != nil {
+		return PublishedFile{}, err
+	}
+
+	res, err := tx.ExecContext(ctx, `
+		DELETE FROM published_files WHERE user_id=? AND file_name=? AND object_id=?
+	`, userID, fileName, pub.ObjectID)
+	if err != nil {
+		return PublishedFile{}, err
+	}
+	affected, _ := res.RowsAffected()
+	if affected != 1 {
+		return PublishedFile{}, ErrFileNotFound
+	}
+	if err := tx.Commit(); err != nil {
+		return PublishedFile{}, err
+	}
+
+	var remainingRefs int
+	if err := s.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM published_files WHERE object_id=?", pub.ObjectID).Scan(&remainingRefs); err == nil && remainingRefs == 0 {
+		if rmErr := s.root.Remove(objRel); rmErr != nil && !os.IsNotExist(rmErr) {
+			return pub, rmErr
+		}
+		_ = s.root.SyncRootSubdir("objects")
+	}
+
+	return pub, nil
+}
+
 // GetTask 获取任务
 func (s *Store) GetTask(ctx context.Context, taskID protocol.TransferID) (Task, error) {
 	s.mu.RLock()

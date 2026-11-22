@@ -123,11 +123,12 @@ make test-coverage
 # 查看远端已发布文件列表
 ./bin/linux/sft -config configs/client.alice.local.json list
 
-# 上传 / 下载 / 混合并发传输
+# 上传 / 下载 / 删除自己上传的远端文件 / 混合并发传输
 ./bin/linux/sft -config configs/client.alice.local.json upload ./a.bin ./b.bin
 ./bin/linux/sft -config configs/client.alice.local.json -out ./downloads download a.bin
 ./bin/linux/sft -config configs/client.alice.local.json -out ./downloads -save-as renamed.bin download a.bin
-./bin/linux/sft -config configs/client.alice.local.json transfer put:./c.bin get:a.bin
+./bin/linux/sft -config configs/client.alice.local.json delete a.bin
+./bin/linux/sft -config configs/client.alice.local.json transfer put:./c.bin get:b.bin
 
 # 查询或控制正在运行/待恢复的队列任务（支持通过本地 IPC 控制运行中的 TUI/CLI 实例）
 ./bin/linux/sft -config configs/client.alice.local.json status

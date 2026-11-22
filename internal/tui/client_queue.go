@@ -466,6 +466,64 @@ func (m *model) prepareDownload() tea.Cmd {
 	return m.prepareBatch(protocol.DirectionDownload, specs, true)
 }
 
+func (m *model) prepareDeleteRemote() {
+	if m.cfg == nil || m.runner == nil {
+		m.setToast("请先按 i 选择或导入客户端身份")
+		return
+	}
+	if m.remoteErr != "" {
+		m.setToast("远端连接暂不可用，请按 r 刷新后再删除")
+		return
+	}
+	if m.opBusy {
+		m.setToast("已有操作正在执行，请稍候…")
+		return
+	}
+	var names []string
+	if len(m.remoteSelected) > 0 {
+		for _, f := range m.remoteEntries {
+			if m.remoteSelected[f.FileName] {
+				names = append(names, f.FileName)
+			}
+		}
+	} else if m.remoteCursor >= 0 && m.remoteCursor < len(m.visibleRemote) {
+		names = append(names, m.visibleRemote[m.remoteCursor].FileName)
+	}
+	if len(names) == 0 {
+		m.setToast("请选择要删除的远端文件")
+		return
+	}
+	m.pendingDeleteNames = names
+	m.infoScroll = 0
+	m.clearToast()
+	m.modal = modalDeleteRemote
+}
+
+func (m *model) deleteRemoteFilesCmd(names []string) tea.Cmd {
+	runner := m.runner
+	return func() tea.Msg {
+		if runner == nil {
+			return remoteDeletedMsg{failed: names, firstErr: fmt.Errorf("未连接到远端服务")}
+		}
+		var deleted, failed []string
+		var firstErr error
+		for _, name := range names {
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			err := runner.Delete(ctx, name)
+			cancel()
+			if err != nil {
+				failed = append(failed, name)
+				if firstErr == nil {
+					firstErr = err
+				}
+				continue
+			}
+			deleted = append(deleted, name)
+		}
+		return remoteDeletedMsg{deleted: deleted, failed: failed, firstErr: firstErr}
+	}
+}
+
 func (m *model) prepareBatch(dir protocol.Direction, specs []queue.Spec, clearSel bool) tea.Cmd {
 	var conflicts []string
 	if dir == protocol.DirectionUpload {

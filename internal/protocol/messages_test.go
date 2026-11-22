@@ -266,6 +266,33 @@ func TestMarshalUnmarshalAllTypes(t *testing.T) {
 	if err := Unmarshal(extraBytes, &outErr); err == nil {
 		t.Error("expected error for trailing bytes in Unmarshal")
 	}
+
+	// 9. DeleteRequest / DeleteResponse 编解码与路径穿越拦截
+	delReq := DeleteRequest{FileName: "my-file.bin"}
+	p, err = Marshal(delReq)
+	if err != nil {
+		t.Fatalf("Marshal DeleteRequest failed: %v", err)
+	}
+	var outDelReq DeleteRequest
+	if err := Unmarshal(p, &outDelReq); err != nil || outDelReq != delReq {
+		t.Fatalf("DeleteRequest roundtrip mismatch: got=%+v err=%v", outDelReq, err)
+	}
+	for _, bad := range []string{"", "../secret", "a/b", `a\b`, ".", ".."} {
+		if _, err := Marshal(DeleteRequest{FileName: bad}); err == nil {
+			t.Errorf("Marshal DeleteRequest must reject invalid name %q", bad)
+		}
+	}
+	pResp, err := Marshal(DeleteResponse{})
+	if err != nil || len(pResp) != 0 {
+		t.Fatalf("Marshal DeleteResponse failed: len=%d err=%v", len(pResp), err)
+	}
+	var outDelResp DeleteResponse
+	if err := Unmarshal(pResp, &outDelResp); err != nil {
+		t.Fatalf("Unmarshal DeleteResponse failed: %v", err)
+	}
+	if err := Unmarshal([]byte{0x01}, &outDelResp); err == nil {
+		t.Error("expected error for non-empty DeleteResponse payload")
+	}
 }
 
 func TestListRoundtrip(t *testing.T) {

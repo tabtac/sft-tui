@@ -119,6 +119,11 @@ type batchOpResultMsg struct {
 	isGlobalOp bool
 	enqueued   []queue.Task
 }
+type remoteDeletedMsg struct {
+	deleted  []string
+	failed   []string
+	firstErr error
+}
 type batchTracker struct {
 	id      string
 	started time.Time
@@ -228,9 +233,10 @@ type model struct {
 	idCursor        int
 	pendingBatchDir protocol.Direction
 	pendingSpecs    []queue.Spec
-	pendingClearSel bool
-	conflictNames   []string
-	renameTask      *queue.Task
+	pendingClearSel    bool
+	conflictNames      []string
+	pendingDeleteNames []string
+	renameTask         *queue.Task
 }
 
 // Run 启动 Bubble Tea AltScreen 客户端界面并阻塞直至优雅退出。
@@ -671,6 +677,34 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.quit {
 			m.cleanup()
 			return m, tea.Quit
+		}
+		return m, nil
+
+	case remoteDeletedMsg:
+		m.opBusy = false
+		m.opLabel = ""
+		m.opStart = time.Time{}
+		for _, name := range msg.deleted {
+			delete(m.remoteSelected, name)
+		}
+		switch {
+		case len(msg.failed) == 0 && len(msg.deleted) == 1:
+			m.setToast("已删除远端文件：" + msg.deleted[0])
+		case len(msg.failed) == 0 && len(msg.deleted) > 1:
+			m.setToast(fmt.Sprintf("已删除 %d 个远端文件", len(msg.deleted)))
+		case len(msg.deleted) > 0 && len(msg.failed) > 0:
+			errMsg := ""
+			if msg.firstErr != nil {
+				errMsg = "：" + msg.firstErr.Error()
+			}
+			m.setToastError(fmt.Sprintf("已删除 %d 个，%d 个失败%s", len(msg.deleted), len(msg.failed), errMsg))
+		case msg.firstErr != nil:
+			m.setToastError("删除失败：" + msg.firstErr.Error())
+		default:
+			m.setToastError("未删除任何文件")
+		}
+		if len(msg.deleted) > 0 {
+			return m, m.loadRemoteCmd()
 		}
 		return m, nil
 

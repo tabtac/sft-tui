@@ -17,6 +17,7 @@ import (
 	"sft-tui/internal/protocol"
 	"sft-tui/internal/queue"
 	"sft-tui/internal/testcert"
+	"sft-tui/internal/transfer"
 )
 
 func TestClientConflictCancelPreservesSelectionAndHistoryRetryChecksConflict(t *testing.T) {
@@ -1027,5 +1028,56 @@ func TestClientEscClearSelectAllKeyScopesAndRemoteErrorDetail(t *testing.T) {
 	m.Update(keyType(tea.KeyEnter))
 	if m.modal != modalDetail || !strings.Contains(ansi.Strip(m.View()), "unknown authority") {
 		t.Fatalf("expected Enter on remote error to open detail modal, modal=%v", m.modal)
+	}
+}
+
+func TestClientRemoteDeleteConfirmationModalFlow(t *testing.T) {
+	dir := t.TempDir()
+	m := newModel(Options{ExecutableDir: dir, Directory: dir})
+	m.Update(tea.WindowSizeMsg{Width: 100, Height: 28})
+	cfg := config.DefaultClient()
+	m.cfg = &cfg
+	m.runner = transfer.NewQueueRunner(cfg, nil)
+	defer m.runner.Close()
+	m.focus = areaRemote
+	m.remoteEntries = []protocol.FileEntry{
+		{FileName: "mine-a.bin", Size: 128},
+		{FileName: "mine-b.bin", Size: 256},
+	}
+	m.rebuildRemoteVisible()
+
+	// 远端底栏包含 [x]删除 且无括号提示
+	footer := ansi.Strip(m.renderFooter())
+	if !strings.Contains(footer, "[x]删除") || strings.ContainsAny(footer, "()") {
+		t.Fatalf("unexpected remote footer: %s", footer)
+	}
+
+	// 按 x 打开删除二次确认弹窗，按 n 安全取消
+	m.Update(keyRune('x'))
+	if m.modal != modalDeleteRemote || len(m.pendingDeleteNames) != 1 || m.pendingDeleteNames[0] != "mine-a.bin" {
+		t.Fatalf("expected modalDeleteRemote for mine-a.bin, modal=%v pending=%v", m.modal, m.pendingDeleteNames)
+	}
+	if !strings.Contains(ansi.Strip(m.View()), "删除远端文件确认") {
+		t.Fatalf("delete confirmation modal missing expected title:\n%s", ansi.Strip(m.View()))
+	}
+	m.Update(keyRune('n'))
+	if m.modal != modalNone || len(m.pendingDeleteNames) != 0 {
+		t.Fatalf("expected n to cancel delete modal, modal=%v pending=%v", m.modal, m.pendingDeleteNames)
+	}
+
+	// 多选后按 x，按 y 触发异步删除命令，收到 remoteDeletedMsg 后清理选中并触发远端列表刷新
+	m.remoteSelected["mine-a.bin"] = true
+	m.remoteSelected["mine-b.bin"] = true
+	m.Update(keyRune('x'))
+	if m.modal != modalDeleteRemote || len(m.pendingDeleteNames) != 2 {
+		t.Fatalf("expected 2 selected remote files pending delete, got %v", m.pendingDeleteNames)
+	}
+	_, delCmd := m.Update(keyRune('y'))
+	if m.modal != modalNone || !m.opBusy || delCmd == nil {
+		t.Fatalf("expected y to dispatch async delete cmd: modal=%v opBusy=%v cmd=%v", m.modal, m.opBusy, delCmd)
+	}
+	_, refreshCmd := m.Update(remoteDeletedMsg{deleted: []string{"mine-a.bin", "mine-b.bin"}})
+	if m.opBusy || len(m.remoteSelected) != 0 || refreshCmd == nil || !strings.Contains(m.statusToast, "已删除 2 个") {
+		t.Fatalf("unexpected post-delete state: busy=%v sel=%v refresh=%v toast=%q", m.opBusy, m.remoteSelected, refreshCmd != nil, m.statusToast)
 	}
 }

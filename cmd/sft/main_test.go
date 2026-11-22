@@ -457,3 +457,47 @@ func TestCLIBulkUploadRecoversFromTemporaryRateLimit(t *testing.T) {
 		t.Fatalf("expected 32 completed uploads, got %d", got)
 	}
 }
+
+func TestCLIDeleteOwnRemoteFileAndRejectsInvalidArgs(t *testing.T) {
+	cfgPath, cleanup := setupCLIFixture(t)
+	defer cleanup()
+
+	src := filepath.Join(t.TempDir(), "del-me.txt")
+	if err := os.WriteFile(src, []byte("delete test payload"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	var out, errOut bytes.Buffer
+	if code := runCommand([]string{"-config", cfgPath, "-progress", "never", "upload", src}, &out, &errOut); code != 0 {
+		t.Fatalf("upload failed: code=%d err=%s", code, errOut.String())
+	}
+
+	// 拒绝重复删除参数和路径穿越
+	out.Reset()
+	errOut.Reset()
+	if code := runCommand([]string{"-config", cfgPath, "delete", "del-me.txt", "del-me.txt"}, &out, &errOut); code == 0 {
+		t.Fatal("expected duplicate delete target to fail")
+	}
+	out.Reset()
+	errOut.Reset()
+	if code := runCommand([]string{"-config", cfgPath, "delete", "../del-me.txt"}, &out, &errOut); code == 0 {
+		t.Fatal("expected path traversal delete target to fail")
+	}
+
+	// 删除已上传文件并验证 list 为空
+	out.Reset()
+	errOut.Reset()
+	if code := runCommand([]string{"-config", cfgPath, "delete", "del-me.txt"}, &out, &errOut); code != 0 {
+		t.Fatalf("delete failed: code=%d out=%q err=%q", code, out.String(), errOut.String())
+	}
+	if !strings.Contains(out.String(), "已删除：del-me.txt") {
+		t.Fatalf("unexpected delete stdout: %q", out.String())
+	}
+	out.Reset()
+	errOut.Reset()
+	if code := runCommand([]string{"-config", cfgPath, "list"}, &out, &errOut); code != 0 {
+		t.Fatalf("list after delete failed: %s", errOut.String())
+	}
+	if strings.Contains(out.String(), "del-me.txt") {
+		t.Fatalf("deleted file still present in list:\n%s", out.String())
+	}
+}
