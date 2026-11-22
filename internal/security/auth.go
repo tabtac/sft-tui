@@ -271,6 +271,19 @@ func (a *Authorizer) Check(user, operation string) (Principal, error) {
 	return p.clone(), nil
 }
 
+// CheckBandwidth 零分配检查指定用户是否具备操作权限并返回当前有效带宽策略，适用于传输热路径。
+func (a *Authorizer) CheckBandwidth(user, operation string) (config.Bandwidth, error) {
+	a.mu.RLock()
+	p, ok := a.users[user]
+	allowed := ok && p.Allows(operation)
+	bw := p.Bandwidth
+	a.mu.RUnlock()
+	if !allowed {
+		return config.Bandwidth{}, &protocol.RemoteError{Code: protocol.CodeUnauthorized, Message: "用户没有此操作权限"}
+	}
+	return bw, nil
+}
+
 // Register 注册已建立 mTLS 连接的到期定时器，并在证书过期时主动断连。
 func (a *Authorizer) Register(cert *x509.Certificate, conn net.Conn) (Principal, error) {
 	a.mu.Lock()

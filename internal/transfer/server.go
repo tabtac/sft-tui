@@ -266,11 +266,28 @@ func (s *Server) sendInitError(c *session.Conn, err error) {
 	_ = c.Send(protocol.TypeError, 0, *storage.AsRemote(err))
 }
 
+const (
+	maxCheckpointFlushBatch uint32 = 2 * 1024 * 1024
+	checkpointFlushInterval        = 250 * time.Millisecond
+)
+
+func checkpointBatchBytes(chunkSize, windowSize uint32) uint64 {
+	return uint64(max(chunkSize, min(windowSize/2, maxCheckpointFlushBatch)))
+}
+
 func (s *Server) authorize(user, op string) (security.Principal, error) {
 	if s.hooks.Authorize != nil {
 		return s.hooks.Authorize(user, op)
 	}
 	return s.auth.Check(user, op)
+}
+
+func (s *Server) authorizeBandwidth(user, op string) (config.Bandwidth, error) {
+	if s.hooks.Authorize != nil {
+		p, err := s.hooks.Authorize(user, op)
+		return p.Bandwidth, err
+	}
+	return s.auth.CheckBandwidth(user, op)
 }
 
 func (s *Server) acquireStream(user string, bw config.Bandwidth) (func(), error) {
@@ -536,12 +553,12 @@ func (s *Server) handleUpload(user string, bw config.Bandwidth, st *session.Stre
 	offset := task.Offset
 	committedOffset := task.Offset
 	lastFlush := time.Now()
-	flushBatch := uint64(max(st.ChunkSize(), min(st.WindowSize()/2, 512*1024)))
-	flushUpload := func(waitCtx context.Context) error {
+	flushBatch := checkpointBatchBytes(st.ChunkSize(), st.WindowSize())
+	flushUpload := func(waitCtx context.Context, curBW config.Bandwidth) error {
 		if offset <= committedOffset {
 			return nil
 		}
-		if err := s.waitCheckpoint(waitCtx, user, bw); err != nil {
+		if err := s.waitCheckpoint(waitCtx, user, curBW); err != nil {
 			return err
 		}
 		committed, err := s.store.FlushUploadCheckpoint(st.Context(), task.ID, lease)
@@ -569,7 +586,7 @@ func (s *Server) handleUpload(user string, bw config.Bandwidth, st *session.Stre
 			timedOut := errors.Is(err, context.DeadlineExceeded) && waitCtx.Err() == context.DeadlineExceeded && st.Context().Err() == nil
 			cancelWait()
 			if timedOut {
-				if fErr := flushUpload(st.PayloadContext()); fErr != nil {
+				if fErr := flushUpload(st.PayloadContext(), bw); fErr != nil {
 					if st.PayloadContext().Err() != nil && st.Context().Err() == nil {
 						continue
 					}
@@ -589,29 +606,32 @@ func (s *Server) handleUpload(user string, bw config.Bandwidth, st *session.Stre
 			if err = protocol.Unmarshal(frame.Payload, &d); err != nil {
 				return "failed", err
 			}
-			if _, err = s.authorize(user, "upload"); err != nil {
-				return "failed", err
+			curBW, authErr := s.authorizeBandwidth(user, "upload")
+			if authErr != nil {
+				return "failed", authErr
 			}
+			bw = curBW
 			if st.PayloadContext().Err() != nil && st.Context().Err() == nil {
 				continue
 			}
-			if err = s.waitBandwidth(st.PayloadContext(), user, bw, protocol.DirectionUpload, len(d.Bytes)); err != nil {
+			if err = s.waitBandwidth(st.PayloadContext(), user, curBW, protocol.DirectionUpload, len(d.Bytes)); err != nil {
 				if st.PayloadContext().Err() != nil && st.Context().Err() == nil {
 					continue
 				}
 				return "paused", err
 			}
-			if _, err = s.authorize(user, "upload"); err != nil {
-				return "failed", err
+			if curBW, authErr = s.authorizeBandwidth(user, "upload"); authErr != nil {
+				return "failed", authErr
 			}
+			bw = curBW
 			newOffset, err := s.store.StageUploadChunk(st.Context(), task.ID, lease, d.FileOffset, d.Bytes)
 			if err != nil {
 				return "failed", err
 			}
 			offset = newOffset
 			s.progress(monID, offset, "传输")
-			if offset == task.FileSize || offset-committedOffset >= flushBatch || time.Since(lastFlush) >= 50*time.Millisecond {
-				if err = flushUpload(st.PayloadContext()); err != nil {
+			if offset == task.FileSize || offset-committedOffset >= flushBatch || time.Since(lastFlush) >= checkpointFlushInterval {
+				if err = flushUpload(st.PayloadContext(), bw); err != nil {
 					if st.PayloadContext().Err() != nil && st.Context().Err() == nil {
 						continue
 					}
@@ -621,7 +641,7 @@ func (s *Server) handleUpload(user string, bw config.Bandwidth, st *session.Stre
 
 		case protocol.TypeCommit:
 			if offset > committedOffset {
-				if err = flushUpload(st.Context()); err != nil {
+				if err = flushUpload(st.Context(), bw); err != nil {
 					return "failed", err
 				}
 			}
@@ -630,7 +650,7 @@ func (s *Server) handleUpload(user string, bw config.Bandwidth, st *session.Stre
 			if err = protocol.Unmarshal(frame.Payload, &c); err != nil {
 				return "failed", err
 			}
-			if _, err = s.authorize(user, "upload"); err != nil {
+			if _, err = s.authorizeBandwidth(user, "upload"); err != nil {
 				return "failed", err
 			}
 			if err = s.store.CommitUploadSession(st.Context(), task.ID, lease, c.FileSize, c.FileSHA256); err != nil {
@@ -831,7 +851,7 @@ func (s *Server) handleDownload(user string, bw config.Bandwidth, st *session.St
 		}
 	} else {
 		win := uint64(max(st.WindowSize(), st.ChunkSize()))
-		ckptBatch := uint64(max(st.ChunkSize(), min(st.WindowSize()/2, 512*1024)))
+		ckptBatch := checkpointBatchBytes(st.ChunkSize(), st.WindowSize())
 		dlCtx, stopDL := context.WithCancel(st.Context())
 		defer stopDL()
 
@@ -938,11 +958,13 @@ func (s *Server) handleDownload(user string, bw config.Bandwidth, st *session.St
 				sendAborted, sendOut, sendErr = true, "failed", err
 				break
 			}
-			if _, err = s.authorize(user, "download"); err != nil {
-				sendAborted, sendOut, sendErr = true, "failed", err
+			curBW, authErr := s.authorizeBandwidth(user, "download")
+			if authErr != nil {
+				sendAborted, sendOut, sendErr = true, "failed", authErr
 				break
 			}
-			if err = s.waitBandwidth(st.PayloadContext(), user, bw, protocol.DirectionDownload, n); err != nil {
+			bw = curBW
+			if err = s.waitBandwidth(st.PayloadContext(), user, curBW, protocol.DirectionDownload, n); err != nil {
 				sendAborted = true
 				if st.PayloadContext().Err() == nil || st.Context().Err() != nil {
 					sendOut, sendErr = "paused", err

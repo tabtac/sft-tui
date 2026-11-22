@@ -823,6 +823,18 @@ func TestTempUnavailableClassification(t *testing.T) {
 	}
 }
 
+func TestCheckpointBatchBytesScaling(t *testing.T) {
+	if got := checkpointBatchBytes(64*1024, 1024*1024); got != 512*1024 {
+		t.Fatalf("1 MiB window batch = %d, want 512 KiB", got)
+	}
+	if got := checkpointBatchBytes(64*1024, 4*1024*1024); got != 2*1024*1024 {
+		t.Fatalf("4 MiB window batch = %d, want 2 MiB", got)
+	}
+	if got := checkpointBatchBytes(64*1024, 64*1024); got != 64*1024 {
+		t.Fatalf("64 KiB window batch = %d, want 64 KiB", got)
+	}
+}
+
 func TestRunnerCloseNeverReturnsNilClientWithoutError(t *testing.T) {
 	r := NewQueueRunner(config.Client{}, nil)
 	origCancel := r.cancel

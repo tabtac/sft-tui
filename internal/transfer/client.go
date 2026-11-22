@@ -981,7 +981,7 @@ func (c *Client) executeDownload(ctx context.Context, task *queue.Task, op *queu
 		}
 		persistedOffset := offset
 		lastFlush := time.Now()
-		flushBatch := uint64(max(st.ChunkSize(), min(st.WindowSize()/2, 512*1024)))
+		flushBatch := checkpointBatchBytes(st.ChunkSize(), st.WindowSize())
 		flushDownload := func(sendAck bool) error {
 			if offset > persistedOffset {
 				if fErr := partFile.Sync(); fErr != nil {
@@ -1036,7 +1036,7 @@ func (c *Client) executeDownload(ctx context.Context, task *queue.Task, op *queu
 			}
 			offset += uint64(n)
 			reportProgress(progress, offset, size, queue.Transferring)
-			if offset == size || offset-persistedOffset >= flushBatch || time.Since(lastFlush) >= 50*time.Millisecond {
+			if offset == size || offset-persistedOffset >= flushBatch || time.Since(lastFlush) >= checkpointFlushInterval {
 				if err = flushDownload(offset < size); err != nil {
 					return result, err
 				}

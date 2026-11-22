@@ -561,3 +561,65 @@ func TestClientIdentityKeyStableAcrossRenewalAndIsolatedByUserCAAndServer(t *tes
 		t.Fatalf("expected different server name to have distinct identity key (otherSNI=%s, err=%v)", kOtherSNI, err)
 	}
 }
+
+func TestAuthorizerCheckBandwidthZeroAllocAndEnforcement(t *testing.T) {
+	dir := t.TempDir()
+	ca, err := NewCA(30, "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	caPath := filepath.Join(dir, "ca.pem")
+	if err := os.WriteFile(caPath, ca.Certificate, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	alice, err := NewLeafFromCA(ca, "alice", "", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	aliceCert := filepath.Join(dir, "alice.pem")
+	if err := os.WriteFile(aliceCert, alice.Certificate, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	pool, err := loadCA(caPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	customBW := config.Bandwidth{
+		UploadBytesPerSecond:   4 * 1024 * 1024,
+		DownloadBytesPerSecond: 8 * 1024 * 1024,
+		BurstBytes:             1024 * 1024,
+	}
+	srvCfg := config.DefaultServer()
+	srvCfg.AuthorizedClients = []config.AuthorizedClient{{
+		UserID:      "alice",
+		Certificate: aliceCert,
+		Permissions: []string{"upload"},
+		Bandwidth:   &customBW,
+	}}
+	auth, err := NewAuthorizer(srvCfg, pool)
+	if err != nil {
+		t.Fatalf("NewAuthorizer: %v", err)
+	}
+
+	bw, err := auth.CheckBandwidth("alice", "upload")
+	if err != nil || bw != customBW {
+		t.Fatalf("CheckBandwidth(upload) = (%+v, %v), want (%+v, nil)", bw, err, customBW)
+	}
+	if _, err := auth.CheckBandwidth("alice", "download"); err == nil {
+		t.Fatal("expected CheckBandwidth(download) to deny missing permission")
+	}
+	if _, err := auth.CheckBandwidth("unknown", "upload"); err == nil {
+		t.Fatal("expected CheckBandwidth(unknown) to fail")
+	}
+
+	allocs := testing.AllocsPerRun(100, func() {
+		if _, err := auth.CheckBandwidth("alice", "upload"); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if allocs != 0 {
+		t.Fatalf("expected 0 allocs/op on CheckBandwidth hot path, got %.1f", allocs)
+	}
+}
