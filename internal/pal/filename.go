@@ -24,18 +24,32 @@ func isWindowsIllegalRune(r rune) bool {
 	}
 }
 
+func normalizeWindowsDeviceDigit(r rune) rune {
+	switch r {
+	case '\u00b9': // ¹ SUPERSCRIPT ONE
+		return '1'
+	case '\u00b2': // ² SUPERSCRIPT TWO
+		return '2'
+	case '\u00b3': // ³ SUPERSCRIPT THREE
+		return '3'
+	default:
+		return r
+	}
+}
+
 func isWindowsReservedBase(name string) bool {
 	stem := name
 	if dot := strings.IndexByte(stem, '.'); dot >= 0 {
 		stem = stem[:dot]
 	}
 	stem = strings.TrimRight(stem, " ")
-	_, reserved := windowsReservedNames[strings.ToUpper(stem)]
+	stem = strings.Map(normalizeWindowsDeviceDigit, strings.ToUpper(stem))
+	_, reserved := windowsReservedNames[stem]
 	return reserved
 }
 
 // ValidateWindowsFilename 校验单级文件名是否可安全保存为 Windows 本地普通文件
-// （拒绝非法字符、NTFS ADS 冒号、尾随点/空格以及 CON/PRN/AUX/NUL/COM1-9/LPT1-9 等保留设备名）。
+// （拒绝非法字符、NTFS ADS 冒号、尾随点/空格以及 CON/PRN/AUX/NUL/COM1-9/LPT1-9 含上标 ¹²³ 设备别名）。
 func ValidateWindowsFilename(name string) error {
 	if name == "" || name == "." || name == ".." {
 		return fmt.Errorf("本地文件名不能为空或目录保留名：%q", name)
