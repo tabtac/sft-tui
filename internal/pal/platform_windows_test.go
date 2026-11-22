@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
@@ -195,5 +196,43 @@ func TestReviewWindowsReplaceCanRetryAfterOwnReaderCloses(t *testing.T) {
 	}
 	if got, err := os.ReadFile(dst); err != nil || string(got) != "new" {
 		t.Errorf("retry content: %q %v", got, err)
+	}
+}
+
+func TestWindowsNamedPipeRapidListenAcceptCloseNoDeadlock(t *testing.T) {
+	base := t.TempDir()
+	for i := 0; i < 300; i++ {
+		endpoint := GetNamedIPCPath(base, "probe")
+		ln, err := ListenIPC(endpoint)
+		if err != nil {
+			t.Fatalf("iter %d ListenIPC: %v", i, err)
+		}
+		acceptDone := make(chan struct{})
+		go func() {
+			defer close(acceptDone)
+			conn, err := ln.Accept()
+			if err == nil && conn != nil {
+				_ = conn.Close()
+			}
+		}()
+
+		closeDone := make(chan error, 1)
+		go func() {
+			closeDone <- ln.Close()
+		}()
+
+		select {
+		case err := <-closeDone:
+			if err != nil {
+				t.Fatalf("iter %d Close error: %v", i, err)
+			}
+		case <-time.After(3 * time.Second):
+			t.Fatalf("iter %d Close deadlocked without clients", i)
+		}
+		select {
+		case <-acceptDone:
+		case <-time.After(3 * time.Second):
+			t.Fatalf("iter %d Accept did not exit after Close", i)
+		}
 	}
 }

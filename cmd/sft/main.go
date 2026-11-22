@@ -140,6 +140,16 @@ func runCommandWithInput(args []string, in io.Reader, out, errOut io.Writer) int
 		return runDelete(cfg, pos[1:], out, errOut)
 	}
 
+	// 在打开 SQLite 队列与本地 IPC 监听器之前先完成无状态参数、本地文件名和同批重复校验，避免非法命令无谓启停队列资源。
+	var preJobs []cliJob
+	if op == "upload" || op == "download" || op == "transfer" {
+		var code int
+		preJobs, code = validateCLIJobs(op, pos[1:], *saveAs, *outDir, errOut)
+		if code != 0 {
+			return code
+		}
+	}
+
 	// 其余所有 CLI 操作均通过统一 SQLite 队列引擎（queue.Manager）驱动
 	idKey, err := security.ClientIdentityKey(cfg)
 	if err != nil {
@@ -201,42 +211,85 @@ func runCommandWithInput(args []string, in io.Reader, out, errOut io.Writer) int
 	case "pause", "abort":
 		return runQueueControl(mgr, cfg, op, pos[1], out, errOut)
 	default:
-		jobs, err := parseJobs(op, pos[1:])
-		if err != nil {
-			fmt.Fprintln(errOut, "sft：", err)
-			return 1
-		}
-		if *saveAs != "" {
-			if op != "download" || len(jobs) != 1 {
-				fmt.Fprintln(errOut, "sft：-save-as 仅支持单文件 download 命令")
-				return 2
-			}
-			if err := pal.ValidateLocalFilename(*saveAs); err != nil {
-				fmt.Fprintln(errOut, "sft：", err)
-				return 1
-			}
-			jobs[0].saveAs = *saveAs
-		}
 		if op == "download" || op == "transfer" {
-			for _, j := range jobs {
+			for _, j := range preJobs {
 				if !j.upload {
-					localName := j.target
-					if j.saveAs != "" {
-						localName = j.saveAs
-					}
-					if err := pal.ValidateLocalFilename(localName); err != nil {
-						fmt.Fprintln(errOut, "sft：", err)
-						return 1
-					}
 					if mkErr := os.MkdirAll(*outDir, 0750); mkErr != nil {
 						fmt.Fprintln(errOut, "sft：", mkErr)
 						return 1
 					}
+					break
 				}
 			}
 		}
-		return runTransfers(mgr, cfg, jobs, *outDir, *progressMode, out, errOut)
+		return runTransfers(mgr, cfg, preJobs, *outDir, *progressMode, out, errOut)
 	}
+}
+
+func validateCLIJobs(op string, rawArgs []string, saveAs, outDir string, errOut io.Writer) ([]cliJob, int) {
+	jobs, err := parseJobs(op, rawArgs)
+	if err != nil {
+		fmt.Fprintln(errOut, "sft：", err)
+		return nil, 1
+	}
+	if saveAs != "" {
+		if op != "download" || len(jobs) != 1 {
+			fmt.Fprintln(errOut, "sft：-save-as 仅支持单文件 download 命令")
+			return nil, 2
+		}
+		if err := pal.ValidateLocalFilename(saveAs); err != nil {
+			fmt.Fprintln(errOut, "sft：", err)
+			return nil, 1
+		}
+		jobs[0].saveAs = saveAs
+	}
+	seenTargets := make(map[string]string, len(jobs))
+	for _, j := range jobs {
+		var dir protocol.Direction
+		var remote, localPath string
+		if j.upload {
+			dir = protocol.DirectionUpload
+			abs, err := filepath.Abs(j.target)
+			if err != nil {
+				fmt.Fprintln(errOut, "sft：", err)
+				return nil, 1
+			}
+			localPath = abs
+			remote = filepath.Base(abs)
+			if err := protocol.ValidateName(remote); err != nil {
+				fmt.Fprintln(errOut, "sft：", err)
+				return nil, 1
+			}
+		} else {
+			dir = protocol.DirectionDownload
+			remote = j.target
+			localName := j.target
+			if j.saveAs != "" {
+				localName = j.saveAs
+			}
+			if err := pal.ValidateLocalFilename(localName); err != nil {
+				fmt.Fprintln(errOut, "sft：", err)
+				return nil, 1
+			}
+			abs, err := filepath.Abs(filepath.Join(outDir, localName))
+			if err != nil {
+				fmt.Fprintln(errOut, "sft：", err)
+				return nil, 1
+			}
+			localPath = abs
+		}
+		key := queue.TargetKey(dir, remote, localPath)
+		if prevPath, dup := seenTargets[key]; dup {
+			if !sameTransferPath(prevPath, localPath) {
+				fmt.Fprintf(errOut, "sft：同一批次中存在同名但路径不同的目标 %s（%s 与 %s）\n", remote, prevPath, localPath)
+			} else {
+				fmt.Fprintf(errOut, "sft：同一批次中重复指定了目标 %s\n", remote)
+			}
+			return nil, 1
+		}
+		seenTargets[key] = localPath
+	}
+	return jobs, 0
 }
 
 func printUsage(w io.Writer) {
