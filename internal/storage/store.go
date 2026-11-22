@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"math"
 	"os"
 	"path/filepath"
@@ -307,7 +308,8 @@ func sweepOrphanDir(root *pal.Root, sub string, keep map[string]struct{}) error 
 			continue
 		}
 		if err := root.Remove(rel); err != nil && !os.IsNotExist(err) {
-			return err
+			slog.Warn("孤儿文件回收待重试", "path", rel, "error", err)
+			continue
 		}
 		removed = true
 	}
@@ -964,12 +966,12 @@ func (s *Store) OpenPublishedFile(ctx context.Context, userID, fileName string) 
 	return s.openPublishedLocked(ctx, userID, fileName)
 }
 
-// DeletePublishedFile 严格在已认证用户命名空间内删除其自己上传的已发布文件与底层不可变对象。
+// DeletePublishedFile 严格在已认证用户命名空间内删除其自己上传的发布记录，并尝试回收底层对象。
 // 安全与一致性保证：
 // 1. 仅匹配 (user_id, file_name)，绝不暴露或删除其他用户的同名或异名文件。
 // 2. 校验文件名合法性与数据库 object_id 格式，并经 pal.Root 验证底层对象为非符号链接的普通文件。
 // 3. 若存在持有活跃租约的传输任务正在使用该对象，拒绝删除并返回 ErrTaskBusy；其余未持租约的暂停下载任务在同一事务中原子标记为 CANCELLED。
-// 4. 先提交 SQLite 事务再移除物理对象，避免数据库回滚导致对象丢失。
+// 4. SQLite 提交即逻辑删除成功；物理回收失败仅告警，留待启动清理重试，避免误报删除失败。
 func (s *Store) DeletePublishedFile(ctx context.Context, userID, fileName string) (PublishedFile, error) {
 	if err := ctx.Err(); err != nil {
 		return PublishedFile{}, err
@@ -1069,9 +1071,12 @@ func (s *Store) DeletePublishedFile(ctx context.Context, userID, fileName string
 	}
 
 	var remainingRefs int
-	if err := s.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM published_files WHERE object_id=?", pub.ObjectID).Scan(&remainingRefs); err == nil && remainingRefs == 0 {
+	if err := s.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM published_files WHERE object_id=?", pub.ObjectID).Scan(&remainingRefs); err != nil {
+		slog.Warn("文件已逻辑删除，磁盘回收待重试", "user", userID, "file", fileName, "object_id", pub.ObjectID, "error", err)
+	} else if remainingRefs == 0 {
 		if rmErr := s.root.Remove(objRel); rmErr != nil && !os.IsNotExist(rmErr) {
-			return pub, rmErr
+			slog.Warn("文件已逻辑删除，磁盘回收待重试", "user", userID, "file", fileName, "object_id", pub.ObjectID, "error", rmErr)
+			return pub, nil
 		}
 		_ = s.root.SyncRootSubdir("objects")
 	}
