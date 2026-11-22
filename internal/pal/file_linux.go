@@ -74,6 +74,24 @@ func OpenLockFile(path string) (*os.File, error) {
 	return os.OpenFile(path, os.O_CREATE|os.O_RDWR|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0600)
 }
 
+// OpenRegularNoFollow 使用 O_NOFOLLOW 原子打开普通文件并复核文件类型，消除 Lstat->Open 符号链接 TOCTOU 窗口。
+func OpenRegularNoFollow(path string, flag int, perm os.FileMode) (*os.File, error) {
+	f, err := os.OpenFile(path, flag|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, perm)
+	if err != nil {
+		return nil, err
+	}
+	info, err := f.Stat()
+	if err != nil {
+		_ = f.Close()
+		return nil, err
+	}
+	if !info.Mode().IsRegular() {
+		_ = f.Close()
+		return nil, fmt.Errorf("security violation: %q must be a regular file", path)
+	}
+	return f, nil
+}
+
 // FileIdentity 返回文件底层设备号、inode 与硬链接数
 func FileIdentity(f *os.File) (dev uint64, ino uint64, nlink uint64, err error) {
 	info, err := f.Stat()

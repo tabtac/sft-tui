@@ -151,3 +151,45 @@ func TestLogOpenRejectsSymbolicLinkWithoutTouchingTarget(t *testing.T) {
 		t.Errorf("log symlink target changed: %q %v", data, err)
 	}
 }
+
+func TestWriterTwoSegmentRotationPreservesAuditHistoryWithinTotalBound(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "sftd.log")
+	backup := path + ".1"
+
+	w, err := Open(path, MinMaxBytes)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer w.Close()
+
+	// 写入首段审计事件（20 KiB）
+	first := append([]byte("AUDIT_MARKER_SEG1\n"), bytes.Repeat([]byte("a"), 20*1024)...)
+	if _, err := w.Write(first); err != nil {
+		t.Fatal(err)
+	}
+	// 再写 20 KiB，超过单段 32 KiB 上限 -> 触发滚动，首段保留在 .1，新记录写入活动文件
+	second := append([]byte("AUDIT_MARKER_SEG2\n"), bytes.Repeat([]byte("b"), 20*1024)...)
+	if _, err := w.Write(second); err != nil {
+		t.Fatal(err)
+	}
+
+	activeData, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read active log: %v", err)
+	}
+	backupData, err := os.ReadFile(backup)
+	if err != nil {
+		t.Fatalf("read rotated backup log: %v", err)
+	}
+	if !strings.Contains(string(backupData), "AUDIT_MARKER_SEG1") {
+		t.Fatal("expected prior audit segment to be preserved in .1 after rotation")
+	}
+	if !strings.Contains(string(activeData), "AUDIT_MARKER_SEG2") {
+		t.Fatal("expected new audit record in active log after rotation")
+	}
+	total := int64(len(activeData) + len(backupData))
+	if total > MinMaxBytes {
+		t.Fatalf("total rotated log size exceeded bound: %d > %d", total, MinMaxBytes)
+	}
+}

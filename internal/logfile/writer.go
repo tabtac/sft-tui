@@ -1,4 +1,4 @@
-// Package logfile 提供带独占文件锁、私有权限与大小上限的单文件有界服务日志写入器。
+// Package logfile 提供带独占文件锁、私有权限与总大小严格有界的双段滚动服务日志写入器。
 package logfile
 
 import (
@@ -18,13 +18,16 @@ const (
 )
 
 type Writer struct {
-	mu             sync.Mutex
-	file, lock     *os.File
-	size, maxBytes int64
-	closed         bool
+	mu                       sync.Mutex
+	path, backupPath         string
+	file, lock               *os.File
+	size, maxBytes, segLimit int64
+	closed                   bool
 }
 
-// Open 打开或创建私有有界日志文件，拒绝符号链接并防止多实例并发写入同一日志文件。
+// Open 打开或创建私有有界双段滚动日志文件，拒绝符号链接并防止多实例并发写入同一日志文件。
+// 活动日志与单个历史滚动段（path + ".1"）各占 maxBytes/2，总磁盘占用严格不超过 maxBytes，
+// 防止触达上限时一次性清空全部审计轨迹。
 func Open(path string, maxBytes int64) (*Writer, error) {
 	if maxBytes < MinMaxBytes || maxBytes > MaxMaxBytes {
 		return nil, fmt.Errorf("日志文件大小须为 64 KiB–1 GiB")
@@ -49,20 +52,15 @@ func Open(path string, maxBytes int64) (*Writer, error) {
 		_ = lock.Close()
 		return nil, err
 	}
-	if err := pal.CheckRegularOrAbsent(absolute); err != nil {
+	backupPath := absolute + ".1"
+	if err := pal.CheckRegularOrAbsent(backupPath); err != nil {
 		return fail(err)
 	}
-	f, err := os.OpenFile(absolute, os.O_CREATE|os.O_RDWR, 0600)
+	f, err := openLogSegment(absolute, os.O_CREATE|os.O_RDWR)
 	if err != nil {
 		return fail(err)
 	}
 	info, err := f.Stat()
-	if err == nil && !info.Mode().IsRegular() {
-		err = fmt.Errorf("服务日志必须是普通文件")
-	}
-	if err == nil {
-		err = f.Chmod(0600)
-	}
 	if err == nil {
 		_, err = f.Seek(0, io.SeekEnd)
 	}
@@ -70,22 +68,77 @@ func Open(path string, maxBytes int64) (*Writer, error) {
 		_ = f.Close()
 		return fail(err)
 	}
-	return &Writer{file: f, lock: lock, size: info.Size(), maxBytes: maxBytes}, nil
+	segLimit := maxBytes / 2
+	return &Writer{
+		path:       absolute,
+		backupPath: backupPath,
+		file:       f,
+		lock:       lock,
+		size:       info.Size(),
+		maxBytes:   maxBytes,
+		segLimit:   segLimit,
+	}, nil
+}
+
+func openLogSegment(path string, flag int) (*os.File, error) {
+	f, err := pal.OpenRegularNoFollow(path, flag, 0600)
+	if err != nil {
+		return nil, err
+	}
+	if err := f.Chmod(0600); err != nil {
+		_ = f.Close()
+		return nil, err
+	}
+	return f, nil
+}
+
+func (w *Writer) rotateLocked() error {
+	if err := pal.CheckRegularOrAbsent(w.backupPath); err != nil {
+		return err
+	}
+	if w.file != nil {
+		_ = w.file.Sync()
+		if err := w.file.Close(); err != nil {
+			w.file = nil
+			return err
+		}
+		w.file = nil
+	}
+	if err := pal.AtomicReplace(w.path, w.backupPath); err != nil {
+		// 滚动失败时尽量恢复打开原文件，避免 Writer 陷入无句柄状态
+		if reopened, rErr := openLogSegment(w.path, os.O_CREATE|os.O_RDWR); rErr == nil {
+			if info, sErr := reopened.Stat(); sErr == nil {
+				_, _ = reopened.Seek(0, io.SeekEnd)
+				w.file = reopened
+				w.size = info.Size()
+			} else {
+				_ = reopened.Close()
+			}
+		}
+		return fmt.Errorf("日志滚动失败：%w", err)
+	}
+	f, err := openLogSegment(w.path, os.O_CREATE|os.O_RDWR|os.O_TRUNC)
+	if err != nil {
+		return fmt.Errorf("日志滚动后重建失败：%w", err)
+	}
+	w.file = f
+	w.size = 0
+	return nil
 }
 
 func (w *Writer) Write(data []byte) (int, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	if w.closed {
+	if w.closed || w.file == nil {
 		return 0, os.ErrClosed
 	}
 	origLen := len(data)
 	if origLen == 0 {
 		return 0, nil
 	}
-	if int64(origLen) > w.maxBytes {
+	if int64(origLen) > w.segLimit {
 		const suffix = "… [日志过长，已截断]\n"
-		end := int(w.maxBytes) - len(suffix)
+		end := int(w.segLimit) - len(suffix)
 		if end < 0 {
 			end = 0
 		}
@@ -97,15 +150,10 @@ func (w *Writer) Write(data []byte) (int, error) {
 		buf = append(buf, suffix...)
 		data = buf
 	}
-	if w.size > 0 && w.size+int64(len(data)) > w.maxBytes {
-		// 在同文件内重置覆盖，不留归档副本，防止无限膨胀
-		if err := w.file.Truncate(0); err != nil {
-			return 0, fmt.Errorf("日志达到上限，清空失败：%w", err)
-		}
-		if _, err := w.file.Seek(0, io.SeekStart); err != nil {
+	if w.size > 0 && w.size+int64(len(data)) > w.segLimit {
+		if err := w.rotateLocked(); err != nil {
 			return 0, err
 		}
-		w.size = 0
 	}
 	n, err := w.file.Write(data)
 	w.size += int64(n)
@@ -125,7 +173,11 @@ func (w *Writer) Close() error {
 		return nil
 	}
 	w.closed = true
-	err := w.file.Close()
+	var err error
+	if w.file != nil {
+		err = w.file.Close()
+		w.file = nil
+	}
 	_ = pal.UnlockFile(w.lock)
 	if e := w.lock.Close(); err == nil {
 		err = e

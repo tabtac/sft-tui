@@ -35,9 +35,14 @@ func DigestReaderContext(ctx context.Context, r io.Reader) ([32]byte, uint64, er
 	}
 }
 
-// ReadSmall 安全读取有大小上限的普通文件（不跟随目录外的异常大文件/设备）。
+// ReadSmall 安全读取有大小上限的普通文件（使用 O_NOFOLLOW/无重解析点打开，消除 Lstat->Open TOCTOU）。
 func ReadSmall(path string, maxBytes int64) ([]byte, error) {
-	info, err := os.Lstat(path)
+	f, err := OpenRegularNoFollow(path, os.O_RDONLY, 0)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	info, err := f.Stat()
 	if err != nil {
 		return nil, err
 	}
@@ -47,11 +52,6 @@ func ReadSmall(path string, maxBytes int64) ([]byte, error) {
 	if info.Size() > maxBytes {
 		return nil, fmt.Errorf("file exceeds max allowed size (%d > %d): %s", info.Size(), maxBytes, path)
 	}
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
 	data, err := io.ReadAll(io.LimitReader(f, maxBytes+1))
 	if err != nil {
 		return nil, err
