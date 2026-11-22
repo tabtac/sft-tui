@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"net"
-	"reflect"
 	"sort"
 	"sync"
 	"time"
@@ -213,10 +212,22 @@ func (a *Authorizer) ReloadWithCA(entries []config.AuthorizedClient, ca *x509.Ce
 	for conn, reg := range a.connections {
 		user := reg.user
 		p, exists := users[user]
-		if !exists || !p.validAt(now) || !reflect.DeepEqual(old[user], p) || changedCertUsers[user] {
+		oldP, hadOld := old[user]
+		mustClose := !exists ||
+			!hadOld ||
+			!p.validAt(now) ||
+			changedCertUsers[user] ||
+			oldP.CertFingerprint != p.CertFingerprint ||
+			oldP.PubKeyFingerprint != p.PubKeyFingerprint ||
+			permissionsNarrowed(oldP.Permissions, p.Permissions)
+		if mustClose {
 			reg.timer.Stop()
 			delete(a.connections, conn)
 			closeList = append(closeList, conn)
+			continue
+		}
+		if !p.NotAfter.Equal(oldP.NotAfter) {
+			a.replaceRegistrationLocked(conn, user, p.NotAfter)
 		}
 	}
 	a.certs, a.users = certs, users
@@ -227,6 +238,27 @@ func (a *Authorizer) ReloadWithCA(entries []config.AuthorizedClient, ca *x509.Ce
 		_ = conn.Close()
 	}
 	return nil
+}
+
+// permissionsNarrowed 判断热更新后用户的权限集合是否被收窄；
+// 仅带宽调整或权限扩展返回 false，不中断活跃连接。
+func permissionsNarrowed(oldPerms, newPerms []string) bool {
+	if newPerms == nil {
+		return false
+	}
+	if oldPerms == nil {
+		return true
+	}
+	allowed := make(map[string]struct{}, len(newPerms))
+	for _, op := range newPerms {
+		allowed[op] = struct{}{}
+	}
+	for _, op := range oldPerms {
+		if _, ok := allowed[op]; !ok {
+			return true
+		}
+	}
+	return false
 }
 
 func verifyAuthorizationChain(cert *x509.Certificate, roots, intermediates *x509.CertPool, now time.Time) ([][]*x509.Certificate, error) {
@@ -293,12 +325,17 @@ func (a *Authorizer) Register(cert *x509.Certificate, conn net.Conn) (Principal,
 	if !ok || !p.validAt(time.Now()) || p.PubKeyFingerprint != PubKeyFingerprint(cert) {
 		return p.clone(), fmt.Errorf("用户已撤销或证书不匹配")
 	}
+	a.replaceRegistrationLocked(conn, p.UserID, p.NotAfter)
+	return p.clone(), nil
+}
+
+func (a *Authorizer) replaceRegistrationLocked(conn net.Conn, user string, notAfter time.Time) {
 	if old := a.connections[conn]; old != nil {
 		old.timer.Stop()
 	}
-	reg := &registeredConnection{user: p.UserID}
+	reg := &registeredConnection{user: user}
 	a.connections[conn] = reg
-	reg.timer = time.AfterFunc(time.Until(p.NotAfter), func() {
+	reg.timer = time.AfterFunc(time.Until(notAfter), func() {
 		a.mu.Lock()
 		current := a.connections[conn] == reg
 		if current {
@@ -309,7 +346,6 @@ func (a *Authorizer) Register(cert *x509.Certificate, conn net.Conn) (Principal,
 			_ = conn.Close()
 		}
 	})
-	return p.clone(), nil
 }
 
 func (a *Authorizer) Unregister(conn net.Conn) {

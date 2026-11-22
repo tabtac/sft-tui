@@ -623,3 +623,98 @@ func TestAuthorizerCheckBandwidthZeroAllocAndEnforcement(t *testing.T) {
 		t.Fatalf("expected 0 allocs/op on CheckBandwidth hot path, got %.1f", allocs)
 	}
 }
+
+func TestAuthorizerHotReloadSmoothBandwidthAndPermissionChanges(t *testing.T) {
+	dir, srvCfg, _ := testCertConfig(t)
+	srvCfg.AuthorizedClients[0].Permissions = []string{"download"}
+	_, auth, err := ServerTLS(srvCfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	aliceCert, err := ReadCertificate(filepath.Join(dir, "alice.pem"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	c1, c2 := net.Pipe()
+	defer c1.Close()
+	defer c2.Close()
+
+	if _, err := auth.Register(aliceCert, c1); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+
+	assertConnOpen := func(stage string) {
+		t.Helper()
+		done := make(chan error, 1)
+		go func() {
+			_ = c1.SetReadDeadline(time.Now().Add(time.Second))
+			buf := make([]byte, 2)
+			_, err := c1.Read(buf)
+			done <- err
+		}()
+		_ = c2.SetWriteDeadline(time.Now().Add(time.Second))
+		if _, err := c2.Write([]byte("ok")); err != nil {
+			t.Fatalf("%s: expected active connection to remain open, write failed: %v", stage, err)
+		}
+		if err := <-done; err != nil {
+			t.Fatalf("%s: expected active connection to remain open, read failed: %v", stage, err)
+		}
+	}
+
+	// 1. 仅调整带宽策略：不得中断已有活跃连接，且 CheckBandwidth 立即生效
+	newBW := config.Bandwidth{
+		UploadBytesPerSecond:   2 * 1024 * 1024,
+		DownloadBytesPerSecond: 6 * 1024 * 1024,
+		BurstBytes:             512 * 1024,
+	}
+	srvCfg.AuthorizedClients[0].Bandwidth = &newBW
+	if err := auth.Reload(srvCfg.AuthorizedClients); err != nil {
+		t.Fatalf("Reload bandwidth: %v", err)
+	}
+	assertConnOpen("bandwidth reload")
+	if gotBW, err := auth.CheckBandwidth("alice", "download"); err != nil || gotBW != newBW {
+		t.Fatalf("CheckBandwidth after reload = (%+v, %v), want (%+v, nil)", gotBW, err, newBW)
+	}
+
+	// 2. 扩展权限（download -> download, upload）：不得中断已有活跃连接
+	srvCfg.AuthorizedClients[0].Permissions = []string{"download", "upload"}
+	if err := auth.Reload(srvCfg.AuthorizedClients); err != nil {
+		t.Fatalf("Reload permission expansion: %v", err)
+	}
+	assertConnOpen("permission expansion")
+	if _, err := auth.Check("alice", "upload"); err != nil {
+		t.Fatalf("expected upload permission after expansion: %v", err)
+	}
+
+	// 3. 收窄权限（download, upload -> download）：必须立即断开活跃连接
+	srvCfg.AuthorizedClients[0].Permissions = []string{"download"}
+	if err := auth.Reload(srvCfg.AuthorizedClients); err != nil {
+		t.Fatalf("Reload permission narrowing: %v", err)
+	}
+	_ = c2.SetReadDeadline(time.Now().Add(time.Second))
+	buf := make([]byte, 1)
+	if _, err := c2.Read(buf); err == nil {
+		t.Fatal("expected narrowed permission reload to close active connection")
+	}
+}
+
+func TestNewCASetsMaxPathLenZero(t *testing.T) {
+	ca, err := NewCA(30, "", "", "PathLen Test CA")
+	if err != nil {
+		t.Fatalf("NewCA: %v", err)
+	}
+	if !ca.Leaf.IsCA || !ca.Leaf.BasicConstraintsValid || ca.Leaf.MaxPathLen != 0 || !ca.Leaf.MaxPathLenZero {
+		t.Fatalf("expected CA BasicConstraints pathLen=0, got IsCA=%v Valid=%v MaxPathLen=%d MaxPathLenZero=%v",
+			ca.Leaf.IsCA, ca.Leaf.BasicConstraintsValid, ca.Leaf.MaxPathLen, ca.Leaf.MaxPathLenZero)
+	}
+	cert, key := writeCertificateMaterial(t, ca)
+	renewed, err := NewCA(60, cert, key)
+	if err != nil {
+		t.Fatalf("renew NewCA: %v", err)
+	}
+	if renewed.Leaf.MaxPathLen != 0 || !renewed.Leaf.MaxPathLenZero {
+		t.Fatalf("expected renewed CA pathLen=0, got MaxPathLen=%d MaxPathLenZero=%v",
+			renewed.Leaf.MaxPathLen, renewed.Leaf.MaxPathLenZero)
+	}
+}

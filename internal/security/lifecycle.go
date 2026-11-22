@@ -88,6 +88,8 @@ func NewCA(days int, renewCertificate, renewKey string, commonName ...string) (C
 		NotAfter:              after,
 		IsCA:                  true,
 		BasicConstraintsValid: true,
+		MaxPathLen:            0,
+		MaxPathLenZero:        true,
 		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageCRLSign,
 	}
 	if len(commonName) > 0 && commonName[0] != "" {

@@ -2,6 +2,7 @@ package queue
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -10,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"sft-tui/internal/pal"
 	"sft-tui/internal/protocol"
 )
 
@@ -433,5 +435,50 @@ func TestUpdateCheckpointRollbackOnDatabaseFailure(t *testing.T) {
 	}
 	if _, err := m.store.db.Exec("DROP TRIGGER reject_checkpoint"); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestIPCHardeningRejectsUnknownFieldsAndTrailingObjects(t *testing.T) {
+	m, dir := newTestManager(t)
+	_ = m
+
+	// 1. 合法 RemoteStatus 正常返回
+	if _, err := RemoteStatus(dir, "alice-key"); err != nil {
+		t.Fatalf("RemoteStatus: %v", err)
+	}
+
+	ep := IPCPath(dir, "alice-key")
+	sendRaw := func(payload string) ipcResponse {
+		t.Helper()
+		conn, err := pal.DialIPC(ep, 2*time.Second)
+		if err != nil {
+			t.Fatalf("DialIPC: %v", err)
+		}
+		defer conn.Close()
+		_ = conn.SetDeadline(time.Now().Add(3 * time.Second))
+		if _, err := conn.Write([]byte(payload)); err != nil {
+			t.Fatalf("Write: %v", err)
+		}
+		var resp ipcResponse
+		if err := json.NewDecoder(conn).Decode(&resp); err != nil {
+			t.Fatalf("Decode resp for %q: %v", payload, err)
+		}
+		return resp
+	}
+
+	for _, tc := range []struct {
+		name    string
+		payload string
+	}{
+		{"unknown_field", `{"op":"status","unknown":true}` + "\n"},
+		{"trailing_object", `{"op":"status"}{"op":"status"}` + "\n"},
+		{"non_object", `["status"]` + "\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			resp := sendRaw(tc.payload)
+			if resp.OK || resp.Error == "" {
+				t.Fatalf("expected error response for %s, got %+v", tc.name, resp)
+			}
+		})
 	}
 }

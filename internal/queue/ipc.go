@@ -1,6 +1,8 @@
 package queue
 
 import (
+	"bufio"
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -61,15 +63,25 @@ func (m *Manager) stopIPC() {
 
 func (m *Manager) serveIPC(ln net.Listener) {
 	defer m.ipcWG.Done()
+	slots := make(chan struct{}, 4)
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
 			return
 		}
+		select {
+		case slots <- struct{}{}:
+		default:
+			_ = conn.Close()
+			continue
+		}
 		m.ipcWG.Add(1)
 		go func(c net.Conn) {
 			defer m.ipcWG.Done()
-			defer c.Close()
+			defer func() {
+				<-slots
+				_ = c.Close()
+			}()
 			m.handleIPCConn(c)
 		}(conn)
 	}
@@ -77,10 +89,33 @@ func (m *Manager) serveIPC(ln net.Listener) {
 
 func (m *Manager) handleIPCConn(c net.Conn) {
 	_ = c.SetDeadline(time.Now().Add(18 * time.Second))
+	line, err := bufio.NewReader(io.LimitReader(c, maxQueueIPCBytes+1)).ReadBytes('\n')
+	if err == io.EOF && len(line) > 0 {
+		err = nil
+	}
+	if err != nil {
+		_ = json.NewEncoder(c).Encode(ipcResponse{Error: "无法读取控制请求：" + err.Error()})
+		return
+	}
+	if len(line) > maxQueueIPCBytes {
+		_ = json.NewEncoder(c).Encode(ipcResponse{Error: "控制请求过大"})
+		return
+	}
+	trimmed := bytes.TrimSpace(line)
+	if !bytes.HasPrefix(trimmed, []byte("{")) {
+		_ = json.NewEncoder(c).Encode(ipcResponse{Error: "控制请求必须为 JSON 对象"})
+		return
+	}
 	var req ipcRequest
-	dec := json.NewDecoder(io.LimitReader(c, maxQueueIPCBytes))
+	dec := json.NewDecoder(bytes.NewReader(trimmed))
+	dec.DisallowUnknownFields()
 	if err := dec.Decode(&req); err != nil {
 		_ = json.NewEncoder(c).Encode(ipcResponse{Error: "无法解析控制请求：" + err.Error()})
+		return
+	}
+	var extra any
+	if extraErr := dec.Decode(&extra); extraErr != io.EOF {
+		_ = json.NewEncoder(c).Encode(ipcResponse{Error: "控制请求只能包含单个 JSON 对象"})
 		return
 	}
 	resp := m.dispatchIPC(req)
