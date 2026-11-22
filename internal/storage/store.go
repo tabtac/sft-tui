@@ -219,6 +219,101 @@ func reconcileStaging(root *pal.Root, db *sql.DB) error {
 			}
 		}
 	}
+	return sweepOrphanFiles(root, db)
+}
+
+// sweepOrphanFiles 启动时正向扫描 staging/ 与 objects/ 目录，清理数据库已无引用的孤儿普通文件。
+func sweepOrphanFiles(root *pal.Root, db *sql.DB) error {
+	liveStaging := make(map[string]struct{})
+	sRows, err := db.Query(
+		"SELECT id FROM tasks WHERE direction=? AND status NOT IN ('COMPLETED', 'FAILED', 'CANCELLED', 'EXPIRED')",
+		int(protocol.DirectionUpload),
+	)
+	if err != nil {
+		return err
+	}
+	for sRows.Next() {
+		var idHex string
+		if err := sRows.Scan(&idHex); err != nil {
+			sRows.Close()
+			return err
+		}
+		liveStaging[idHex+".part"] = struct{}{}
+	}
+	if err := sRows.Err(); err != nil {
+		sRows.Close()
+		return err
+	}
+	sRows.Close()
+
+	liveObjects := make(map[string]struct{})
+	oRows, err := db.Query(`
+		SELECT object_id FROM published_files WHERE object_id != ''
+		UNION
+		SELECT object_id FROM tasks WHERE object_id != '' AND status NOT IN ('COMPLETED', 'FAILED', 'CANCELLED', 'EXPIRED')
+	`)
+	if err != nil {
+		return err
+	}
+	for oRows.Next() {
+		var objectID string
+		if err := oRows.Scan(&objectID); err != nil {
+			oRows.Close()
+			return err
+		}
+		liveObjects[objectID] = struct{}{}
+	}
+	if err := oRows.Err(); err != nil {
+		oRows.Close()
+		return err
+	}
+	oRows.Close()
+
+	if err := sweepOrphanDir(root, "staging", liveStaging); err != nil {
+		return err
+	}
+	return sweepOrphanDir(root, "objects", liveObjects)
+}
+
+func sweepOrphanDir(root *pal.Root, sub string, keep map[string]struct{}) error {
+	dir, err := root.Open(sub)
+	if err != nil {
+		return err
+	}
+	entries, readErr := dir.ReadDir(-1)
+	closeErr := dir.Close()
+	if readErr != nil {
+		return readErr
+	}
+	if closeErr != nil {
+		return closeErr
+	}
+
+	removed := false
+	for _, entry := range entries {
+		name := entry.Name()
+		if _, ok := keep[name]; ok {
+			continue
+		}
+		rel := sub + "/" + name
+		info, err := root.Lstat(rel)
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return err
+		}
+		if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+			continue
+		}
+		if err := root.Remove(rel); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+		removed = true
+	}
+	if removed {
+		_ = root.SyncRootSubdir(sub)
+	}
 	return nil
 }
 

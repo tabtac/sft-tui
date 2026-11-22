@@ -167,3 +167,47 @@ func TestReviewLockReleasedAfterCloseAndFailedOpen(t *testing.T) {
 	}
 	reviewOpenStore(t, root)
 }
+
+func TestReopenSweepsOrphanStagingAndObjects(t *testing.T) {
+	root := t.TempDir()
+	s := reviewOpenStore(t, root)
+
+	// 1. 创建一个未完成上传任务（应保留 staging/.part）
+	liveUpload := reviewCreateTask(t, s, "alice", reviewRequest("live-part.bin", []byte("ABCD"), 1))
+	reviewWrite(t, s, liveUpload, 0, []byte("AB"))
+
+	// 2. 创建一个已发布文件（应保留 objects/<objectID>）
+	pubTask := reviewPublish(t, s, "alice", "published.bin", []byte("PAYLOAD"), 2)
+
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// 3. 注入孤儿文件到 staging/ 与 objects/，模拟进程异常退出或删除中途崩溃的残留
+	orphanPart := filepath.Join(root, "staging", "deadbeef000000000000000000000000.part")
+	orphanObj := filepath.Join(root, "objects", "000000000000000000000000000000000000000000000000000000000000dead")
+	if err := os.WriteFile(orphanPart, []byte("orphan-part"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(orphanObj, []byte("orphan-obj"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	// 4. 重开 Store 触发启动自愈清理
+	reopened := reviewOpenStore(t, root)
+	_ = reopened
+
+	if _, err := os.Lstat(orphanPart); !os.IsNotExist(err) {
+		t.Errorf("expected orphan staging file to be removed, err=%v", err)
+	}
+	if _, err := os.Lstat(orphanObj); !os.IsNotExist(err) {
+		t.Errorf("expected orphan object file to be removed, err=%v", err)
+	}
+	if got := string(reviewReadFile(t, reviewPartPath(root, liveUpload.ID))); got != "AB" {
+		t.Errorf("live staging file corrupted or removed: %q", got)
+	}
+	liveObjPath := filepath.Join(root, "objects", pubTask.ObjectID)
+	if got := string(reviewReadFile(t, liveObjPath)); got != "PAYLOAD" {
+		t.Errorf("live published object corrupted or removed: %q", got)
+	}
+}
