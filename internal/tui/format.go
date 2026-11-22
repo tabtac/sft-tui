@@ -445,7 +445,7 @@ func renderActionFooter(th theme, width int, areaPrefix string, chips []footerCh
 		reason := sanitizeInline(c.reason)
 		var txt string
 		if reason != "" {
-			txt = th.badgeMuted.Render(fmt.Sprintf("[%s]%s(%s)", key, label, reason))
+			txt = th.badgeMuted.Render(fmt.Sprintf("[%s]%s", key, label))
 		} else {
 			txt = th.hintKey.Render("["+key+"]") + th.rowNormal.Render(label)
 		}

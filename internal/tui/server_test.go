@@ -853,16 +853,16 @@ func TestServerBusyProgressDoubleSubmitGuardAndContextualFooter(t *testing.T) {
 	m.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
 	m.Update(m.loadConfigCmd()())
 
-	// 1. 离线状态下，概览页应展示不可用操作及原因，且保持单行 80x24
+	// 1. 离线状态下，概览页 Footer 单行清爽渲染（不带括号原因文案）
 	f0 := ansi.Strip(m.renderFooter())
-	if lipgloss.Height(f0) != 1 || !strings.Contains(f0, "未运行") || !strings.Contains(f0, "已初始化") {
+	if lipgloss.Height(f0) != 1 || !strings.Contains(f0, "[s]启动") || !strings.Contains(f0, "[x]停止") || strings.ContainsAny(f0, "()") {
 		t.Fatalf("unexpected server overview footer:\n%s", f0)
 	}
 
-	// 2. 设置页：离线时热加载不可用并显示原因
+	// 2. 设置页：保持单行且不含括号提示
 	m.Update(keyRune('5'))
 	f4 := ansi.Strip(m.renderFooter())
-	if lipgloss.Height(f4) != 1 || !strings.Contains(f4, "服务离线") {
+	if lipgloss.Height(f4) != 1 || !strings.Contains(f4, "[A]热加载") || strings.ContainsAny(f4, "()") {
 		t.Fatalf("unexpected server settings footer:\n%s", f4)
 	}
 
@@ -1128,6 +1128,10 @@ func TestServerRuntimeMonitorCardAdaptivelyFillsPanelWidth(t *testing.T) {
 				if !strings.Contains(view, token) {
 					t.Fatalf("%dx%d overview missing %q:\n%s", w, h, token, view)
 				}
+			}
+			// 实时运行监控卡片不再重复展示运行时间或采样时间
+			if strings.Contains(card, "运行中 · ") || strings.Contains(card, "采样：") {
+				t.Fatalf("%dx%d runtime monitor card should not repeat uptime or sample time:\n%s", w, h, card)
 			}
 		}
 	}

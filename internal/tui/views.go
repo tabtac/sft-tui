@@ -199,7 +199,7 @@ func (m *model) renderFooter() string {
 		case m.manager == nil:
 			upReason = "需先选身份"
 		case len(m.localSelected) > 0:
-			upLabel = fmt.Sprintf("上传(%d)", len(m.localSelected))
+			upLabel = fmt.Sprintf("上传 %d", len(m.localSelected))
 		case curLocal == nil || !curLocal.regular:
 			upReason = "需选文件"
 		default:
@@ -236,7 +236,7 @@ func (m *model) renderFooter() string {
 		case m.remoteErr != "":
 			dnReason = "远端离线"
 		case len(m.remoteSelected) > 0:
-			dnLabel = fmt.Sprintf("下载(%d)", len(m.remoteSelected))
+			dnLabel = fmt.Sprintf("下载 %d", len(m.remoteSelected))
 		case m.remoteCursor < 0 || m.remoteCursor >= len(m.visibleRemote):
 			dnReason = "无文件"
 		default:

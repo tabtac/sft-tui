@@ -340,10 +340,10 @@ func (m *serverModel) renderFooter() string {
 		}
 		return renderActionFooter(m.th, m.width, "日志:", []footerChip{
 			{key: "p", label: pauseLabel, essential: true},
-			{key: "l", label: "等级(" + logLevelLabel(m.logMinLevel) + ")", essential: true},
+			{key: "l", label: "等级:" + logLevelLabel(m.logMinLevel), essential: true},
 			{key: "U", label: "用户", essential: true},
 			{key: "F", label: "文件", essential: true},
-			{key: "T", label: "时间(" + logSinceLabel(m.logSinceIdx) + ")", essential: true},
+			{key: "T", label: "时间:" + logSinceLabel(m.logSinceIdx), essential: true},
 			{key: "/", label: "文本", essential: true},
 			{key: "C", label: "清空", reason: clearReason},
 			{key: "Enter", label: "详情", reason: detailReason},
@@ -621,12 +621,11 @@ func (m *serverModel) renderRuntimeMonitorCard(outerW, outerH int) string {
 
 	var rtBadge string
 	if m.runtime != nil {
-		uptime := time.Since(m.runtime.Started).Round(time.Second)
 		switch m.runtime.State {
 		case "running":
-			rtBadge = m.th.badgeOk.Render("● 运行中") + m.th.badgeMuted.Render(" · "+uptime.String())
+			rtBadge = m.th.badgeOk.Render("● 运行中")
 		case "draining":
-			rtBadge = m.th.badgeWarn.Render("◐ 排空停服") + m.th.badgeMuted.Render(" · "+uptime.String())
+			rtBadge = m.th.badgeWarn.Render("◐ 排空停服")
 		default:
 			rtBadge = m.th.badgeErr.Render("✕ " + sanitizeInline(m.runtime.State))
 		}
@@ -666,12 +665,6 @@ func (m *serverModel) renderRuntimeMonitorCard(outerW, outerH int) string {
 
 	r := m.runtime
 	pubText := fmt.Sprintf("已发布：%d 个 (%s)", r.PublishedFiles, progress.FormatBytes(r.PublishedBytes))
-	sampleText := m.th.badgeMuted.Render("采样：等待首次")
-	if r.StorageError != "" {
-		sampleText = m.th.badgeWarn.Render("采样异常")
-	} else if !r.StorageAt.IsZero() {
-		sampleText = m.th.badgeMuted.Render("采样：" + r.StorageAt.Local().Format("15:04:05"))
-	}
 	inRateVal := m.th.badgeOk.Render(progress.FormatRate(r.ReceiveRate))
 	outRateVal := m.th.hintKey.Render(progress.FormatRate(r.SendRate))
 	sparkRow := func(prefix string, dir int, style lipgloss.Style) string {
@@ -712,10 +705,10 @@ func (m *serverModel) renderRuntimeMonitorCard(outerW, outerH int) string {
 		if r.State != "running" && !r.DrainStarted.IsZero() {
 			sepRow = m.th.badgeWarn.Render(truncPlainCell(fmt.Sprintf("正在排空停服（已等待 %s · 剩余任务 %d）", time.Since(r.DrainStarted).Round(time.Second), r.ActiveTasks), innerW))
 		} else if r.StorageError != "" {
-			sepRow = m.th.badgeWarn.Render(truncPlainCell("存储采样异常："+r.StorageError, innerW))
+			sepRow = m.th.badgeWarn.Render(truncPlainCell("存储统计异常："+r.StorageError, innerW))
 		}
 		statLines = append(statLines,
-			spreadRow(connText, sampleText, innerW),
+			truncCell(connText, innerW),
 			spreadRow(pubText, taskText, innerW),
 			spreadRow(inRate, outRate, innerW),
 			spreadRow(inTotal, outTotal, innerW),
@@ -726,9 +719,6 @@ func (m *serverModel) renderRuntimeMonitorCard(outerW, outerH int) string {
 
 	default:
 		connText := fmt.Sprintf("在线:%d  连接:%d  活动:%d", r.OnlineUsers, r.Connections, r.ActiveTasks)
-		if innerW >= 66 {
-			connText += " · " + sampleText
-		}
 		statLines = append(statLines,
 			spreadRow(connText, pubText, innerW),
 			spreadRow("实时入站(上传)："+inRateVal, "实时出站(下载)："+outRateVal, innerW),
